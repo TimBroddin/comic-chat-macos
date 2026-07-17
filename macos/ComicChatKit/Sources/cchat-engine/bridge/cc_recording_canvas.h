@@ -27,6 +27,15 @@
 //   clip_push  "clip+ l,t,r,b"
 //   clip_pop   "clip-"
 //
+// clip_pop RESET SEMANTICS (load-bearing, see comicchat.h's cc_canvas_ops):
+//   clip_pop resets the clip to the unclipped base — it is NOT a balanced
+//   one-level pop of the matching clip_push. The engine's only clip-reset
+//   path is the CDC adapter's `SelectClipRgn(NULL, RGN_COPY)`, which drops
+//   the whole accumulated clip in a single call; no single-level pop is ever
+//   emitted. A canvas that implements clip_pop as "undo the last clip_push"
+//   will leave earlier clip rects active and collapse every subsequent
+//   panel's drawing into panel 1's clip region.
+//
 // Formatting rules:
 //   - Coordinates are signed decimal integers, comma-joined, no spaces
 //     ("x,y" / "l,t,r,b"), exactly as written above.

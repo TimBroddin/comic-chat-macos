@@ -16,7 +16,9 @@ import cchat_engine
 /// times a `scale` supersampling factor, with the y-up page top pinned to the
 /// bitmap top. CoreGraphics bitmaps are natively y-up (origin bottom-left), so
 /// the engine's y-up convention needs no per-glyph flip — CoreText draws
-/// upward, matching.
+/// upward, matching. One coordinate is NOT a straight passthrough, though:
+/// `drawText`'s `y` is the TOP of the GDI text box (see its doc comment), which
+/// must be converted to a CoreText baseline before use.
 ///
 /// COLORS: engine colors are GDI COLORREF (0x00BBGGRR — red in the low byte).
 ///
@@ -34,6 +36,11 @@ public final class CGCanvas: Canvas {
     // CTFont cache keyed by the requested spec — creating CTFonts is not free
     // and the engine measures/draws with a small set of specs repeatedly.
     private var fontCache: [FontSpec: CTFont] = [:]
+    // A SEPARATE cache of the same fonts built at 20x point size, used only for
+    // DRAWING (see `drawFont(for:)`/`drawText`'s doc comment for why: scaling
+    // via CGContext.textMatrix instead, against this context's 1/20 CTM, was
+    // tried first and corrupts multi-glyph line layout).
+    private var drawFontCache: [FontSpec: CTFont] = [:]
 
     /// Create a bitmap sized for a page of `widthTwips` x `heightTwips`, at the
     /// given supersampling `scale`. Fills opaque white (the comic page ground).
@@ -90,14 +97,13 @@ public final class CGCanvas: Canvas {
         return (r, g, b)
     }
 
-    private func font(for spec: FontSpec) -> CTFont {
-        if let cached = fontCache[spec] { return cached }
-        // LOGFONT lfHeight is in twips; negative means character height. Point
-        // size = |height| / 20 (twips per point).
-        let sizePt = abs(CGFloat(spec.height)) / 20.0
+    // Build a CTFont for `spec` at the given point size, applying bold/italic
+    // symbolic traits if requested and available. Shared by `font(for:)` (real
+    // point size, for measurement) and `drawFont(for:)` (20x point size, for
+    // drawing).
+    private func makeFont(spec: FontSpec, sizePt: CGFloat) -> CTFont {
         let face = spec.face.isEmpty ? "Helvetica" : spec.face
         var ct = CTFontCreateWithName(face as CFString, sizePt, nil)
-        // Apply bold/italic traits if requested and available.
         var symbolic: CTFontSymbolicTraits = []
         if spec.weight >= 600 { symbolic.insert(.traitBold) }
         if spec.italic { symbolic.insert(.traitItalic) }
@@ -106,17 +112,57 @@ public final class CGCanvas: Canvas {
                 ct = styled
             }
         }
+        return ct
+    }
+
+    /// The real-point-size CTFont for `spec` (LOGFONT lfHeight/20 points),
+    /// used for measurement (`measureText`/`fontMetrics`) where callers expect
+    /// true point-based metrics.
+    private func font(for spec: FontSpec) -> CTFont {
+        if let cached = fontCache[spec] { return cached }
+        // LOGFONT lfHeight is in twips; negative means character height. Point
+        // size = |height| / 20 (twips per point).
+        let sizePt = abs(CGFloat(spec.height)) / 20.0
+        let ct = makeFont(spec: spec, sizePt: sizePt)
         fontCache[spec] = ct
         return ct
     }
 
-    /// Build a CTLine for `bytes` in `spec` with `color`. Bytes are decoded as
+    /// The DRAWING CTFont for `spec`, built at 20x the real point size.
+    ///
+    /// Why: this context's CTM maps user space to TWIPS (a 1/20 scale, see
+    /// init's doc), so a real-point-size CTFont's glyph outlines render at
+    /// 1/20 the intended size (Task 11 review finding 1: 12pt -> 12 twips =
+    /// 0.6pt, empty-looking balloons). The first fix attempted was
+    /// compensating with `context.textMatrix = scaleX:20,y:20` before
+    /// `CTLineDraw` — that DOES restore correct glyph SIZE, but corrupts
+    /// multi-glyph line layout: with the CTM already holding a 1/20 scale, a
+    /// 20x textMatrix against it collapses every glyph after the first onto
+    /// (approximately) the same position instead of advancing along the line
+    /// (verified with a minimal repro: drawing "MMMMMMMMMM" that way renders
+    /// ONE blob, not ten M's; building the CTFont at 20x point size instead
+    /// and leaving the text matrix untouched renders all ten correctly
+    /// spaced). So: scale the FONT, not the text matrix -- glyph outlines
+    /// AND advances come out already twips-scaled, and `CTLineDraw` positions
+    /// them normally through the existing 1/20 CTM.
+    private func drawFont(for spec: FontSpec) -> CTFont {
+        if let cached = drawFontCache[spec] { return cached }
+        let sizePt = abs(CGFloat(spec.height)) / 20.0
+        let ct = makeFont(spec: spec, sizePt: sizePt * 20.0)
+        drawFontCache[spec] = ct
+        return ct
+    }
+
+    /// Build a CTLine for `bytes` in `spec` with `color`, using the CTFont
+    /// `fontForLine` returns (real point size for measurement, 20x for
+    /// drawing -- see `font(for:)` vs `drawFont(for:)`). Bytes are decoded as
     /// CP-1252, falling back to ISO Latin-1 (both are 1:1 for ASCII).
     private func line(_ spec: FontSpec, bytes: UnsafePointer<CChar>?, len: Int32,
-                      color: (r: CGFloat, g: CGFloat, b: CGFloat)) -> CTLine? {
+                      color: (r: CGFloat, g: CGFloat, b: CGFloat),
+                      fontForLine: (FontSpec) -> CTFont) -> CTLine? {
         let text = Self.decodeBytes(bytes, len: len)
         guard !text.isEmpty else { return nil }
-        let ctFont = font(for: spec)
+        let ctFont = fontForLine(spec)
         let fgColor = CGColor(colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
                               components: [color.r, color.g, color.b, 1.0])!
         // Use CoreText attribute keys directly (no AppKit dependency).
@@ -143,7 +189,7 @@ public final class CGCanvas: Canvas {
 
     public func measureText(_ f: FontSpec, bytes: UnsafePointer<CChar>?, len: Int32) -> (w: Int32, h: Int32) {
         let color = (r: CGFloat(0), g: CGFloat(0), b: CGFloat(0))
-        guard let ctLine = line(f, bytes: bytes, len: len, color: color) else {
+        guard let ctLine = line(f, bytes: bytes, len: len, color: color, fontForLine: font(for:)) else {
             return (0, 0)
         }
         var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
@@ -175,26 +221,54 @@ public final class CGCanvas: Canvas {
                          bkOpaque: Bool, bkColor: UInt32,
                          bytes: UnsafePointer<CChar>?, len: Int32) {
         let fg = cgColor(color)
-        guard let ctLine = line(f, bytes: bytes, len: len, color: fg) else { return }
+        // Real-point-size metrics (ascent/descent/width) drive the twips-space
+        // math below (baseline conversion, background rect) -- built from the
+        // MEASUREMENT font (`font(for:)`), matching what `measureText`/
+        // `fontMetrics` report, and independent of the DRAWING font's 20x
+        // scale (see `drawFont(for:)`'s doc comment).
+        guard let metricsLine = line(f, bytes: bytes, len: len, color: fg, fontForLine: font(for:))
+        else { return }
+        var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
+        let widthPt = CTLineGetTypographicBounds(metricsLine, &ascent, &descent, &leading)
+
+        // `y` is the TOP of the glyph box, not a baseline: the engine is lifted
+        // Win32 GDI code (mfc_compat.h's CDC::TextOut forwards straight to
+        // draw_text with no SetTextAlign call anywhere in the codebase, so
+        // GDI's default TA_TOP|TA_LEFT alignment applies) running in a y-up
+        // MM_TWIPS space (comicchat.h's canvas-boundary doc). TA_TOP's "top"
+        // in a y-up space is the LARGEST y of the box, with the glyphs
+        // extending downward (toward smaller y) from there — confirmed by
+        // balloon.cpp's CLabel::iDrawFormattedTextLine, whose `iBaseY` starts
+        // at `m_bbox.Top` and steps DOWN by a full line height per line.
+        // CoreText's `textPosition`, in contrast, is the BASELINE. Convert:
+        // baseline = (top-of-box) - ascent, in the same twips units as `y`.
+        let ascTwips = ascent * 20.0
+        let descTwips = descent * 20.0
+        let baselineY = CGFloat(y) - ascTwips
 
         context.saveGState()
         // Optional opaque text background: fill the line's typographic box.
         if bkOpaque {
-            var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
-            let widthPt = CTLineGetTypographicBounds(ctLine, &ascent, &descent, &leading)
             let bg = cgColor(bkColor)
             context.setFillColor(red: bg.r, green: bg.g, blue: bg.b, alpha: 1)
             // Rect in twips around the baseline (y-up: ascent above, descent below).
             let wTwips = CGFloat(widthPt) * 20.0
-            let ascTwips = CGFloat(ascent) * 20.0
-            let descTwips = CGFloat(descent) * 20.0
-            context.fill(CGRect(x: CGFloat(x), y: CGFloat(y) - descTwips,
+            context.fill(CGRect(x: CGFloat(x), y: baselineY - descTwips,
                                 width: wTwips, height: ascTwips + descTwips))
         }
-        // CoreText draws upward from the baseline; our context is y-up, so the
-        // text position IS the baseline in twips. No per-glyph flip needed.
-        context.textPosition = CGPoint(x: CGFloat(x), y: CGFloat(y))
-        CTLineDraw(ctLine, context)
+        // Draw with the DRAWING font (built at 20x point size, see
+        // `drawFont(for:)`): its glyph outlines and advances are already
+        // twips-scaled, so `CTLineDraw` positions them correctly through the
+        // existing 1/20 CTM (see init's doc) with NO text-matrix scaling
+        // needed -- scaling via `context.textMatrix` here instead was tried
+        // first and corrupts multi-glyph line layout (see `drawFont(for:)`'s
+        // doc comment for the repro). The pen position (`textPosition`) is
+        // the baseline in twips user space (matches the layout engine's x,
+        // and the baseline derived from its y above).
+        guard let drawLine = line(f, bytes: bytes, len: len, color: fg, fontForLine: drawFont(for:))
+        else { return }
+        context.textPosition = CGPoint(x: CGFloat(x), y: baselineY)
+        CTLineDraw(drawLine, context)
         context.restoreGState()
     }
 

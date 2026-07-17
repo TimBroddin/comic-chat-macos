@@ -126,6 +126,14 @@ typedef struct cc_canvas_ops {
                  int32_t do_stroke, uint32_t stroke_color, int32_t stroke_width,
                  int32_t dashed);
     void (*clip_push)(void* ctx, int32_t l, int32_t t, int32_t r, int32_t b);
+    /* clip_pop RESETS the clip to the unclipped base state — it is NOT a
+     * balanced one-level pop of the most recent clip_push. This mirrors the
+     * engine's only clip-reset path, the CDC adapter's
+     * `SelectClipRgn(NULL, RGN_COPY)`, which collapses the ENTIRE clip stack
+     * in one call; the engine never emits a call that undoes just one
+     * clip_push. A canvas implementation that pops only one level per
+     * clip_pop will leave earlier panels' clip rects active forever, which
+     * collapses every later panel's drawing into panel 1's clip region. */
     void (*clip_pop)(void* ctx);
     int32_t (*is_printing)(void* ctx);
 } cc_canvas_ops;

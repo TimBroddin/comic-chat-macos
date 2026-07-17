@@ -126,6 +126,63 @@ extension EngineGlobalStateSelfTests {
             let fraction = try nonWhiteFraction(canvas)
             #expect(fraction > 0.01)
 
+            // Guard readable balloon text (Task 11 review finding 3): the
+            // non-white-fraction check above only proves SOMETHING drew
+            // somewhere on the page — the exact bug this test would have
+            // missed (balloon text rendering 20x too small, see CGCanvas.swift
+            // drawText's textMatrix fix) leaves plenty of OTHER non-white
+            // pixels (balloon outline, avatar art, panel borders) so the >1%
+            // fraction check alone does not catch it.
+            //
+            // Sampling directly inside the composited page's first-balloon
+            // region turned out NOT to isolate glyph pixels reliably: the
+            // first balloon's real (CoreText-measured, OS-dependent, spec §9)
+            // ascent is taller than the ~80-twip gap between its baseline and
+            // the panel's top clip edge, AND the balloon's pixel footprint
+            // overlaps the avatar head art drawn in the same panel -- so
+            // "non-white pixels in that rect" is never zero, fix or no fix
+            // (verified: with the textMatrix fix reverted, that region still
+            // reported non-white pixels from surrounding art, giving a false
+            // GREEN -- see the round-1 report's RED-evidence section).
+            //
+            // Instead, isolate the exact same drawText call the compositor
+            // makes for this balloon's first line -- same FontSpec (Comic
+            // Sans MS, 12pt / LOGFONT lfHeight -240, per fonts.cpp's SetFonts
+            // and cc_compose.cpp's call site), same text, same color, same
+            // pen position (735,-80 twips, from Fixtures/strip-golden.txt line
+            // 13: `text 735,-80 color=000000 "Hello there"` -- the golden
+            // proves LAYOUT places the pen there; `stripPNG` installs the same
+            // fake layout metrics the golden was frozen under via
+            // cc_set_metrics_canvas, so this pen position applies unchanged
+            // here) -- onto a bare white CGCanvas the same panel size, with no
+            // avatar/balloon art underneath. This exercises the identical
+            // CGCanvas.drawText codepath.
+            //
+            // A plain "any non-white pixel" check is STILL not enough here:
+            // even at the buggy 1/20 scale, CoreText's antialiasing leaks a
+            // handful of faint gray pixels (verified: the reverted build
+            // draws 9 pixels, darkest channel value 173 -- a barely-visible
+            // smudge, not readable text), which would make a bare `fraction >
+            // 0` check pass on the very bug this test exists to catch. The
+            // fixed build instead paints 149 pixels with a darkest value of 0
+            // (solid black ink) -- so require BOTH a dark-ink pixel count
+            // floor and genuinely dark pixels (channel value well below
+            // antialiasing-fringe gray) to tell "readable glyphs" apart from
+            // "sub-pixel smudge."
+            do {
+                let font = FontSpec(face: "Comic Sans MS", height: -240, weight: 400)
+                let isolated = CGCanvas(widthTwips: 2300, heightTwips: 2300, scale: scale)
+                let text = "Hello there"
+                text.withCString { cptr in
+                    isolated.drawText(font, x: 735, y: -80, color: 0x00000000,
+                                       bkOpaque: false, bkColor: 0,
+                                       bytes: cptr, len: Int32(text.utf8.count))
+                }
+                let darkPixels = try darkPixelCount(isolated, maxChannelValue: 100)
+                #expect(darkPixels >= 20,
+                    "expected at least 20 genuinely dark (channel < 100) glyph pixels after drawing the first balloon's text (\"Hello there\" at 735,-80 twips, Comic Sans MS 12pt) on a bare canvas; found \(darkPixels) — balloon text is not rendering at a visible, readable scale")
+            }
+
             // Write the PNG for human review (out of tree; .superpowers/sdd
             // is gitignored). Resolve the repo root the same way the golden
             // catalog test does: 5 deletions from #filePath.
@@ -181,6 +238,37 @@ extension EngineGlobalStateSelfTests {
             i += 4
         }
         return Double(nonWhite) / Double(total)
+    }
+
+    // Count of pixels whose R channel is below `maxChannelValue` in the
+    // canvas's rendered bitmap -- a stricter test than "non-white": at the
+    // Task-11-review-finding-1 bug's 1/20 draw scale, CoreText antialiasing
+    // still leaks a few very-faint-gray pixels near the (invisible-to-the-eye)
+    // sub-pixel glyph position, which a bare "non-white" test would count as
+    // a false positive. Requiring a low channel value isolates genuinely dark
+    // (readable) glyph ink from that antialiasing fringe.
+    private func darkPixelCount(_ canvas: CGCanvas, maxChannelValue: UInt8) throws -> Int {
+        guard let cg = canvas.makeCGImage() else {
+            throw Strip.StripError(message: "makeCGImage failed")
+        }
+        let width = cg.width
+        let height = cg.height
+        var buffer = [UInt8](repeating: 0, count: width * height * 4)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let ctx = CGContext(
+            data: &buffer, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw Strip.StripError(message: "readback context failed")
+        }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+        var dark = 0
+        var i = 0
+        while i < buffer.count {
+            if buffer[i] < maxChannelValue { dark += 1 }
+            i += 4
+        }
+        return dark
     }
   }
 }
