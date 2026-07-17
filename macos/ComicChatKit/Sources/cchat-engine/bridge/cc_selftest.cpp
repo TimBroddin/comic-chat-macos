@@ -55,6 +55,15 @@ static void testContext() {
     CC_CHECK(ccContext().backdropDir == "/tmp/bg");
 }
 
+static void testCStringMidClamping() {
+    CC_CHECK(CString("ab").Mid(10) == "");
+    CC_CHECK(CString("ab").Mid(10, 5) == "");
+    CC_CHECK(CString("abcdef").Mid(2) == "cdef");
+    CC_CHECK(CString("abcdef").Mid(2, 100) == "cdef");
+    CC_CHECK(CString("abcdef").Mid(-1) == "abcdef");
+    CC_CHECK(CString("abcdef").Mid(2, -1) == "");
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -63,5 +72,6 @@ extern "C" int32_t cc_run_selftests(void) {
     testStructSizes();
     testCollections();
     testContext();
+    testCStringMidClamping();
     return g_failures;
 }

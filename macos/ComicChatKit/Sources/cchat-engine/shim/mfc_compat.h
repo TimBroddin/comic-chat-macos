@@ -128,8 +128,21 @@ public:
         m_s = buf;
     }
     CString Left(int n) const { return CString(m_s.substr(0, (size_t)n).c_str()); }
-    CString Mid(int i) const { return CString(m_s.substr((size_t)i).c_str()); }
-    CString Mid(int i, int n) const { return CString(m_s.substr((size_t)i, (size_t)n).c_str()); }
+    CString Mid(int i) const {
+        int len = (int)m_s.size();
+        if (i < 0) i = 0;
+        if (i >= len) return CString("");
+        return CString(m_s.substr((size_t)i).c_str());
+    }
+    CString Mid(int i, int n) const {
+        int len = (int)m_s.size();
+        if (i < 0) i = 0;
+        if (i >= len) return CString("");
+        if (n < 0) n = 0;
+        int remaining = len - i;
+        if (n > remaining) n = remaining;
+        return CString(m_s.substr((size_t)i, (size_t)n).c_str());
+    }
     int Find(char c) const { auto p = m_s.find(c); return p == std::string::npos ? -1 : (int)p; }
     int Find(const char* s) const { auto p = m_s.find(s); return p == std::string::npos ? -1 : (int)p; }
     void MakeUpper() { for (auto& c : m_s) c = (char)toupper((unsigned char)c); }
