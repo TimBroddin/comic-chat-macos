@@ -23,24 +23,16 @@
 #include "pe.h"
 #include "dib.h"
 #include "avatar.h"
-#include "traj.h"
 
-// --- CPanelElement (pe.h) — real bodies in panel.cpp / wmini.cpp / balloon.cpp ---
-
-// owning file: wmini.cpp:881 / balloon.cpp:641 (defined twice in the original tree)
-CPanelElement::CPanelElement(const CPanelElement& /*p*/) {
-    ASSERT(0);
-}
+// --- CPanelElement (pe.h) — real bodies in panel.cpp / balloon.cpp ---
+// Task 6 lifted balloon.cpp, which defines the copy-ctor (balloon.cpp:641)
+// and GetBBox (balloon.cpp:647) that were stubbed here (Task 4). Those two
+// stubs are gone. SetBBox's owner is panel.cpp:542 (Task 8, still stubbed).
 
 // owning file: panel.cpp:542
 BOOL CPanelElement::SetBBox(int /*left*/, int /*bottom*/, int /*right*/, int /*top*/) {
     ASSERT(0);
     return FALSE;
-}
-
-// owning file: wmini.cpp:703 / balloon.cpp:647 (defined twice in the original tree)
-void CPanelElement::GetBBox(RECT* /*r*/) {
-    ASSERT(0);
 }
 
 // --- CBodySingle (avatar.h) — real bodies in bodycam.cpp ---
@@ -103,19 +95,48 @@ void CBodyDouble::FlipBodyBox(RECT& /*fullBox*/, RECT& /*headBox*/, RECT& /*tors
     ASSERT(0);
 }
 
-// --- CArc free-function helpers (traj.h/traj.cpp, Plan 2 Task 4) — real
-//     bodies in arc.cpp, not yet lifted. CArc is only ever constructed by
-//     balloon.cpp/wmini.cpp (later-plan UI-layer files); no lifted-so-far
-//     code (the load/parse path) builds a CArc, so CArc::Draw/CArc::Dash
-//     (traj.cpp) are unreachable today -- R12(b) trap stubs, not a
-//     verbatim single-function lift. ---------------------------------------
+// --- CArc free-function helpers (DrawArc2/DashArc2, arc.cpp): the R12(b)
+//     trap stubs that lived here (Task 4) are gone -- Task 6 lifted arc.cpp
+//     (R1 only), which now defines both symbols. --------------------------
 
-// owning file: arc.cpp:97
-void DrawArc2(CDC* /*dc*/, POINT& /*start*/, POINT& /*end*/, int /*altitude*/) {
-    ASSERT(0);
-}
+// --- INTL/MIME free functions (intl.c) — Plan 2 Task 6, R12(b) variant.
+//     balloon.cpp's word-wrap path (ForceLineBreak / FindFurthestLineBreak /
+//     BreakIntoLines) calls GetMime()/iBytesofChar()/FindSubStringForINTL-
+//     ThatFits(). Their real bodies live in intl.c, which is NOT scheduled
+//     for any lift in this roadmap (it is the East-Asian MIME/DBCS layer,
+//     out of the engine-port scope, spec §"CP-1252 by default").
+//
+//     This port runs a single-byte CP-1252 codepage, so GetMime() returns
+//     NULL exactly as intl.c's `void *GetMime() { return g_pMime; }` does
+//     when no Far-East codepage is active (g_pMime stays NULL). That is the
+//     SAME already-reviewed "no DBCS/MIME on this port" posture the shim
+//     codified for IsDBCSLeadByte()->FALSE / CharNext() (Task 5). So these
+//     are R12(b) stubs, but two return their CP-1252-correct live values
+//     rather than trapping, because balloon.cpp genuinely calls them on the
+//     load/layout path and NULL/1 is the honest single-byte answer:
+//       * GetMime()      -> NULL : reproduces g_pMime==NULL (no MIME active).
+//       * iBytesofChar() -> 1    : intl.c's own `if (!g_pMime) return 1;`
+//                                  branch value under the NULL-MIME state.
+//     FindSubStringForINTLThatFits() is only ever reached when GetMime()!=NULL
+//     (guarded at balloon.cpp:289 `if (GetMime())`), so on this port it is
+//     genuinely unreachable -> a true ASSERT(0) trap. If a future Far-East
+//     build lands, intl.c must be lifted and these three stubs deleted.
+//     NOTE (reviewer): the non-trapping return values are a documented
+//     judgment call at the R12(a)/R12(b) boundary -- lifting GetMime's
+//     verbatim body would drag in the whole MIME machinery (g_pMime/SetMime/
+//     SCRIPTINFO/codepage detection), so a faithful NULL-returning stub is
+//     used instead. See p2-task-6-report.md for the full analysis.
 
-// owning file: arc.cpp:129
-void DashArc2(DASHINFO& /*d*/, POINT& /*start*/, POINT& /*end*/, int /*altitude*/) {
+extern "C" void* GetMime() { return nullptr; }  // intl.c:2682 (CP-1252: no MIME)
+
+extern "C" int iBytesofChar(BYTE /*ch*/) { return 1; }  // intl.c:2699 (NULL-MIME branch)
+
+// intl.c:506 — unreachable on this port (only called when GetMime() != NULL).
+extern "C" BOOL FindSubStringForINTLThatFits(
+    void* /*vMime*/, HDC /*hdc*/, LPCTSTR /*szString*/, int /*cbString*/,
+    DWORD* /*prgdwFormatting*/, int /*cFormats*/, LPCTSTR /*szFixedPitchName*/,
+    LPCTSTR /*szSymbolName*/, int* /*pcbFit*/, BOOL* /*pbHasBlankOrAlike*/,
+    LPSIZE /*lpSize*/, int /*nMaxExtent*/) {
     ASSERT(0);
+    return FALSE;
 }

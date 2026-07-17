@@ -8,7 +8,18 @@
 #include "traj.h"
 #include "spline.h"
 #include "format.h"
+#include "bbox.h"
+#include "pe.h"
+#include "avatar.h"
+#include "balloon.h"    // Task 6: CFontInfo/CBalloon/CBWoodring* + ::BreakIntoLines
+#include "backdrop.h"
+#include "panel.h"      // Task 6: CUnitPanelPage (SetFonts + font statics)
 #include <unistd.h>   // mkstemp, close (testShimFileApis)
+
+// ::BreakIntoLines free function (balloon.cpp) — declared here for the
+// characterization test (balloon.h declares only the CLabel:: method wrapper).
+int BreakIntoLines(CDC *pdc, int iMaxWidth, char *szString, CDWordArray *prgdwFormatting,
+                   char *rgszStarts[], int rgiLengths[], int rgiWidths[]);
 
 static int g_failures;
 #define CC_CHECK(e) do { if (!(e)) { g_failures++; ccLog("SELFTEST FAIL: %s (%s:%d)", #e, __FILE__, __LINE__); } } while (0)
@@ -1025,6 +1036,271 @@ static void cc_selftest_format() {
     dc.SelectObject((CFont*)NULL);
 }
 
+// --- Plan 2 Task 6: balloon layout engine ------------------------------------
+// Step 1 (R17): session settings struct + metricsDC() verification. The
+// original layout code reached theApp.m_comicsColor/m_charSet/m_comicsFont/
+// m_szGuiFaceName/m_iFontHeightBalloon/m_flags1 for its font + formatting
+// defaults; those become ccContext().session fields (R17). This first test
+// pins the documented default values every field is initialized to.
+
+static void cc_selftest_balloon() {
+    // (Step 1) session defaults, per the task brief's Step 1 struct plus the
+    // extra fields fonts.cpp/balloon.h actually reach (R17: doc/settings via
+    // ccContext().session). Defaults chosen to match the original's shipping
+    // registry/resource defaults: black comics text, "Comic Sans MS" 12pt.
+    CCEngineContext& ctx = ccContext();
+    CC_CHECK(ctx.session.comicsColor == RGB(0, 0, 0));
+    CC_CHECK(strcmp(ctx.session.comicsFontFace, "Comic Sans MS") == 0);
+    CC_CHECK(ctx.session.comicsFontPts == 12);
+    CC_CHECK(ctx.session.charSet == 0);
+    CC_CHECK(ctx.session.iFontHeightBalloon == 240);  // 12pt * 20 twips/pt
+    CC_CHECK(strcmp(ctx.session.guiFaceName, "Comic Sans MS") == 0);
+    CC_CHECK(ctx.session.flags1 == 0);
+
+    // (R9 shim additions for balloon.cpp/fonts.cpp) --------------------------
+    cc_set_metrics_canvas(nullptr);  // reset (each metricsDC() call below is
+                                     // separate from the CClientDC lifetime)
+    CCRecordingCanvas shimRec;
+    CDC shimDc(shimRec.handle());
+    LOGFONT slf;
+    memset(&slf, 0, sizeof(slf));
+    strcpy(slf.lfFaceName, "Comic Sans MS");
+    slf.lfHeight = -240;
+    slf.lfWeight = 400;
+    CFont sfont;
+    sfont.CreateFontIndirect(&slf);
+    shimDc.SelectObject(&sfont);
+
+    // GetTextMetrics now returns BOOL (fonts.cpp: VERIFY(pDc->GetTextMetrics))
+    // and fills tmCharSet from the selected font's charset.
+    TEXTMETRIC stm;
+    memset(&stm, 0, sizeof(stm));
+    BOOL gotMetrics = shimDc.GetTextMetrics(&stm);
+    CC_CHECK(gotMetrics == TRUE);
+    CC_CHECK(stm.tmHeight == 240);
+    CC_CHECK(stm.tmCharSet == 0);  // slf.lfCharSet was 0 (DEFAULT via memset)
+
+    // GetTextFace returns the selected font's face name (fonts.cpp doVKern
+    // "Comic Sans MS" comparison), returning its length.
+    char face[LF_FACESIZE];
+    int faceLen = shimDc.GetTextFace(LF_FACESIZE, face);
+    CC_CHECK(faceLen == (int)strlen("Comic Sans MS"));
+    CC_CHECK(strcmp(face, "Comic Sans MS") == 0);
+
+    // CPtrList::AddHead prepends; GetHeadPosition/GetNext then walk head-first.
+    int va = 1, vb = 2;
+    CPtrList plist;
+    plist.AddHead(&va);
+    plist.AddHead(&vb);  // vb now at head
+    POSITION ppos = plist.GetHeadPosition();
+    CC_CHECK(plist.GetNext(ppos) == &vb);
+    CC_CHECK(plist.GetNext(ppos) == &va);
+    CC_CHECK(ppos == nullptr);
+    plist.RemoveAll();  // fonts.cpp DestroyFonts
+    CC_CHECK(plist.GetHeadPosition() == nullptr);
+
+    // Charset constants (fonts.cpp SetFonts Far-East italic test).
+    CC_CHECK(ANSI_CHARSET == 0);
+    CC_CHECK(GREEK_CHARSET == 161);
+    CC_CHECK(TURKISH_CHARSET == 162);
+    CC_CHECK(BALTIC_CHARSET == 186);
+    CC_CHECK(RUSSIAN_CHARSET == 204);
+
+    // GetSysColor(COLOR_WINDOW) (balloon.cpp iDrawFormattedTextLine): the
+    // window background default is white on this port (RGBA end-to-end, no
+    // system theme) -- the original compared a run's fg color against it to
+    // detect "same as window bg -> transparent".
+    CC_CHECK(GetSysColor(COLOR_WINDOW) == RGB(255, 255, 255));
+
+    // SetRect (balloon.cpp bURLHit) fills a RECT.
+    RECT sr;
+    SetRect(&sr, 1, 2, 3, 4);
+    CC_CHECK(sr.left == 1 && sr.top == 2 && sr.right == 3 && sr.bottom == 4);
+
+    // DEFAULT_PITCH (balloon.cpp iDrawFormattedTextLine symbol-font branch).
+    CC_CHECK(DEFAULT_PITCH == 0);
+
+    // === Step 3 characterization tests ==================================
+    // All measurement flows through ccContext().metricsDC(), which binds to
+    // the registered metrics canvas. Register a persistent recording canvas
+    // (its fake metrics: 120 twips/byte wide, 240 tall; font_metrics height
+    // 240, ascent 190, descent 50, internal_leading 40, external_leading 20).
+    // cc_set_metrics_canvas resets the cached metricsDC (Task 6), so this
+    // rebinds cleanly even though cc_selftest_dc left one cached earlier.
+    static CCRecordingCanvas balloonMetrics;  // static: outlives this call, so
+                                              // the cached metricsDC never
+                                              // dangles for later selftests.
+    cc_set_metrics_canvas(balloonMetrics.handle());
+    // Task 6: cc_set_metrics_canvas resets the cached metricsDC so a
+    // re-registration rebinds cleanly (cc_selftest_dc left one cached against
+    // a now-destroyed canvas). Verify the rebound DC is live.
+    CDC* mdcRebound = ccContext().metricsDC();
+    CC_CHECK(mdcRebound != nullptr);
+    CC_CHECK(mdcRebound->GetDeviceCaps(LOGPIXELSY) == 1440);
+
+    CFont balloonFont;
+    {
+        LOGFONT lf;
+        memset(&lf, 0, sizeof(lf));
+        strcpy(lf.lfFaceName, "Comic Sans MS");
+        lf.lfHeight = -240;
+        lf.lfWeight = 400;
+        balloonFont.CreateFontIndirect(&lf);
+    }
+
+    // --- (a) CFontInfo ctor field arithmetic (balloon.cpp:606) ----------
+    // CFontInfo(pFont, color, nLeading=-40, nBaseAdd=30) under the fake
+    // metrics (tm.tmHeight=240, tm.tmExternalLeading=20):
+    //   m_leading  = nLeading + tmExternalLeading = -40 + 20         = -20
+    //   m_baseAdd  = nBaseAdd - tmExternalLeading =  30 - 20         =  10
+    //   topOffset  = nLeading ? 0 : FAREAST_TOPOFFSET; nLeading!=0   =>  0
+    //   m_lineHeight = tmHeight + m_leading = 240 + (-20)            = 220
+    //   m_continuationWidth = GetTextExtent("...",3).cx = 3*120      = 360
+    {
+        CFontInfo fi(&balloonFont, RGB(0, 0, 0), -40, 30);
+        CC_CHECK(fi.m_leading == -20);
+        CC_CHECK(fi.m_baseAdd == 10);
+        CC_CHECK(fi.m_topOffset == 0);
+        CC_CHECK(fi.m_lineHeight == 220);
+        CC_CHECK(fi.m_continuationWidth == 360);
+        CC_CHECK(fi.m_font == &balloonFont);
+        CC_CHECK(fi.m_crDefaultForeColor == RGB(0, 0, 0));
+    }
+    // A second CFontInfo with nLeading==0 exercises the topOffset else-branch:
+    //   m_leading = 0 + 20 = 20; m_baseAdd = 0 - 20 = -20;
+    //   topOffset = FAREAST_TOPOFFSET = 50; m_lineHeight = 240 + 20 = 260.
+    {
+        CFontInfo fi0(&balloonFont, RGB(0, 0, 0), 0, 0);
+        CC_CHECK(fi0.m_leading == 20);
+        CC_CHECK(fi0.m_baseAdd == -20);
+        CC_CHECK(fi0.m_topOffset == 50);   // FAREAST_TOPOFFSET
+        CC_CHECK(fi0.m_lineHeight == 260);
+    }
+
+    // --- (b) ::BreakIntoLines characterization (balloon.cpp:347) --------
+    // Input "hello world foo bar" (19 bytes), iMaxWidth 1200 (=10 bytes @
+    // 120 twips/byte), NULL formatting (so each byte measures 120 wide).
+    // Greedy wrap, traced by hand against the algorithm + fake metrics:
+    //   line 0 "hello"      : "hello"(600) fits, "hello world"(1320) doesn't
+    //                         -> break after "hello"          w=600  len=5
+    //   line 1 "world foo"  : "world"(600), "world foo"(1080) fit,
+    //                         "world foo bar"(1560) doesn't    w=1080 len=9
+    //   line 2 "bar"        : "bar"(360) runs to end-of-string w=360  len=3
+    // => 3 lines; widths {600,1080,360}; lengths {5,9,3}; max width 1080.
+    {
+        char text[] = "hello world foo bar";
+        char* rgszStarts[MAXLINES];
+        int rgiLengths[MAXLINES], rgiWidths[MAXLINES];
+        CDC* pdc = ccContext().metricsDC();
+        CFont* pOld = pdc->SelectObject(&balloonFont);
+        int nLines = BreakIntoLines(pdc, 1200, text, NULL, rgszStarts, rgiLengths, rgiWidths);
+        pdc->SelectObject(pOld);
+        CC_CHECK(nLines == 3);
+        CC_CHECK(rgiLengths[0] == 5 && rgiWidths[0] == 600);
+        CC_CHECK(rgiLengths[1] == 9 && rgiWidths[1] == 1080);
+        CC_CHECK(rgiLengths[2] == 3 && rgiWidths[2] == 360);
+        // rgszStarts point into `text` at the start of each wrapped line.
+        CC_CHECK(strncmp(rgszStarts[0], "hello", 5) == 0);
+        CC_CHECK(strncmp(rgszStarts[1], "world foo", 9) == 0);
+        CC_CHECK(strncmp(rgszStarts[2], "bar", 3) == 0);
+    }
+
+    // --- (d) SetFonts -> four CFontInfo statics (fonts.cpp) -------------
+    // Done before (c) because CBWoodringNormal's ctor pulls its CFontInfo
+    // from CUnitPanelPage::m_fiWNormal, which SetFonts populates.
+    // SetFonts(logFont{lfHeight=-240,face="Comic Sans MS"}, RGB(0,0,0)):
+    //   reduction = abs(-240)/180 = 1.333..; szPhysFaceName="Comic Sans MS"
+    //   so doVKern=1.
+    //   m_fiWNormal  = CFontInfo(fontBalloon, color, (int)(-40*1.333)= -53,
+    //                            (int)(30*1.333)= 40)
+    //     -> leading = -53+20 = -33; lineHeight = 240 + (-33) = 207
+    //   m_fiWWhisper = same params -> lineHeight = 207
+    //   UpdateTitleFonts (reduction' = m_unitWidth/4860; m_unitWidth =
+    //     MINUNITPANELWIDTH-1 = 2299):
+    //       reduction' = 2299/4860 = 0.473...
+    //       m_fiTitle = CFontInfo(fontTitle, color, (int)(-220*0.473*1)= -104,
+    //                             (int)(120*0.473)= 56)
+    //         -> leading = -104+20 = -84; lineHeight = 240 + (-84) = 156
+    //       m_fiShout = CFontInfo(fontShout, color, 0, 0)
+    //         -> leading = 0+20 = 20; lineHeight = 240 + 20 = 260
+    //   (doVKern for title/shout is computed the same way: physical face is
+    //    "Comic Sans MS" -> 1; title uses it, shout passes 0,0 so unaffected.)
+    {
+        LOGFONT lf;
+        memset(&lf, 0, sizeof(lf));
+        strcpy(lf.lfFaceName, "Comic Sans MS");
+        lf.lfHeight = -240;
+        lf.lfWeight = 400;
+        lf.lfCharSet = 0;  // DEFAULT-ish; == tm.tmCharSet so no substitution
+        BOOL ok = CUnitPanelPage::SetFonts(lf, RGB(0, 0, 0));
+        CC_CHECK(ok == TRUE);
+        CC_CHECK(CUnitPanelPage::m_fiWNormal != NULL);
+        CC_CHECK(CUnitPanelPage::m_fiWWhisper != NULL);
+        CC_CHECK(CUnitPanelPage::m_fiTitle != NULL);
+        CC_CHECK(CUnitPanelPage::m_fiShout != NULL);
+        CC_CHECK(CUnitPanelPage::m_fiWNormal->m_lineHeight == 207);
+        CC_CHECK(CUnitPanelPage::m_fiWWhisper->m_lineHeight == 207);
+        CC_CHECK(CUnitPanelPage::m_fiTitle->m_lineHeight == 156);
+        CC_CHECK(CUnitPanelPage::m_fiShout->m_lineHeight == 260);
+    }
+
+    // --- (c) CBalloon::SetBBox stable-bbox characterization -------------
+    // With m_fiWNormal now set, build a CBWoodringNormal for "hello world
+    // foo bar" and SetBBox it into a fixed rect. SetBBox(left,bottom,right,
+    // top) computes internals (BreakIntoLines + spline). The resulting
+    // m_trueBox (cloud bbox, balloon-local) must be stable and plausible:
+    //   width  = Right-Left  >= the longest wrapped line (1080 twips), since
+    //            the cloud must enclose the widest text line plus borders;
+    //   height = Top-Bottom  ~ nLines(3) * lineHeight(207) + vertical margins.
+    // We freeze the exact m_trueBox once observed, having hand-verified the
+    // plausibility bounds below; ShiftLines/CreateBalloonSpline use randfloat
+    // but MAXLEFTSHIFT/MAXCENTERSHIFT are both 0, so the wrap + shape are
+    // deterministic (no RNG effect on geometry).
+    {
+        CBWoodringNormal balloon("hello world foo bar", NULL, NULL);
+        // Give it a speaker anchor is not needed for SetBBox/ComputeInternals
+        // (AddArrow/tail is separate). SetBBox width small enough to force the
+        // 3-line wrap: interior width right-left-2*XBORDER must be ~1200.
+        //   XBORDER=100, so choose right-left = 1200 + 2*100 = 1400.
+        BOOL ok = balloon.SetBBox(0, 0, 1400, 0);
+        CC_CHECK(ok == TRUE);
+        // Wrapped into 3 lines (== the (b) trace): m_fInfo->m_nLines == 3.
+        CC_CHECK(balloon.m_fInfo != NULL);
+        CC_CHECK(balloon.m_fInfo->m_nLines == 3);
+        RECT tb;
+        balloon.GetCloudBBox(&tb);
+        int width  = tb.right - tb.left;
+        int height = tb.top - tb.bottom;
+        // Observed cloud bbox (frozen after hand-verifying plausibility):
+        //   L=0 T=0 R=1280 B=-751  (width 1280, height 751)
+        // Plausibility check by hand:
+        //   width  1280 == longest wrapped line (1080) + 2*XBORDER (2*100):
+        //     CreateBalloonSpline pushes each boundary filter out by XBORDER
+        //     (lFilters[i].x -= XBORDER; rFilters[i].x += XBORDER), so the
+        //     cloud encloses the widest line plus one border on each side.
+        //   height 751 ~ nLines(3)*lineHeight(207)=621 + vertical borders
+        //     (TOPBORDER/-20, YBORDER/40, baseAdd, wave height) ~ 130 twips.
+        //   Both >= the required lower bounds (width >= longest line; height
+        //   >= nLines*lineHeight), and deterministic (MAXLEFTSHIFT ==
+        //   MAXCENTERSHIFT == 0, so ShiftLines/CreateBalloonSpline use no RNG
+        //   effect on geometry).
+        CC_CHECK(tb.left == 0 && tb.top == 0);
+        CC_CHECK(tb.right == 1280 && tb.bottom == -751);
+        CC_CHECK(width == 1280);   // == 1080 (longest line) + 2*XBORDER(100)
+        CC_CHECK(width  >= 1080);  // >= longest wrapped line
+        CC_CHECK(height == 751);
+        CC_CHECK(height >= 3 * 207);  // >= nLines * lineHeight
+        // Stability: a second identical balloon yields the identical bbox
+        // (deterministic wrap + zero shift).
+        CBWoodringNormal balloon2("hello world foo bar", NULL, NULL);
+        CC_CHECK(balloon2.SetBBox(0, 0, 1400, 0) == TRUE);
+        RECT tb2;
+        balloon2.GetCloudBBox(&tb2);
+        CC_CHECK(tb2.left == tb.left && tb2.right == tb.right);
+        CC_CHECK(tb2.top == tb.top && tb2.bottom == tb.bottom);
+    }
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -1051,5 +1327,6 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_dc();
     cc_selftest_geometry();
     cc_selftest_format();
+    cc_selftest_balloon();
     return g_failures;
 }

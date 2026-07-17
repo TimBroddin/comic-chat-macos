@@ -80,12 +80,38 @@ inline DWORD GetTickCount() { return 0; }
 struct POINT { LONG x; LONG y; };
 struct SIZE  { LONG cx; LONG cy; };
 struct RECT  { LONG left; LONG top; LONG right; LONG bottom; };
+// R9 (Plan 2 Task 6): balloon.cpp forward-declares FindSubStringForINTLThatFits
+// (intl.c) with an LPSIZE out-param -- Win32's SIZE*. Never dereferenced by
+// lifted code (that function is unreachable on this CP-1252 port; see the
+// stub in cc_link_stubs.cpp), but the declaration must name a real type.
+typedef SIZE* LPSIZE;
 
 typedef DWORD COLORREF;
 #define RGB(r,g,b) ((COLORREF)(((BYTE)(r)) | (((DWORD)(BYTE)(g)) << 8) | (((DWORD)(BYTE)(b)) << 16)))
 #define GetRValue(c) ((BYTE)(c))
 #define GetGValue(c) ((BYTE)((c) >> 8))
 #define GetBValue(c) ((BYTE)((c) >> 16))
+
+// R9 (Plan 2 Task 6): Win32 SetRect fills a RECT. balloon.cpp's bURLHit uses
+// it to build the hit-test rect. Matches <winuser.h> SetRect exactly.
+inline BOOL SetRect(RECT* r, int l, int t, int rt, int b) {
+    if (!r) return FALSE;
+    r->left = l; r->top = t; r->right = rt; r->bottom = b;
+    return TRUE;
+}
+
+// R9 (Plan 2 Task 6): GetSysColor(COLOR_WINDOW) -- balloon.cpp's
+// iDrawFormattedTextLine compares a run's foreground color against the window
+// background to detect a sender-requested-transparency run. This headless
+// RGBA port has no system theme; the window background is plain white
+// (the 1998 Win32 default and the only value this comparison meaningfully
+// needs). Only COLOR_WINDOW is ever queried here.
+#define COLOR_WINDOW 5
+inline COLORREF GetSysColor(int /*index*/) {
+    // Only COLOR_WINDOW is ever queried by lifted code; white is the 1998
+    // Win32 default and the only value the transparency comparison needs.
+    return RGB(255, 255, 255);
+}
 
 // --- DIB structures (packed, wire-compatible with the .avb format) ---------
 #pragma pack(push, 2)
@@ -240,6 +266,15 @@ class CObject {
 public:
     virtual ~CObject() {}
 };
+
+// --- DECLARE_DYNAMIC (rule R9; Plan 2 Task 6, panel.h's CDamage). MFC's
+//     DECLARE_DYNAMIC(cls) declares RTTI machinery (a static CRuntimeClass +
+//     GetRuntimeClass()/IsKindOf()). panel.h's CDamage (an UpdateAllViews
+//     hint object) is the only lifted class using it, and no lifted code
+//     ever calls RUNTIME_CLASS/IsKindOf on it -- so a no-op expansion (which
+//     leaves CDamage a plain class) is exact for this port. Selftested in
+//     cc_selftest_balloon(). ---------------------------------------------------
+#define DECLARE_DYNAMIC(class_name)
 
 // --- CString (byte-oriented, MFC-flavored subset) ----------------------------
 class CString {
@@ -401,7 +436,26 @@ struct TEXTMETRIC {
     LONG tmExternalLeading;
     LONG tmAveCharWidth;
     LONG tmMaxCharWidth;
+    // R9 (Plan 2 Task 6): fonts.cpp's SetFonts reads tm.tmCharSet (line 55/77)
+    // to decide font-substitution and Far-East italic suppression. CDC::
+    // GetTextMetrics fills it from the selected font's lfCharSet (the metrics
+    // canvas has no real font engine to report an actual physical charset).
+    BYTE tmCharSet;
 };
+
+// R9 (Plan 2 Task 6): Win32 <wingdi.h> charset constants used by fonts.cpp's
+// SetFonts (Far-East-italic test) and balloon.cpp's Capitalize (R11-wrapped,
+// but must still parse). Values are Win32's exact <wingdi.h> definitions.
+// DEFAULT_CHARSET (1) is already defined further down for EnumFontFamiliesEx.
+#define ANSI_CHARSET        0
+#define GREEK_CHARSET       161
+#define TURKISH_CHARSET     162
+#define BALTIC_CHARSET      186
+#define RUSSIAN_CHARSET     204
+// R9 (Plan 2 Task 6): DEFAULT_PITCH (low-nibble pitch value 0) -- balloon.cpp's
+// iDrawFormattedTextLine sets lfPitchAndFamily's pitch to DEFAULT_PITCH for a
+// symbol-font run. FIXED_PITCH(1)/VARIABLE_PITCH(2) are defined below.
+#define DEFAULT_PITCH       0
 
 // --- HDC / GetDC / ReleaseDC (rule R9; format.cpp's nGetSpecialFontIndex --
 //     the mandatory GetFormattedTextExtent-reachable function that probes
@@ -518,6 +572,12 @@ class CBitmap {};
 class CDC {
 public:
     BOOL m_bPrinting = FALSE;
+    // R9 (Plan 2 Task 6): MFC's CDC exposes a public m_hDC handle. balloon.cpp
+    // passes pdc->m_hDC to FindSubStringForINTLThatFits (dead INTL path, stub)
+    // and DrawTextEx (CStarLabel::Draw, R11-wrapped render). HDC is an opaque
+    // non-null token in this port (same convention as GetSafeHdc); it's only
+    // ever handed to a stub or a wrapped-out call, never dereferenced.
+    HDC m_hDC = (HDC)this;
 
     explicit CDC(cc_canvas* canvas) : canvas_(canvas) {}
 
@@ -537,7 +597,14 @@ public:
         canvasWrap().measure_text(&f, s, len, &w, &h);
         return CSize(w, h);
     }
-    void GetTextMetrics(TEXTMETRIC* tm) const {
+    // R9 (Plan 2 Task 6): returns BOOL (was void) so fonts.cpp's
+    // VERIFY(pDc->GetTextMetrics(&tm)) / balloon.cpp's VERIFY(...) compile --
+    // MFC's CDC::GetTextMetrics returns BOOL (success). Always succeeds here.
+    // Also fills tmCharSet from the selected font's lfCharSet (the metrics
+    // canvas reports no physical charset; the requested charset is the honest
+    // stand-in, and matches fonts.cpp's "lfCharSet == tm.tmCharSet" no-op
+    // expectation when the requested font is available).
+    BOOL GetTextMetrics(TEXTMETRIC* tm) const {
         cc_font_spec f = currentFontSpec();
         cc_text_metrics m;
         memset(&m, 0, sizeof(m));
@@ -549,6 +616,21 @@ public:
         tm->tmExternalLeading = m.external_leading;
         tm->tmAveCharWidth = m.ave_char_width;
         tm->tmMaxCharWidth = m.max_char_width;
+        tm->tmCharSet = f.charset;
+        return TRUE;
+    }
+    // R9 (Plan 2 Task 6): fonts.cpp reads the *physical* face name of the
+    // currently-selected font (GetTextFace) to gate the "Comic Sans MS"
+    // vertical-kerning tweak. The metrics canvas has no font substitution, so
+    // the physical face equals the requested face. Copies it into buf (up to
+    // count chars incl. NUL) and returns its length, matching Win32's
+    // GetTextFace return value.
+    int GetTextFace(int count, char* buf) const {
+        cc_font_spec f = currentFontSpec();
+        if (count <= 0 || !buf) return 0;
+        strncpy(buf, f.face, (size_t)count - 1);
+        buf[count - 1] = '\0';
+        return (int)strlen(buf);
     }
     COLORREF SetTextColor(COLORREF c) { COLORREF old = textColor_; textColor_ = c; return old; }
     int SetBkMode(int mode) { int old = bkMode_; bkMode_ = mode; return old; }
@@ -660,6 +742,10 @@ public:
         arc(p3, {p3.x + ox, p3.y}, {p0.x, p0.y - oy}, p0);
         emitPath(pts, 12, /*doFill=*/1, /*doStroke=*/1);
     }
+    // R9 (Plan 2 Task 6): MFC's CDC::Ellipse is overloaded on LPCRECT.
+    // balloon.cpp's CBWoodringThink::Draw calls pdc->Ellipse(&circRect) (the
+    // think-bubble circles). Forwards to the (l,t,r,b) form above.
+    void Ellipse(const RECT* r) { Ellipse(r->left, r->top, r->right, r->bottom); }
 
     // --- solid fills -----------------------------------------------------
     void FillSolidRect(const RECT* r, COLORREF color) {
@@ -819,6 +905,14 @@ public:
     // CDWordArray::InsertAt(index, newElement) semantics exactly.
     void InsertAt(int i, T v) { m_v.insert(m_v.begin() + i, v); }
     void FreeExtra() { m_v.shrink_to_fit(); }  // R9: releases unused capacity, like MFC's FreeExtra()
+    // R9 (Plan 2 Task 6): MFC's CArray::GetData returns a pointer to the
+    // contiguous element storage. balloon.cpp's FindFurthestLineBreakIntl
+    // (dead INTL path) passes prgdwFormatting->GetData() to
+    // FindSubStringForINTLThatFits. Empty-array case returns NULL (MFC returns
+    // a valid-but-unusable pointer for size 0; NULL is safer and the one
+    // caller already guards with `prgdwFormatting ? ...->GetData() : NULL`).
+    T* GetData() { return m_v.empty() ? nullptr : m_v.data(); }
+    const T* GetData() const { return m_v.empty() ? nullptr : m_v.data(); }
 protected:
     std::vector<T> m_v;
 };
@@ -975,6 +1069,16 @@ private:
 class CPtrList {
 public:
     void AddTail(void* p) { m_v.push_back(p); }
+    // R9 (Plan 2 Task 6): fonts.cpp builds m_fonts/m_fontInfos with AddHead
+    // (prepend), then DestroyFonts walks head-to-tail deleting each. MFC's
+    // AddHead inserts at the front; order only matters for the walk, and
+    // DestroyFonts deletes every element regardless, so prepend-vs-append is
+    // behaviorally identical there -- but AddHead's contract is "prepend", so
+    // that is what it does (GetHeadPosition then yields the most recent add).
+    void AddHead(void* p) { m_v.insert(m_v.begin(), p); }
+    // R9 (Plan 2 Task 6): fonts.cpp's DestroyFonts calls m_fonts.RemoveAll()/
+    // m_fontInfos.RemoveAll() after deleting every element. Clears the list.
+    void RemoveAll() { m_v.clear(); }
     POSITION GetHeadPosition() const {
         return m_v.empty() ? nullptr : (POSITION)(uintptr_t)1;
     }
