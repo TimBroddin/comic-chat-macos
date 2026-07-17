@@ -12,23 +12,41 @@ int32_t cc_engine_version(void);
 void    cc_set_art_dirs(const char* avatar_dir, const char* backdrop_dir);
 int32_t cc_run_selftests(void);
 
-/* Temporary smoke-test hook for the avatar loading chain (Task 4). Loads the
- * .avb file at `path` via the original CAvatarFileStream/CAvatarX::LoadAvatar
- * code, copies its name into name_out (best-effort truncated to name_cap),
- * and writes its pose count into pose_count_out. Returns 0 on success,
- * non-zero on any failure. Replaced by the real cc_avatar_* API in Task 6. */
-int32_t cc_smoke_load_avatar(const char* path, char* name_out, size_t name_cap,
-                             int32_t* pose_count_out);
+/* ============================================================================
+ * Permanent art API (Task 6). RGBA is always 8-bit/channel, row-major,
+ * top-to-bottom, straight (non-premultiplied) alpha. `rgba` is malloc'd by
+ * the bridge and must be released with cc_image_free — exactly once, and
+ * only via this function (never free() it directly). A zeroed cc_image
+ * (width=0, height=0, rgba=NULL) is always safe to pass to cc_image_free. */
 
-/* Temporary smoke-test hook for the backdrop loading chain (Task 5). Loads the
- * .bgb (or .bmp) file at `path` via the original
- * CAvatarFileStream/CChatBackdrop::LoadBackdrop code, copies the backdrop's
- * URL (best-effort truncated to name_cap; empty string if none) into
- * name_out, and writes the loaded DIB's width/height into width_out/
- * height_out. Returns 0 on success, non-zero on any failure. Replaced by the
- * real cc_backdrop_* API in Task 6. */
-int32_t cc_smoke_load_backdrop(const char* path, char* name_out, size_t name_cap,
-                               int32_t* width_out, int32_t* height_out);
+typedef struct cc_image {
+    int32_t width;
+    int32_t height;
+    uint8_t* rgba; /* width*height*4 bytes, RGBA8, or NULL if not populated */
+} cc_image;
+
+void cc_image_free(cc_image* img);
+
+/* An opened avatar file (.avb). Owns the underlying parsed CAvatarX object
+ * for the lifetime between cc_avatar_open and cc_avatar_close. */
+typedef struct cc_avatar cc_avatar;
+
+cc_avatar*  cc_avatar_open(const char* path);   /* NULL on failure */
+void        cc_avatar_close(cc_avatar* av);     /* no-op if av == NULL */
+const char* cc_avatar_name(const cc_avatar* av); /* never NULL; "" if unknown */
+int32_t     cc_avatar_pose_count(const cc_avatar* av);
+const char* cc_avatar_pose_name(const cc_avatar* av, int32_t idx); /* never NULL */
+int32_t     cc_avatar_pose_image(const cc_avatar* av, int32_t idx, cc_image* out); /* 0 = ok */
+
+/* An opened backdrop file (.bgb or .bmp). Owns the underlying parsed
+ * CChatBackdrop object for the lifetime between cc_backdrop_open and
+ * cc_backdrop_close. */
+typedef struct cc_backdrop cc_backdrop;
+
+cc_backdrop* cc_backdrop_open(const char* path); /* NULL on failure */
+void         cc_backdrop_close(cc_backdrop* bd); /* no-op if bd == NULL */
+const char*  cc_backdrop_name(const cc_backdrop* bd); /* never NULL; "" if unknown */
+int32_t      cc_backdrop_image(const cc_backdrop* bd, cc_image* out); /* 0 = ok */
 
 #ifdef __cplusplus
 }

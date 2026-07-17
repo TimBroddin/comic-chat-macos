@@ -31,7 +31,8 @@ let package = Package(
         ),
         .testTarget(
             name: "ComicChatKitTests",
-            dependencies: ["ComicChatKit"]
+            dependencies: ["ComicChatKit"],
+            resources: [.copy("Fixtures")]
         ),
     ],
     cxxLanguageStandard: .cxx17
