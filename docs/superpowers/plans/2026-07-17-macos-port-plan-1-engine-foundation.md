@@ -33,6 +33,7 @@ When a copied original file fails to compile, fix it **only** in these ways, in 
 | R7 | `AfxMessageBox`, UI notification calls | Replace with `ccLog("...")` |
 | R8 | Includes of UI/doc headers (`chatdoc.h`, `binddoc.h`, `ui.h`, `userinfo.h`, `pageview.h`, `histent.h`) | Delete the include. If a type from them is genuinely needed by model code, forward-declare it and keep usage pointer-opaque; if a code path needs their behavior, `#ifndef CC_NO_UI` it out. |
 | R9 | A missing MFC type/member the shim lacks | Add the **minimal** member to `mfc_compat.h`, with a selftest exercising it. Never add speculatively. |
+| R10 | Original code needed by a lifted call site or a task-mandated test, but disabled in the original build (`#if 0`, dead `#ifdef`) | Re-enable it **verbatim** (move the definition out of the disabled region, changing nothing else); note it in the report. Added 2026-07-17 during Task 3 for `CDIB::GetNumClrEntries()`. |
 
 Anything not covered above: stop and flag rather than improvise.
 
