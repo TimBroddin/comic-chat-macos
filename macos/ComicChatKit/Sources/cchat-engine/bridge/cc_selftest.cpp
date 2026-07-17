@@ -7,6 +7,7 @@
 #include "vector2d.h"
 #include "traj.h"
 #include "spline.h"
+#include "format.h"
 #include <unistd.h>   // mkstemp, close (testShimFileApis)
 
 static int g_failures;
@@ -934,6 +935,96 @@ static void cc_selftest_geometry() {
     }
 }
 
+// --- Plan 2 Task 5: format.h/.cpp formatting/measurement half ---------------
+// (a) GetFormattedTextExtent(dc, "hello", 5, NULL): the lifted code's actual
+//     NULL-formatting handling is bSizorPresent(NULL) -- which returns FALSE
+//     on its very first line ("if (!prgdwFormatting) return FALSE;") -- so
+//     GetFormattedTextExtent takes its early-return branch
+//     (`if (!bSizorPresent(...)) return pdc->GetTextExtent(...)`) and never
+//     touches the per-run font-swap loop at all. Under the recording
+//     canvas's fake metrics (120 twips/byte, height 240 regardless of
+//     style), GetTextExtent("hello", 5) = 5*120=600 wide, 240 tall.
+// (b) Two-run case built via InsertFormat(NULL, TRUE, wBold, 2): since the
+//     array starts NULL, InsertFormat takes its "empty array" branch
+//     (ASSERT(bAddFormat) passes, ignores the find-insertion-point search)
+//     and produces a single entry MAKELONG(wBold, 2) -- format=wBold from
+//     offset 2 onward. Feeding "aabb" (len 4) through GetFormattedTextExtent
+//     with that 1-entry array: bSizorPresent sees wFormat & wBold set on
+//     that entry -> TRUE, so the per-run loop runs. Run 1 measures
+//     szInput[0..2) = "aa" (2 bytes * 120 = 240). After the loop's single
+//     iteration (iUpper=0), the trailing tail (wMaxLen=4 > wCurLen=2) is
+//     measured too: szInputTmp = szInput+2 = "bb", length wMaxLen-wCurLen=2
+//     -> 240. Fake metrics ignore the lfWeight=700 style swap, so total
+//     width = 240+240 = 480, height = max(240,240) = 240.
+// (c) SzControlLess("a\x02b", &arr): iterates byte-by-byte. 'a' opens the
+//     output buffer (szOutput=szWrite=szInput). chCtlBold (0x02) is a
+//     control byte: SzSkipOneFormat sets wFormat |= wBold (0x0100) via the
+//     output param and returns szRead+1 (the control byte's *own* position
+//     + 1, since the chCtlBold case doesn't itself advance szRead before
+//     the switch's break) -- i.e. skips exactly the one control byte,
+//     landing back on 'b'. bNewFormatInPlace is now TRUE. 'b' is copied to
+//     szWrite (now szInput+1, i.e. output offset 1), and because
+//     bNewFormatInPlace is TRUE, exactly one formatting entry is appended:
+//     MAKELONG(wBold, szWrite-szOutput) = MAKELONG(0x0100, 1) -- "from
+//     output offset 1 onward, bold is active" (the 'b' that followed
+//     chCtlBold in the original text). The loop then hits the NUL and
+//     terminates the output at szWrite+1 (output offset 2). Net effect:
+//     output string "ab" (control byte stripped), formatting array has
+//     exactly 1 entry packing format=wBold(0x0100) at offset=1.
+
+static void cc_selftest_format() {
+    CCRecordingCanvas rec;
+    CDC dc(rec.handle());
+    LOGFONT lf;
+    memset(&lf, 0, sizeof(lf));
+    strcpy(lf.lfFaceName, "Comic Sans MS");
+    lf.lfHeight = -240;
+    lf.lfWeight = 400;
+    CFont font;
+    font.CreateFontIndirect(&lf);
+    dc.SelectObject(&font);
+
+    // (a) NULL formatting -> bSizorPresent(NULL) is FALSE -> early-return
+    // branch -> plain GetTextExtent("hello", 5) = 600x240.
+    {
+        char text[] = "hello";
+        CSize extent = GetFormattedTextExtent(&dc, text, 5, NULL);
+        CC_CHECK(extent.cx == 600 && extent.cy == 240);
+    }
+
+    // (b) Two-run case: "aabb" with a bold switch at offset 2, built via
+    // InsertFormat on a NULL array. Expect width 480 (run-splitting
+    // arithmetic; style itself is ignored by the fake metrics).
+    {
+        CDWordArray* arr = InsertFormat(NULL, TRUE, wBold, 2);
+        CC_CHECK(arr != NULL);
+        CC_CHECK(arr->GetSize() == 1);
+        CC_CHECK(LOWORD(arr->GetAt(0)) == wBold);
+        CC_CHECK(HIWORD(arr->GetAt(0)) == 2);
+
+        char text[] = "aabb";
+        CSize extent = GetFormattedTextExtent(&dc, text, 4, arr);
+        CC_CHECK(extent.cx == 480 && extent.cy == 240);
+
+        FreeAndNullFormatting(&arr);
+        CC_CHECK(arr == NULL);
+    }
+
+    // (c) SzControlLess strips chCtlBold (0x02) from "a\x02b" -> "ab",
+    // producing exactly 1 formatting entry: format=wBold at offset=1.
+    {
+        char text[] = { 'a', chCtlBold, 'b', '\0' };
+        CDWordArray arr;
+        char* result = SzControlLess(text, &arr);
+        CC_CHECK(strcmp(result, "ab") == 0);
+        CC_CHECK(arr.GetSize() == 1);
+        CC_CHECK(LOWORD(arr.GetAt(0)) == wBold);
+        CC_CHECK(HIWORD(arr.GetAt(0)) == 1);
+    }
+
+    dc.SelectObject((CFont*)NULL);
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -959,5 +1050,6 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_canvas_truncated_cubic();
     cc_selftest_dc();
     cc_selftest_geometry();
+    cc_selftest_format();
     return g_failures;
 }

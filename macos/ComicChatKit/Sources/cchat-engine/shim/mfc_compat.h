@@ -35,6 +35,7 @@ typedef uint16_t       USHORT;
 typedef uint32_t       DWORD;
 typedef uint32_t       ULONG;
 typedef uint32_t       UINT;
+typedef int32_t        INT;    // R9: format.cpp's PushFormattingOffsetsDW(DWORD*, INT, SHORT)
 typedef int32_t        LONG;   // Win32 LONG is 32-bit; engine structs rely on it
 typedef int16_t        SHORT;  // R9: avatar loading chain (bbox.h SRECT, avatar.h m_iconIndex)
 typedef char           CHAR;   // R9: avatar.h GetIndices/SetIndices signed-byte indices
@@ -130,6 +131,34 @@ inline FILE* _tfopen(LPCTSTR path, LPCTSTR mode) { return fopen(path, mode); }
 // --- lstrcmpi (rule R9; backdrop.cpp NotifyDownloadedBackdrop uses it as a
 //     case-insensitive string compare, same semantics as stricmp) -----------
 inline int lstrcmpi(LPCSTR a, LPCSTR b) { return strcasecmp(a ? a : "", b ? b : ""); }
+
+// --- _T / _tcsXXX (rule R9; format.h's FIXEDPITCHFACENAMES/SYMBOLFACENAMES
+//     array initializers use _T("Courier") etc.; format.cpp's FFixedPitchFont/
+//     FSymbolFont/GetFormattedTextExtent use _tcscpy/_tcsicmp/_tcslen). This is
+//     an ANSI build (TCHAR == char, matching the rest of this header), so
+//     these collapse to their plain-char CRT equivalents exactly like Win32's
+//     own tchar.h does when _UNICODE is not defined. ---------------------------
+#define _T(x) __T(x)
+inline char* _tcscpy(char* dst, LPCTSTR src) { return strcpy(dst, src ? src : ""); }
+inline size_t _tcslen(LPCTSTR s) { return strlen(s ? s : ""); }
+inline int _tcsicmp(LPCTSTR a, LPCTSTR b) { return strcasecmp(a ? a : "", b ? b : ""); }
+
+// --- MAKELONG / IsDBCSLeadByte / CharNext / FillMemory (rule R9; format.cpp's
+//     formatting-array packing (OOOOEEFB DWORDs) and control-byte scanning) --
+// MAKELONG matches Win32's <windef.h> exactly: low WORD in bits 0-15, high
+// WORD in bits 16-31.
+#define MAKELONG(low, high) ((LONG)(((WORD)(low)) | (((DWORD)((WORD)(high))) << 16)))
+// This port has no East-Asian DBCS codepage active (ANSI/Latin build), so
+// IsDBCSLeadByte always reports FALSE -- matches Win32's own behavior under
+// a single-byte codepage. format.cpp's DBCS lead-byte checks become no-ops,
+// which is correct for this port (no multi-byte input is ever fed through
+// the selftest/measurement path).
+inline BOOL IsDBCSLeadByte(BYTE) { return FALSE; }
+// CharNext advances one character, skipping an extra byte for a DBCS lead
+// byte (never true here, see above) and never advancing past the terminating
+// NUL -- matches Win32's own CharNext semantics at the end of a string.
+inline LPTSTR CharNext(LPCTSTR p) { return (LPTSTR)(p + (*p ? 1 : 0)); }
+inline void FillMemory(void* dst, size_t len, BYTE val) { memset(dst, val, len); }
 
 // --- legacy OS/2-style DIB header (wire-compatible; used only to detect the
 //     older BITMAPCOREHEADER format, rule R9 for dib.cpp) --------------------
@@ -305,6 +334,16 @@ public:
 // palette).
 class CPalette;
 
+// R8 (Plan 2 Task 5): CRichEditCtrl and CHARFORMAT stay pointer-only opaque
+// types -- format.h declares PRGDWGetFormatting(CRichEditCtrl*, ...) and
+// bLOGFONTToCHARFORMAT(..., CHARFORMAT*) so their signatures must still
+// name real types, but every function body that dereferences them
+// (PRGDWGetFormatting, bLOGFONTToCHARFORMAT, MatchFont) is whole-function
+// R11-wrapped under CC_NO_UI in format.cpp -- no lifted code outside those
+// wrapped bodies ever needs a real member of either type.
+class CRichEditCtrl;
+struct CHARFORMAT;
+
 // --- GDI constants (rule R9; CDC adapter + selftest) -------------------------
 #define OPAQUE      2
 #define TRANSPARENT 1
@@ -318,6 +357,19 @@ class CPalette;
 // rop is a forced-explicit-transformation site (ASSERT(0) — ports that need
 // a different rop must add one deliberately, not silently inherit it here).
 
+// --- ccommon.h constants (rule R9; format.cpp's #include "ccommon.h" is
+//     deleted per R8 -- ccommon.h itself is not scheduled for any lift, it
+//     only ever supplied string-processing constants + externs for files
+//     outside this plan's scope. format.cpp uses exactly three of its
+//     constants (g_chEOS as the string terminator sentinel in the control-
+//     byte scanners, g_chComma in nFillFormatting's ^cWX,YZ construction,
+//     g_chTransparent as the fill byte for "invisible" runs in
+//     GetFormattedTextExtent's transparency case) -- reproduced verbatim
+//     from artifacts/inc/ccommon.h's const TCHAR definitions. ---------------
+const TCHAR g_chEOS         = _T('\0');
+const TCHAR g_chComma       = _T(',');
+const TCHAR g_chTransparent = 0x01;
+
 // --- LOGFONT / TEXTMETRIC (twips; rule R9, CFont/CDC::GetTextMetrics) -------
 #define LF_FACESIZE 32
 struct LOGFONT {
@@ -330,8 +382,17 @@ struct LOGFONT {
     BYTE lfUnderline;
     BYTE lfStrikeOut;
     BYTE lfCharSet;
+    // R9 (Plan 2 Task 5): format.cpp's GetFormattedTextExtent toggles
+    // FIXED_PITCH/VARIABLE_PITCH bits on this field when a run's formatting
+    // switches to/from a fixed-pitch or symbol face.
+    BYTE lfPitchAndFamily;
     char lfFaceName[LF_FACESIZE];
 };
+// R9 (Plan 2 Task 5): lfPitchAndFamily bit values, matching Win32's
+// <wingdi.h> exactly (low nibble = pitch, FIXED_PITCH/VARIABLE_PITCH are
+// mutually exclusive bits within it).
+#define FIXED_PITCH    0x01
+#define VARIABLE_PITCH 0x02
 struct TEXTMETRIC {
     LONG tmHeight;
     LONG tmAscent;
@@ -342,6 +403,43 @@ struct TEXTMETRIC {
     LONG tmMaxCharWidth;
 };
 
+// --- HDC / GetDC / ReleaseDC (rule R9; format.cpp's nGetSpecialFontIndex --
+//     the mandatory GetFormattedTextExtent-reachable function that probes
+//     for fixed-pitch/symbol system fonts via EnumFontFamiliesEx). This port
+//     has no real Win32 GDI device context; HDC is an opaque non-null
+//     sentinel token, exactly like CDC::GetSafeHdc()'s existing convention.
+//     GetDC(NULL)/ReleaseDC(NULL, hdc) query/release the (nonexistent)
+//     screen DC in the original -- here they just hand back/accept the
+//     sentinel so the caller's !hdc check and later ReleaseDC call both
+//     behave exactly like the real API would on a live display. -------------
+typedef void* HWND;
+typedef void* HDC;
+inline HDC GetDC(HWND) { static int sentinel; return &sentinel; }
+inline void ReleaseDC(HWND, HDC) {}
+
+// --- Font-enumeration types + EnumFontFamiliesEx (rule R9; format.cpp's
+//     nGetSpecialFontIndex/EnumFontFamExProc). This headless port has no
+//     real font catalog to enumerate, so EnumFontFamiliesEx always reports
+//     "no font family matched" -- it never invokes the callback and returns
+//     a value the callback itself would never return (matches Win32's own
+//     documented behavior when a face name has zero installed fonts: the
+//     original's `iRet = EnumFontFamiliesEx(...)` compares `iRet == 0` to
+//     detect "callback found and stopped enumeration", so any nonzero
+//     sentinel here reproduces the honest "not found" outcome without
+//     fabricating font presence). LPARAM matches Win32's pointer-sized
+//     signed integer; CALLBACK is __stdcall on Win32 and empty here (this
+//     port has one calling convention). --------------------------------------
+typedef intptr_t LPARAM;
+#define CALLBACK
+#define FW_NORMAL 400
+#define DEFAULT_CHARSET 1
+struct ENUMLOGFONTEX { LOGFONT elfLogFont; char elfFullName[LF_FACESIZE]; char elfStyle[LF_FACESIZE]; };
+struct NEWTEXTMETRICEX { TEXTMETRIC ntmTm; };
+typedef int (CALLBACK *FONTENUMPROC)(ENUMLOGFONTEX*, NEWTEXTMETRICEX*, int, LPARAM);
+inline int EnumFontFamiliesEx(HDC, LOGFONT*, FONTENUMPROC, LPARAM, DWORD) {
+    return 1;  // no matching font family found; callback never invoked
+}
+
 // --- CFont (rule R9; CDC::SelectObject/GetCurrentFont, format.cpp-style
 //     per-run CreateFontIndirect callers in a later task) -------------------
 class CFont {
@@ -351,6 +449,18 @@ public:
         m_lf = *lf;
         return TRUE;
     }
+    // R9 (Plan 2 Task 5): format.cpp's GetFormattedTextExtent reads the
+    // currently-selected font back out via pOldFont->GetLogFont(&logFontOld)
+    // before iterating per-run overrides -- exact inverse of
+    // CreateFontIndirect above (which itself stores m_lf = *lf).
+    void GetLogFont(LOGFONT* lf) const { *lf = m_lf; }
+    // R9 (Plan 2 Task 5): format.cpp calls fontTmp.DeleteObject() after each
+    // per-run SelectObject/GetTextExtent round-trip. MFC's CGdiObject::
+    // DeleteObject() frees the underlying GDI handle; this CFont never holds
+    // a real GDI handle (see CreateFontIndirect above -- it's a LOGFONT
+    // value holder), so this is a no-op, matching this shim's established
+    // posture for CPen/CBrush (also handle-less value holders).
+    BOOL DeleteObject() { return TRUE; }
     // Translates this LOGFONT into the cc_canvas boundary's font_spec (Plan 2
     // spec Sec4.3, comicchat.h). Twips pass through unchanged (R14 header).
     cc_font_spec spec() const {
@@ -703,6 +813,11 @@ public:
     void SetAt(int i, T v) { m_v[(size_t)i] = v; }
     int Add(T v) { m_v.push_back(v); return (int)m_v.size() - 1; }
     void RemoveAt(int i) { m_v.erase(m_v.begin() + i); }
+    // R9 (Plan 2 Task 5): format.cpp's InsertFormat inserts a new formatting
+    // DWORD at a computed index i (the first entry whose offset is >= the
+    // new offset), shifting everything from i onward up by one -- MFC's
+    // CDWordArray::InsertAt(index, newElement) semantics exactly.
+    void InsertAt(int i, T v) { m_v.insert(m_v.begin() + i, v); }
     void FreeExtra() { m_v.shrink_to_fit(); }  // R9: releases unused capacity, like MFC's FreeExtra()
 protected:
     std::vector<T> m_v;
