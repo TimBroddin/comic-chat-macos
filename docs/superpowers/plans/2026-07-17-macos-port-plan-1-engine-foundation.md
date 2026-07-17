@@ -36,6 +36,7 @@ When a copied original file fails to compile, fix it **only** in these ways, in 
 | R10 | Original code needed by a lifted call site or a task-mandated test, but disabled in the original build (`#if 0`, dead `#ifdef`) | Re-enable it **verbatim** (move the definition out of the disabled region, changing nothing else); note it in the report. Added 2026-07-17 during Task 3 for `CDIB::GetNumClrEntries()`. |
 | R11 | A whole function in a lifted file serves the UI/session layer (my-avatar selection, screen-name lookup, body-cam refresh, chat-doc access) **or the protocol layer** (annotation byte codecs calling Plan-3 code) and is not required by the load/parse path | Wrap the **entire definition** in `#ifndef CC_NO_UI` (UI/session) or `#ifndef CC_NO_PROTOCOL` (protocol; define added to Package.swift, removed by Plan 3). Exception for vtable completeness: if it overrides a virtual that lifted code instantiates (e.g. `SetSequential`), keep the definition and wrap only the UI-dependent internals, with a safe no-op/failure `#else`. Header declarations stay. List every R11 exclusion individually in the report. Added 2026-07-17 during Task 4 for `avatar.cpp` (`SetMyAvatar` ×2, `GetScreenName`, `RefreshBodyCam`/`RefreshBodyPreview` call sites, `SetSequential` overrides); protocol clause added for `avatario.cpp` `EmotionToBytes`/`BytesToEmotion` (call `IndexToByte`/`ByteToIndex` from `protsupp.cpp`, Plan 3). |
 | R12 | A lifted class's member functions (typically virtuals needed for vtable emission) are **defined in files scheduled for a later plan** (`bodycam.cpp`, `panel.cpp`, `wmini.cpp`, `balloon.cpp`, …), producing undefined symbols at link | Two-tier fix, decided per symbol: **(a)** if the load/parse path executes it (smoke test traps in the stub, or code reading shows a load-path call), lift **that single function definition verbatim** from its original file into `engine/lifted_singles.cpp` with a provenance comment (`// lifted verbatim from <file>:<line> — full file comes in Plan N`); **(b)** otherwise add a trap stub (`{ ASSERT(0); }`, or return failure for non-void) to `engine/cc_link_stubs.cpp`, tagged with the owning file. Later plans delete stubs/singles as they lift the owning files. Added 2026-07-17 during Task 4 for `CBody*`/`CPanelElement` virtuals. |
+| R13 | Pre-standard MSVC-isms that clang rejects and no compiler flag restores (old `for`-scope variable reuse, temporaries bound to non-const references) | Apply the **minimal standard-conforming rewrite that preserves behavior exactly** (e.g. hoist the loop variable declaration; introduce a named local for the temporary). Each instance individually listed in the report with before/after. The Windows build tolerated these via `/Zc:forScope-` and MSVC permissiveness; clang has no equivalent. Added 2026-07-17 during Task 4 for two instances in `avatar.cpp`. |
 
 Anything not covered above: stop and flag rather than improvise.
 
@@ -718,9 +719,12 @@ git -C /Users/timbroddin/Projects/comic-chat commit -m "macos: lift avbfile/avat
 
 ```swift
 @Test func smokeLoadFieldBackdrop() throws {
+    // 5 deletions: SelfTests.swift → ComicChatKitTests → Tests → ComicChatKit → macos → repo root
+    // (a 4-deletion version of this landed at macos/ — bug found during Task 4)
     let repoRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent()
         .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent()
     let field = repoRoot.appendingPathComponent("v2.5-beta-1-modern/comicart/field.bgb").path
     var name = [CChar](repeating: 0, count: 256)
     var w: Int32 = 0, h: Int32 = 0
@@ -884,9 +888,11 @@ import Foundation
 // public func buildCatalog(artDir: String) throws -> [CatalogEntry]
 
 @Test func comicartMatchesGoldenCatalog() throws {
+    // 5 deletions to reach the repo root (see Task 5 note)
     let repoRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent()
         .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent()
     let artDir = ProcessInfo.processInfo.environment["CC_COMICART_DIR"]
         ?? repoRoot.appendingPathComponent("v2.5-beta-1-modern/comicart").path
     let golden = try JSONDecoder().decode([CatalogEntry].self, from: Data(contentsOf:
