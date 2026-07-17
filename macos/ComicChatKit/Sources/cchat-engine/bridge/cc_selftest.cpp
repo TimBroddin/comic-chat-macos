@@ -262,17 +262,23 @@ static void testMapWordToPtr() {
     map.SetAt(3, &c);
     CC_CHECK(map.Lookup(2, found) == TRUE && found == &b);
 
-    // Iterate via POSITION/GetNextAssoc and verify every key/value round-trips.
+    // Iterate via POSITION/GetNextAssoc and verify every key yields its exact
+    // paired value (review fix: not just "a plausible key", the right value).
     int seen = 0;
+    bool sawKey1 = false, sawKey2 = false, sawKey3 = false;
     POSITION pos = map.GetStartPosition();
     while (pos) {
         WORD key;
         void* value;
         map.GetNextAssoc(pos, key, value);
         CC_CHECK(key >= 1 && key <= 3);
+        if (key == 1) { CC_CHECK(value == &a); sawKey1 = true; }
+        else if (key == 2) { CC_CHECK(value == &b); sawKey2 = true; }
+        else if (key == 3) { CC_CHECK(value == &c); sawKey3 = true; }
         seen++;
     }
     CC_CHECK(seen == 3);
+    CC_CHECK(sawKey1 && sawKey2 && sawKey3);
 
     CC_CHECK(map.RemoveKey(2) == TRUE);
     CC_CHECK(map.Lookup(2, found) == FALSE);
@@ -281,6 +287,49 @@ static void testMapWordToPtr() {
     map.RemoveAll();
     CC_CHECK(map.Lookup(1, found) == FALSE);
     CC_CHECK(map.GetStartPosition() == nullptr);  // empty map has no iteration
+}
+
+static void testMapWordToPtrRemoveDuringIteration() {
+    // Review fix (Important): MFC's documented CMapWordToPtr contract allows
+    // RemoveKey() of any entry — including ones not yet visited — while a
+    // GetStartPosition()/GetNextAssoc() iteration is in flight. The loop must
+    // complete over the surviving entries, never yield the removed key, and
+    // never throw (mid-iteration mutation is a legal, if easy-to-misuse,
+    // real-MFC idiom — see backdrop.cpp's FlushBackDropCache callers).
+    int a = 1, b = 2, c = 3;
+    CMapWordToPtr map;
+    map.SetAt(1, &a);
+    map.SetAt(2, &b);
+    map.SetAt(3, &c);
+
+    // Snapshot the key set, then remove key 2 before the loop visits
+    // anything — unambiguously "not yet visited" regardless of the (MFC-
+    // unspecified) hash iteration order.
+    POSITION pos = map.GetStartPosition();
+    CC_CHECK(map.RemoveKey(2) == TRUE);
+
+    int seen = 0;
+    bool sawRemovedKey = false;
+    while (pos) {
+        WORD key;
+        void* value;
+        map.GetNextAssoc(pos, key, value);
+
+        if (key == 1) CC_CHECK(value == &a);
+        else if (key == 2) sawRemovedKey = true;  // must never happen
+        else if (key == 3) CC_CHECK(value == &c);
+        else CC_CHECK(false);  // unexpected key
+        seen++;
+    }
+    // Loop completed without throwing (we got here), never yielded the
+    // removed key, and still saw exactly the two surviving entries.
+    CC_CHECK(!sawRemovedKey);
+    CC_CHECK(seen == 2);
+
+    void* found = nullptr;
+    CC_CHECK(map.Lookup(1, found) == TRUE && found == &a);
+    CC_CHECK(map.Lookup(2, found) == FALSE);
+    CC_CHECK(map.Lookup(3, found) == TRUE && found == &c);
 }
 
 extern "C" int32_t cc_run_selftests(void) {
@@ -301,5 +350,6 @@ extern "C" int32_t cc_run_selftests(void) {
     testShimMacros();
     testShimStringApis2();
     testMapWordToPtr();
+    testMapWordToPtrRemoveDuringIteration();
     return g_failures;
 }

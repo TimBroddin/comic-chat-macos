@@ -308,6 +308,18 @@ typedef void* POSITION;
 //     here is that map's node in disguise, encoded as an index into a stable
 //     key list captured at GetStartPosition() time (simplest correct mapping
 //     for backdrop.cpp's single linear iterate-and-optionally-delete use). ---
+//
+// ITERATION CONTRACT (review fix, matches real MFC CMapWordToPtr behavior):
+//   - Iteration order is unspecified (hash order, not insertion order).
+//   - GetStartPosition() snapshots the key set at that moment: a SetAt() of a
+//     NEW key during an in-flight iteration is NOT reflected in that
+//     iteration (you won't see it via GetNextAssoc()).
+//   - RemoveKey() of ANY key (the one just visited, one not yet visited, or
+//     even one already visited) during an in-flight iteration is TOLERATED:
+//     GetNextAssoc() skips snapshotted keys no longer present in the map. The
+//     loop completes over the surviving entries and never throws, matching
+//     MFC's documented "removing the current element during iteration is
+//     legal" idiom.
 class CMapWordToPtr {
 public:
     explicit CMapWordToPtr(int /*nBlockSize*/ = 0) {}
@@ -330,8 +342,21 @@ public:
     }
     void GetNextAssoc(POSITION& pos, WORD& key, void*& value) const {
         size_t idx = (size_t)(uintptr_t)pos - 1;
-        key = m_iterKeys[idx];
-        value = m_map.at(key);
+        // Skip any snapshotted key that's since been removed (RemoveKey
+        // mid-iteration), so this never throws and the loop still lands on
+        // an existing entry (or runs off the end, setting pos to nullptr).
+        auto it = m_map.end();
+        while (idx < m_iterKeys.size()) {
+            it = m_map.find(m_iterKeys[idx]);
+            if (it != m_map.end()) break;
+            idx++;
+        }
+        if (idx >= m_iterKeys.size() || it == m_map.end()) {
+            pos = nullptr;
+            return;
+        }
+        key = it->first;
+        value = it->second;
         idx++;
         pos = idx < m_iterKeys.size() ? (POSITION)(uintptr_t)(idx + 1) : nullptr;
     }
