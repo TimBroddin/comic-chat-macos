@@ -122,3 +122,5 @@ against the real Windows 2.5 client — poses/avatars/whispers both directions.
   CrossOver/VM) — set this up early in Plan 3, it gates the test layer.
 - `format.cpp`/`protsupp.cpp` untangling remains the flagged unknown (spec §9);
   budget a discovery-only task at the start of Plan 3.
+
+**Task 6 handover note:** the icon pose is excluded from the pose API by design; Plan 4 pickers need a `cc_avatar_icon_image` accessor added to the bridge.
