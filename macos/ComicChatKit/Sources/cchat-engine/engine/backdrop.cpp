@@ -39,8 +39,8 @@ static CStringArray strFiles;
 
 int GetAllBackDropNames() {
 // build file search strings
-    CString strPattern;
    #ifndef CC_NO_DIRSCAN  // R5: <io.h> directory scan; Swift owns directory listing
+    CString strPattern;
 	struct _finddata_t fd;
 	long hFind;
 
