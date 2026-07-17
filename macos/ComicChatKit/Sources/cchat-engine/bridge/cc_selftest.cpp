@@ -4,6 +4,9 @@
 #include "dib.h"
 #include "cc_canvas.h"
 #include "cc_recording_canvas.h"
+#include "vector2d.h"
+#include "traj.h"
+#include "spline.h"
 #include <unistd.h>   // mkstemp, close (testShimFileApis)
 
 static int g_failures;
@@ -708,6 +711,88 @@ static void cc_selftest_canvas_truncated_cubic() {
     CC_CHECK(log[0].find("C ") == std::string::npos);
 }
 
+// --- Plan 2 Task 4: pure-geometry lift (defines.h, spline, splinutl, traj) ---
+// (a) Builds a CTraj from 3 known points via two CLine segments, draws it
+//     through a recording-canvas-bound CDC, and asserts the exact logged
+//     path string per cc_recording_canvas.h's grammar.
+// (b) A hand-computed numeric check of splinutl.cpp's split_bezier() (De
+//     Casteljau bisection) -- picked because its arithmetic is simple enough
+//     to verify by hand and unambiguous (no MFC/rounding involved, it
+//     operates on DPOINT doubles throughout).
+
+static void cc_selftest_geometry() {
+    // (a) CTraj of 2 CLine segs over 3 known points: P0=(0,0), P1=(100,0),
+    // P2=(100,50). CTraj::Draw does: BeginPath(); MoveTo(firstSeg->SegLo());
+    // for each seg, seg->Draw(dc); [CloseFigure() if m_closed]; EndPath().
+    // CLine::Draw(dc) is just dc->LineTo(m_hi). So the accumulated path is:
+    //   MoveTo(P0) -> M 0,0
+    //   seg1 (P0->P1).Draw -> LineTo(P1) -> L 100,0
+    //   seg2 (P1->P2).Draw -> LineTo(P2) -> L 100,50
+    // m_closed defaults to FALSE (CTraj ctor), so no CloseFigure/Z entry.
+    {
+        CCRecordingCanvas rec;
+        CDC dc(rec.handle());
+
+        POINT p0{0, 0}, p1{100, 0}, p2{100, 50};
+        CTraj traj;
+        traj.AddSeg(new CLine(p0, p1));
+        traj.AddSeg(new CLine(p1, p2));
+        CC_CHECK(traj.m_closed == FALSE);
+
+        CPen pen;
+        pen.CreatePen(PS_SOLID, 10, RGB(0xFF, 0, 0));   // red stroke
+        dc.SelectObject(&pen);
+        CBrush brush;
+        brush.CreateSolidBrush(RGB(0, 0, 0xFF));        // blue fill (unused: stroke only)
+        dc.SelectObject(&brush);
+
+        traj.Draw(&dc);      // accumulates BeginPath..EndPath
+        dc.StrokePath();     // emits the log line (balloon.cpp:1789/1794's
+                              // real-code pattern: m_traj->Draw(pdc); pdc->
+                              // StrokePath()/StrokeAndFillPath())
+
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == 1);
+        CC_CHECK(log[0] ==
+            "path n=3 fill=0 fillc=0000FF stroke=1 strokec=FF0000 w=10 dashed=0 [M 0,0 L 100,0 L 100,50]");
+    }
+
+    // (b) split_bezier() hand-computed check. Control polygon (an S-curve,
+    // not collinear, so both axes and the midpoint arithmetic are exercised):
+    //   p0=(0,0) p1=(0,10) p2=(10,10) p3=(10,0)
+    // De Casteljau bisection (algorithm per the code's own header comment,
+    // traced with the exact variable names/order used in split_bezier()):
+    //   left.p0  = p0                            = (0,0)
+    //   left.p1  = 0.5*(p0+p1)                    = 0.5*(0,10)          = (0,5)
+    //   t        = 0.5*(p1+p2)                    = 0.5*(10,20)         = (5,10)
+    //   left.p2  = 0.5*(left.p1+t)                = 0.5*((0,5)+(5,10))  = (2.5,7.5)
+    //   right.p3 = p3                              = (10,0)
+    //   right.p2 = 0.5*(p2+p3)                    = 0.5*(20,10)         = (10,5)
+    //   right.p1 = 0.5*(t+right.p2)               = 0.5*((5,10)+(10,5))= (7.5,7.5)
+    //   left.p3 = right.p0 = 0.5*(left.p2+right.p1) = 0.5*((2.5,7.5)+(7.5,7.5)) = (5,7.5)
+    {
+        void split_bezier(BEZIER *b, BEZIER *left, BEZIER *right);  // splinutl.cpp
+
+        BEZIER b, left, right;
+        b.p0 = {0.0, 0.0};
+        b.p1 = {0.0, 10.0};
+        b.p2 = {10.0, 10.0};
+        b.p3 = {10.0, 0.0};
+        split_bezier(&b, &left, &right);
+
+        CC_CHECK(left.p0.x == 0.0 && left.p0.y == 0.0);
+        CC_CHECK(left.p1.x == 0.0 && left.p1.y == 5.0);
+        CC_CHECK(left.p2.x == 2.5 && left.p2.y == 7.5);
+        CC_CHECK(left.p3.x == 5.0 && left.p3.y == 7.5);
+        CC_CHECK(right.p0.x == 5.0 && right.p0.y == 7.5);
+        CC_CHECK(right.p1.x == 7.5 && right.p1.y == 7.5);
+        CC_CHECK(right.p2.x == 10.0 && right.p2.y == 5.0);
+        CC_CHECK(right.p3.x == 10.0 && right.p3.y == 0.0);
+        // left/right share the split point (De Casteljau: T0 == S3).
+        CC_CHECK(left.p3.x == right.p0.x && left.p3.y == right.p0.y);
+    }
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -731,5 +816,6 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_canvas();
     cc_selftest_canvas_truncated_cubic();
     cc_selftest_dc();
+    cc_selftest_geometry();
     return g_failures;
 }

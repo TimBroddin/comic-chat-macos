@@ -3,6 +3,10 @@
 #define ENGINE_CONTEXT_H
 
 #include "mfc_compat.h"
+#include "defines.h"  // Plan 2 Task 4: chat.h (R2's replaced include) transitively
+                       // provided defines.h's BM_* mode constants etc. to every
+                       // file that included it; re-provide them here so R2-rerouted
+                       // files see the same symbols chat.h gave them.
 
 struct cc_canvas;  // comicchat.h; forward-declared to avoid a hard dependency here
 

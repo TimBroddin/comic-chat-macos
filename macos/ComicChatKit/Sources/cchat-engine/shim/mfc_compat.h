@@ -465,6 +465,10 @@ public:
         }
         curX_ = lx; curY_ = ly;
     }
+    // R9 (Plan 2 Task 4): POINT overload -- traj.cpp calls dc->MoveTo(POINT)
+    // (e.g. CTraj::Draw's `dc->MoveTo(seg->SegLo())`); GDI itself overloads
+    // MoveTo(int,int)/MoveTo(POINT) identically. Forwards to the (x,y) form.
+    void MoveTo(POINT pt) { MoveTo(pt.x, pt.y); }
     void LineTo(int x, int y) {
         int32_t lx, ly;
         toLogical(x, y, lx, ly);
@@ -480,6 +484,9 @@ public:
             curX_ = lx; curY_ = ly;
         }
     }
+    // R9 (Plan 2 Task 4): POINT overload -- traj.cpp's DashSeg calls
+    // dc->LineTo(interpedPoint) / dc->LineTo(thisPoint) with a POINT.
+    void LineTo(POINT pt) { LineTo(pt.x, pt.y); }
     void CloseFigure() {
         if (inPath_) pathPts_.push_back({CC_PATH_CLOSE, 0, 0});
     }
@@ -492,6 +499,16 @@ public:
         }
         if (count > 0) { curX_ = pathPts_.back().x; curY_ = pathPts_.back().y; }
     }
+    // R9 (Plan 2 Task 4): spline.cpp's CSpline::Draw calls
+    // dc->PolyBezierTo(bezpts+1, BezierCount()-1). Real GDI distinguishes
+    // PolyBezier (pts[0] is an explicit start point) from PolyBezierTo (all
+    // points are curve/control points continuing from the current position)
+    // -- but this adapter's PolyBezier body above already treats every point
+    // as a CC_PATH_CUBIC entry with no special-casing of pts[0], which is
+    // exactly PolyBezierTo's semantics. Same body, distinct name for fidelity
+    // with the original call sites (panel.cpp, a later plan, calls the other
+    // overload: `dc->PolyBezier(card.bezpts, card.BezierCount())`).
+    void PolyBezierTo(const POINT* pts, int count) { PolyBezier(pts, count); }
     void StrokePath() {
         emitPath(pathPts_.data(), (int32_t)pathPts_.size(), /*doFill=*/0, /*doStroke=*/1);
         pathPts_.clear();
@@ -776,6 +793,86 @@ public:
 private:
     std::unordered_map<WORD, void*> m_map;
     mutable std::vector<WORD> m_iterKeys;
+};
+
+// --- CMapStringToPtr (rule R9; spline.cpp's betaMatrixMap caches CBeta
+//     blending matrices keyed by a "%f*%f" tension/bias string). MFC's
+//     CMapStringToPtr is a CString->void* hash map with the same
+//     Lookup/SetAt/RemoveKey/RemoveAll + POSITION-based GetStartPosition()/
+//     GetNextAssoc() shape as CMapWordToPtr above (spline.cpp's
+//     DestroySplineMatrixCaches iterates-and-removes exactly like
+//     backdrop.cpp's FlushBackDropCache does over CMapWordToPtr), just keyed
+//     by string instead of WORD. Same iteration contract as CMapWordToPtr
+//     (see its comment above): unspecified order, snapshot-at-GetStartPosition,
+//     tolerates RemoveKey of any key -- visited, unvisited, or already gone --
+//     mid-iteration. MFC's SetAt dup's the key string internally; std::string
+//     already owns its storage, so no extra copy step is needed here. --------
+class CMapStringToPtr {
+public:
+    explicit CMapStringToPtr(int /*nBlockSize*/ = 0) {}
+
+    BOOL Lookup(const char* key, void*& value) const {
+        auto it = m_map.find(key ? key : "");
+        if (it == m_map.end()) return FALSE;
+        value = it->second;
+        return TRUE;
+    }
+    void SetAt(const char* key, void* value) { m_map[key ? key : ""] = value; }
+    BOOL RemoveKey(const char* key) { return (BOOL)m_map.erase(key ? key : ""); }
+    void RemoveAll() { m_map.clear(); }
+
+    POSITION GetStartPosition() const {
+        m_iterKeys.clear();
+        m_iterKeys.reserve(m_map.size());
+        for (auto& kv : m_map) m_iterKeys.push_back(kv.first);
+        return m_iterKeys.empty() ? nullptr : (POSITION)(uintptr_t)1;
+    }
+    void GetNextAssoc(POSITION& pos, CString& key, void*& value) const {
+        size_t idx = (size_t)(uintptr_t)pos - 1;
+        auto it = m_map.end();
+        while (idx < m_iterKeys.size()) {
+            it = m_map.find(m_iterKeys[idx]);
+            if (it != m_map.end()) break;
+            idx++;
+        }
+        if (idx >= m_iterKeys.size() || it == m_map.end()) {
+            pos = nullptr;
+            return;
+        }
+        key = it->first.c_str();
+        value = it->second;
+        idx++;
+        pos = idx < m_iterKeys.size() ? (POSITION)(uintptr_t)(idx + 1) : nullptr;
+    }
+
+private:
+    std::unordered_map<std::string, void*> m_map;
+    mutable std::vector<std::string> m_iterKeys;
+};
+
+// --- CPtrList (rule R9; traj.h's CTraj::m_segs holds the CSeg* chain drawn/
+//     dashed in order). MFC's CPtrList is a doubly-linked list of void*;
+//     traj.cpp's usage is the minimal "append, then walk head-to-tail" idiom
+//     (AddTail + GetHeadPosition/GetNext), so that's all that's implemented
+//     here -- backed by std::vector for simplicity, POSITION reused as a
+//     1-based index into it (index 0 doubles as "end of list", matching
+//     POSITION's NULL-means-end convention used throughout this header). ---
+class CPtrList {
+public:
+    void AddTail(void* p) { m_v.push_back(p); }
+    POSITION GetHeadPosition() const {
+        return m_v.empty() ? nullptr : (POSITION)(uintptr_t)1;
+    }
+    void* GetNext(POSITION& pos) {
+        size_t idx = (size_t)(uintptr_t)pos - 1;
+        void* value = m_v[idx];
+        idx++;
+        pos = idx < m_v.size() ? (POSITION)(uintptr_t)(idx + 1) : nullptr;
+        return value;
+    }
+
+private:
+    std::vector<void*> m_v;
 };
 
 #endif // MFC_COMPAT_H

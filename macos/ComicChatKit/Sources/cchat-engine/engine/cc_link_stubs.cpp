@@ -23,6 +23,7 @@
 #include "pe.h"
 #include "dib.h"
 #include "avatar.h"
+#include "traj.h"
 
 // --- CPanelElement (pe.h) — real bodies in panel.cpp / wmini.cpp / balloon.cpp ---
 
@@ -99,5 +100,22 @@ void CBodyDouble::GetBodyBox(CPose* /*head*/, CPose* /*body*/, RECT& /*clientRec
 
 // owning file: bodycam.cpp:447
 void CBodyDouble::FlipBodyBox(RECT& /*fullBox*/, RECT& /*headBox*/, RECT& /*torsoBox*/) {
+    ASSERT(0);
+}
+
+// --- CArc free-function helpers (traj.h/traj.cpp, Plan 2 Task 4) — real
+//     bodies in arc.cpp, not yet lifted. CArc is only ever constructed by
+//     balloon.cpp/wmini.cpp (later-plan UI-layer files); no lifted-so-far
+//     code (the load/parse path) builds a CArc, so CArc::Draw/CArc::Dash
+//     (traj.cpp) are unreachable today -- R12(b) trap stubs, not a
+//     verbatim single-function lift. ---------------------------------------
+
+// owning file: arc.cpp:97
+void DrawArc2(CDC* /*dc*/, POINT& /*start*/, POINT& /*end*/, int /*altitude*/) {
+    ASSERT(0);
+}
+
+// owning file: arc.cpp:129
+void DashArc2(DASHINFO& /*d*/, POINT& /*start*/, POINT& /*end*/, int /*altitude*/) {
     ASSERT(0);
 }
