@@ -219,6 +219,34 @@ bool bridge_decode_dib_to_rgba(BITMAPINFO* bmi, void* bits,
     return decodeDibToRgba(&dib, nullptr, outWidth, outHeight, outRgba);
 }
 
+// Plan 2 Task 7 (R14(i)): the CBody draw path (bodycam.cpp DrawBody) composites
+// a pose plane's image DIB with its separate mask DIB in a single alpha-aware
+// blit -- the RGBA collapse of the original's MERGEPAINT-mask + SRCAND-drawing
+// ROP pair (see the transparency-rule block at the top of this file for the
+// per-mask-bit ROP algebra; mask bit 1 => opaque, mask bit 0 => transparent).
+// This is the SAME decode the pose-image golden path (cc_avatar_pose_image)
+// already uses -- decodeDibToRgba(drawing, mask) -- exposed here for CDIB*
+// callers (the CDC adapter's DrawPoseImage). `maskBmi`/`maskBits` may be NULL
+// (fully-opaque plane: no separate mask, e.g. the aura decoded as its own
+// self-opaque sprite, or a mask-less pose plane). Builds transient CDIBs over
+// the caller's memory (CDIB::Create copies the header, borrows the bits) and
+// reuses decodeDibToRgba(). Returns false (outputs untouched) on failure.
+bool bridge_decode_dib_pair_to_rgba(BITMAPINFO* imgBmi, void* imgBits,
+                                     BITMAPINFO* maskBmi, void* maskBits,
+                                     int32_t* outWidth, int32_t* outHeight,
+                                     uint8_t** outRgba) {
+    if (imgBmi == nullptr || imgBits == nullptr) return false;
+    CDIB image;
+    if (!image.Create(imgBmi, (BYTE*)imgBits)) return false;
+    CDIB mask;
+    CDIB* pMask = nullptr;
+    if (maskBmi != nullptr && maskBits != nullptr) {
+        if (!mask.Create(maskBmi, (BYTE*)maskBits)) return false;
+        pMask = &mask;
+    }
+    return decodeDibToRgba(&image, pMask, outWidth, outHeight, outRgba);
+}
+
 extern "C" void cc_image_free(cc_image* img) {
     if (img == nullptr) return;
     if (img->rgba != nullptr) {

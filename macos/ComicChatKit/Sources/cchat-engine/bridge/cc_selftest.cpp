@@ -10,7 +10,9 @@
 #include "format.h"
 #include "bbox.h"
 #include "pe.h"
+#include "avbfile.h"    // Task 7: CAvatarFileStream (cc_selftest_bodydraw)
 #include "avatar.h"
+#include "avatario.h"   // Task 7: InitializeAvatars/DestroyAvatars
 #include "balloon.h"    // Task 6: CFontInfo/CBalloon/CBWoodring* + ::BreakIntoLines
 #include "backdrop.h"
 #include "panel.h"      // Task 6: CUnitPanelPage (SetFonts + font statics)
@@ -53,8 +55,9 @@ static void testColor() {
 }
 
 static void testRasterOpConstants() {
-    // R9 addition: dib.h uses SRCCOPY as a Draw() default argument, which
-    // must compile even with CC_NO_RENDER defined (declaration stays live).
+    // R9 addition: dib.h uses SRCCOPY as a Draw() default argument. Its value
+    // must match Win32 exactly -- the (now live, Task 7) CDIB::Draw bodies pass
+    // it straight to the CDC adapter's SRCCOPY-only StretchDIBits.
     CC_CHECK(SRCCOPY == 0x00CC0020);
     CC_CHECK(DIB_RGB_COLORS == 0);
 }
@@ -1299,6 +1302,133 @@ static void cc_selftest_balloon() {
         CC_CHECK(tb2.left == tb.left && tb2.right == tb.right);
         CC_CHECK(tb2.top == tb.top && tb2.bottom == tb.bottom);
     }
+}
+
+// --- Plan 2 Task 7: CBody draw path (bodycam.cpp CBody* methods now LIVE) -----
+// Opens a real fixture avatar (path passed from the Swift test, same fixture
+// the ArtTests use), registers it so GetAvatar(m_avatarID) resolves, builds a
+// body for a known emotion, then draws it through a recording-canvas CDC and
+// asserts:
+//   - exactly one "image" log line per expected blit (the R14(i) mask-ROP-pair
+//     collapse means ONE draw_image per pose plane -- not the two GDI blits the
+//     original emitted);
+//   - each blit's dest rect matches GetBodyBox's torsoRect/headRect exactly;
+//   - the DrawBody-returned fullRect matches GetBodyBox's fullRect;
+//   - no ASSERT traps fire (the ten cc_link_stubs CBody* traps are gone; if a
+//     stub survived, ASSERT(0) would abort the whole test binary).
+// Returns the failure count so the Swift wrapper can assert == 0.
+
+// Formats a RECT as the recording canvas logs an image dest rect
+// ("image dl,dt,dr,db ...") -- dest is (left,top)-(right,bottom), no origin
+// shift (the selftest draws at window origin 0). Used to compare a GetBodyBox
+// rect against a logged blit line.
+static std::string bodydrawDestPrefix(const RECT& r) {
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "image %ld,%ld,%ld,%ld ",
+                  (long)r.left, (long)r.top, (long)r.right, (long)r.bottom);
+    return std::string(buf);
+}
+
+static int cc_selftest_bodydraw(const char* avatarPath) {
+    int startFailures = g_failures;
+    InitializeAvatars();
+
+    CAvatarFileStream* pStream = new CAvatarFileStream(avatarPath);
+    CAvatarX* av = CAvatarX::LoadAvatar(pStream);
+    CC_CHECK(av != NULL);
+    if (av == NULL) { delete pStream; DestroyAvatars(); return g_failures - startFailures; }
+    av->SetStream(pStream);
+    av->IndexAvatar();  // registers into the avatars[] array so GetAvatar works
+    CC_CHECK(av->m_avatarID != 0);
+    CC_CHECK(GetAvatar(av->m_avatarID) == av);
+
+    // anna.avb is a CAvatarComplex (TORSOFIRST|HEADMASK, flags 5): its body is
+    // a CBodyDouble. Build a body for happy/full-intensity and drive the draw.
+    CAvatarComplex* avc = (CAvatarComplex*)av;
+    CEmotion emotion(1.0, 0.0);
+    CBody* body = av->GetBodyFromEmotion(emotion);
+    CC_CHECK(body != NULL);
+    CC_CHECK(body->GetClass() == BC_BODYDOUBLE);
+    CBodyDouble* dbl = (CBodyDouble*)body;
+
+    // Reference geometry: resolve the head/torso poses and compute GetBodyBox
+    // independently, so the blit dest rects can be checked against it.
+    CPose* headPose = NULL;
+    CPose* torsoPose = NULL;
+    BOOL gotPoses = avc->GetPosesFromIDs(dbl->m_faceRec->poseID, dbl->m_torsoRec->poseID,
+                                         &headPose, &torsoPose);
+    CC_CHECK(gotPoses == TRUE);
+    CC_CHECK(headPose != NULL && torsoPose != NULL);
+
+    RECT clientRect; clientRect.left = 0; clientRect.top = 0;
+    clientRect.right = 2400; clientRect.bottom = -2400;  // MM_TWIPS, y-up
+    RECT refFull, refHead, refTorso;
+    dbl->GetBodyBox(headPose, torsoPose, clientRect, refFull, refHead, refTorso);
+
+    // --- (a) drawNimbus = FALSE: exactly 2 image blits (torso drawing + head
+    //     drawing; TORSOFIRST => torso first). No aura, no other log lines.
+    {
+        CCRecordingCanvas rec;
+        CDC dc(rec.handle());
+        RECT full = dbl->DrawBody(&dc, clientRect, FALSE);
+
+        // fullRect matches GetBodyBox.
+        CC_CHECK(full.left == refFull.left && full.top == refFull.top &&
+                 full.right == refFull.right && full.bottom == refFull.bottom);
+
+        const std::vector<std::string>& log = rec.log();
+        // Only image lines, one per plane.
+        int imageCount = 0;
+        for (const std::string& l : log)
+            if (l.rfind("image ", 0) == 0) imageCount++;
+        CC_CHECK(log.size() == 2);
+        CC_CHECK(imageCount == 2);
+        if (log.size() == 2) {
+            // Blit 0 = torso drawing at torsoRect; blit 1 = head drawing at headRect.
+            CC_CHECK(log[0].rfind(bodydrawDestPrefix(refTorso), 0) == 0);
+            CC_CHECK(log[1].rfind(bodydrawDestPrefix(refHead), 0) == 0);
+        }
+    }
+
+    // --- (b) drawNimbus = TRUE: exactly 4 image blits (torso aura + head aura,
+    //     then torso drawing + head drawing). Auras blit at the same
+    //     torso/head dest rects (nimbus over the body box).
+    {
+        CCRecordingCanvas rec;
+        CDC dc(rec.handle());
+        RECT full = dbl->DrawBody(&dc, clientRect, TRUE);
+
+        CC_CHECK(full.left == refFull.left && full.top == refFull.top &&
+                 full.right == refFull.right && full.bottom == refFull.bottom);
+
+        const std::vector<std::string>& log = rec.log();
+        int imageCount = 0;
+        for (const std::string& l : log)
+            if (l.rfind("image ", 0) == 0) imageCount++;
+        CC_CHECK(log.size() == 4);
+        CC_CHECK(imageCount == 4);
+        if (log.size() == 4) {
+            // Auras first (torso, head), then drawings (torso, head).
+            CC_CHECK(log[0].rfind(bodydrawDestPrefix(refTorso), 0) == 0);
+            CC_CHECK(log[1].rfind(bodydrawDestPrefix(refHead), 0) == 0);
+            CC_CHECK(log[2].rfind(bodydrawDestPrefix(refTorso), 0) == 0);
+            CC_CHECK(log[3].rfind(bodydrawDestPrefix(refHead), 0) == 0);
+        }
+    }
+
+    delete body;
+    DestroyAvatars();  // deletes av (which owns pStream + poses/DIBs)
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift test wrapper (BodyDrawTests.swift), which passes
+// the anna.avb fixture path. Runs cc_selftest_bodydraw standalone (resets
+// g_failures) so it can be asserted == 0 independently of cc_run_selftests.
+extern "C" int32_t cc_run_bodydraw_selftest(const char* avatarPath) {
+    g_failures = 0;
+    if (avatarPath == NULL) return 1;
+    cc_selftest_bodydraw(avatarPath);
+    return g_failures;
 }
 
 extern "C" int32_t cc_run_selftests(void) {

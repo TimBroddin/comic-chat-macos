@@ -100,6 +100,16 @@ inline BOOL SetRect(RECT* r, int l, int t, int rt, int b) {
     return TRUE;
 }
 
+// R9 (Plan 2 Task 7): Win32 ::SetRectEmpty(RECT*) zeroes a RECT. bodycam.cpp's
+// CBody*::DrawBody uses the FREE-function form (not the CRect member) on the
+// early-out path when a pose fails to load. Matches <winuser.h> SetRectEmpty
+// exactly.
+inline BOOL SetRectEmpty(RECT* r) {
+    if (!r) return FALSE;
+    r->left = r->top = r->right = r->bottom = 0;
+    return TRUE;
+}
+
 // R9 (Plan 2 Task 6): GetSysColor(COLOR_WINDOW) -- balloon.cpp's
 // iDrawFormattedTextLine compares a run's foreground color against the window
 // background to detect a sender-requested-transparency run. This headless
@@ -561,6 +571,13 @@ public:
 //     placeholder so the SelectObject overload set compiles.) ---------------
 class CBitmap {};
 
+// R9 (Plan 2 Task 7): CDC::DrawPoseImage takes CDIB*/mask-CDIB* pointers (the
+// CBody draw path, bodycam.cpp). Pointer-only here; the method body (defined
+// out-of-line in mfc_compat.cpp) needs the full CDIB definition and #includes
+// dib.h there. Every other CDIB use in lifted code already #includes dib.h
+// directly.
+class CDIB;
+
 // --- CDC (Plan 2 Task 3) -----------------------------------------------------
 // Adapter over cc_canvas (Task 2). One CDC wraps exactly one cc_canvas* for
 // its lifetime; every drawing/measurement call forwards to that canvas via
@@ -778,6 +795,20 @@ public:
         cc_image_free(&img);
     }
 
+    // --- pose-plane blit with alpha (rule R14(i); Plan 2 Task 7) ---------
+    // Draws one avatar pose plane (image DIB `image`, optional separate mask
+    // DIB `mask`) as a SINGLE alpha-composited draw_image -- the RGBA collapse
+    // of the original CBody draw's MERGEPAINT-mask + SRCAND-drawing ROP pair
+    // (bodycam.cpp DrawBody). The mask supplies the alpha channel exactly as
+    // the pose-image golden path does (bridge_decode_dib_pair_to_rgba reuses
+    // the same decodeDibToRgba the golden test regression-locks). `mask` may
+    // be NULL for a self-opaque plane (a mask-less pose, or the aura sprite).
+    // The dest rect is logical coordinates (window origin applies), like every
+    // other GDI call; the src rect is the full decoded image. Defined out of
+    // line in mfc_compat.cpp (needs the full CDIB definition -- dib.h).
+    void DrawPoseImage(CDIB* image, CDIB* mask,
+                       int destX, int destY, int destW, int destH);
+
     // --- clip region (stack of rects, stored in canvas/device space -- i.e.
     //     with the window origin already applied, matching real GDI: a clip
     //     region set under one origin does not retroactively move if the
@@ -884,6 +915,24 @@ inline UINT RealizePalette(CDC*) { return 0; }
 inline int SetStretchBltMode(CDC*, int) { return 0; }
 inline BOOL GetBrushOrgEx(CDC*, POINT* pt) { pt->x = 0; pt->y = 0; return TRUE; }
 inline BOOL SetBrushOrgEx(CDC*, int, int, POINT* pt) { if (pt) { pt->x = 0; pt->y = 0; } return TRUE; }
+
+// --- free ::StretchDIBits(HDC, ...) (rule R9; Plan 2 Task 7) -----------------
+// dib.cpp's CDIB::Draw overloads (re-enabled when CC_NO_RENDER retired) call
+// the Win32 FREE function ::StretchDIBits(hdc, ...), not the CDC member. In
+// this port HDC is the CDC* itself (CDC::GetSafeHdc() returns (void*)this), so
+// this free form recovers the CDC and forwards to CDC::StretchDIBits (the
+// SRCCOPY-only adapter that decodes the palettized DIB to RGBA and blits it).
+// Signature matches Win32's ::StretchDIBits exactly (return value is the number
+// of scan lines; the sole callers, CDIB::Draw, ignore it).
+inline int StretchDIBits(HDC hdc, int destX, int destY, int destW, int destH,
+                         int srcX, int srcY, int srcW, int srcH,
+                         const void* bits, const BITMAPINFO* bmi,
+                         UINT usage, DWORD rop) {
+    if (hdc == nullptr) return 0;
+    ((CDC*)hdc)->StretchDIBits(destX, destY, destW, destH,
+                               srcX, srcY, srcW, srcH, bits, bmi, usage, rop);
+    return destH;
+}
 
 // --- collections (MFC-flavored, std::vector-backed) ---------------------------
 template <typename T>

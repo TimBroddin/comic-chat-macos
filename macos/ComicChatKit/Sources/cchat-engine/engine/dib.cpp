@@ -163,7 +163,6 @@ BOOL CDIB::Create(BITMAPINFO* pBMI, BYTE* pBits)
 // Draw the DIB to a given DC.
 void CDIB::Draw(CDC* pDC, int x, int y)
 {
-#ifndef CC_NO_RENDER
     ::StretchDIBits(pDC->GetSafeHdc(),
                     x,                        // Destination x
                     y,                        // Destination y
@@ -177,14 +176,10 @@ void CDIB::Draw(CDC* pDC, int x, int y)
                     GetBitmapInfoAddress(),   // BITMAPINFO
                     DIB_RGB_COLORS,           // Options
                     SRCCOPY);                 // Raster operation code (ROP)
-#else
-    { ASSERT(0); }
-#endif
 }
 
 void CDIB::Draw(CDC* pDC, int x, int y, int destWidth, int destHeight, int rop)
 {
-#ifndef CC_NO_RENDER
     ::StretchDIBits(pDC->GetSafeHdc(),
                     x,                        // Destination x
                     y,                        // Destination y
@@ -198,15 +193,11 @@ void CDIB::Draw(CDC* pDC, int x, int y, int destWidth, int destHeight, int rop)
                     GetBitmapInfoAddress(),   // BITMAPINFO
                     DIB_RGB_COLORS,           // Options
                     rop);                     // Raster operation code (ROP)
-#else
-    { ASSERT(0); }
-#endif
 }
 
 void CDIB::Draw(CDC* pDC, int destX, int destY, int destWidth, int destHeight,
 				int srcX, int srcY, int srcWidth, int srcHeight, int rop)
 {
-#ifndef CC_NO_RENDER
 	   ::StretchDIBits(pDC->GetSafeHdc(),
                     destX,                      // Destination x
                     destY,                      // Destination y
@@ -220,9 +211,6 @@ void CDIB::Draw(CDC* pDC, int destX, int destY, int destWidth, int destHeight,
                     GetBitmapInfoAddress(),     // BITMAPINFO
                     DIB_RGB_COLORS,             // Options
                     rop);                       // Raster operation code (ROP)
-#else
-    { ASSERT(0); }
-#endif
 }
 
 #if 0

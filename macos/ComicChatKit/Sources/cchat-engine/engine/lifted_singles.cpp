@@ -18,8 +18,8 @@
 //     * bbox_around_pt(RECT*,POINT*,int) — CBWoodringThink::Draw (bbox.cpp:12)
 //     * adjust_bbox(RECT*,int)        — dependency of bbox_around_pt (bbox.cpp:5)
 //     * inside_bbox(POINT*,RECT*)     — CLabel::bURLHit (bbox.cpp:39)
-//   (SRECTToRECT / the other bbox.cpp functions are NOT lifted: their only
-//    balloon.cpp caller is inside a CC_NO_UI wrap, so they are unreferenced.)
+//     * SRECTToRECT(SRECT&)           — CBodyDouble/CBodySingle::Draw
+//                                        (bodycam.cpp:578/614, LIVE in Task 7)
 //   Each body below is verbatim from v2.5-beta-1-modern/bbox.cpp; full file
 //   comes when a later plan lifts bbox.cpp (delete these then).
 //
@@ -87,6 +87,18 @@ BOOL bbox_overlap (RECT *bbox1, RECT *bbox2) {
 void make_empty (SRECT *bbox) {
 	bbox->Left = bbox->Bottom = LARGESHORT;
 	bbox->Right = bbox->Top = -LARGESHORT;
+}
+
+// lifted verbatim from bbox.cpp:100 — full file comes in a later plan.
+// Task 7: now referenced by the LIVE CBodyDouble/CBodySingle::Draw methods
+// (bodycam.cpp), which map the body's SRECT bbox to a RECT for DrawBody.
+RECT SRECTToRECT(SRECT &s) {
+	RECT r;
+	r.left = s.Left;
+	r.top = s.Top;
+	r.right = s.Right;
+	r.bottom = s.Bottom;
+	return r;
 }
 
 // --- Entry 2: panel.cpp static DATA member (verbatim, with initializer) -----

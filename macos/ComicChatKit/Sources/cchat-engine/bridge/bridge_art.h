@@ -17,4 +17,14 @@ bool bridge_decode_dib_to_rgba(BITMAPINFO* bmi, void* bits,
                                 int32_t* outWidth, int32_t* outHeight,
                                 uint8_t** outRgba);
 
+// Plan 2 Task 7 (R14(i)): decode an image DIB + separate mask DIB into one
+// straight-alpha RGBA8 buffer (mask supplies the alpha, exactly as the
+// pose-image golden path does). maskBmi/maskBits may be NULL for a fully-opaque
+// plane. On success *outRgba is malloc'd; release it via cc_image_free.
+// The CDC adapter's DrawPoseImage (mfc_compat.cpp) is the sole caller.
+bool bridge_decode_dib_pair_to_rgba(BITMAPINFO* imgBmi, void* imgBits,
+                                     BITMAPINFO* maskBmi, void* maskBits,
+                                     int32_t* outWidth, int32_t* outHeight,
+                                     uint8_t** outRgba);
+
 #endif // BRIDGE_ART_H

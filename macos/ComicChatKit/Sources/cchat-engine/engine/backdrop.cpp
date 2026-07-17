@@ -335,7 +335,6 @@ void DestroyBackDropArt() {
 
 void CBackDrop::Draw(CDC *dc, RECT *panelRect, RECT *)
 {
-#ifndef CC_NO_RENDER  // R4
 	CBackDropArt *art = GetBackDropArtFromID(m_backID, !dc->IsPrinting());
 	CDIB* drawing = art != NULL ? art->m_backdrop->GetDrawing () : NULL;
 	if (drawing)
@@ -372,9 +371,6 @@ void CBackDrop::Draw(CDC *dc, RECT *panelRect, RECT *)
 		// just draw white background if we can't find the art
 		dc->FillSolidRect(panelRect, RGB(255,255,255));
 	}
-#else
-	ASSERT(0);
-#endif // CC_NO_RENDER
 }
 
 // Called when a backdrop is downloaded. Finds and fixes up the entry in the

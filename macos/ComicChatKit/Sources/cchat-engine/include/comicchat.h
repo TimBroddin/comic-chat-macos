@@ -12,6 +12,13 @@ int32_t cc_engine_version(void);
 void    cc_set_art_dirs(const char* avatar_dir, const char* backdrop_dir);
 int32_t cc_run_selftests(void);
 
+/* Plan 2 Task 7: CBody draw-path selftest. Opens the avatar at avatar_path
+ * (a real .avb fixture; the Swift wrapper passes it), builds a body, draws it
+ * through a recording canvas, and asserts the image-blit count + dest rects
+ * match GetBodyBox. Returns 0 on success (failure count otherwise). Kept out
+ * of cc_run_selftests because the C++ selftests take no path argument. */
+int32_t cc_run_bodydraw_selftest(const char* avatar_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env
