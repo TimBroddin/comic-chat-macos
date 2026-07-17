@@ -24,14 +24,44 @@ typedef uint32_t       DWORD;
 typedef uint32_t       ULONG;
 typedef uint32_t       UINT;
 typedef int32_t        LONG;   // Win32 LONG is 32-bit; engine structs rely on it
+typedef int16_t        SHORT;  // R9: avatar loading chain (bbox.h SRECT, avatar.h m_iconIndex)
+typedef char           CHAR;   // R9: avatar.h GetIndices/SetIndices signed-byte indices
 typedef char           TCHAR;
 typedef const char*    LPCSTR;
 typedef char*          LPSTR;
 typedef const char*    LPCTSTR;
 typedef char*          LPTSTR;
 typedef void*          LPVOID;
+typedef BYTE*          LPBYTE;   // R9: avatar.h CPose constructor params
+typedef DWORD*         LPDWORD;  // R9: avatar.h CPose constructor params
+typedef WORD*          LPWORD;   // R9: avbfile.cpp ConvertMasksCommon pixel packing
+typedef BYTE*          PBYTE;    // R9: avbfile.cpp AllocAndReadCompressedBuffer / ConvertMasksCommon
+typedef void*          PVOID;    // R9: avbfile.cpp AllocAndReadCompressedBuffer
 #define TRUE  1
 #define FALSE 0
+
+// --- misc Win32 macros/constants (rule R9) ---------------------------------
+#define _MAX_PATH 260           // avbfile.h CAvatarFileStream::m_szFileName
+#define _MAX_FNAME 256          // avatar.cpp CAvatarX copy ctor / GetAllAvatarNames
+#define _MAX_EXT 256            // avatar.cpp GetAllAvatarNames (dir-scan stub path)
+#define LOBYTE(w)  ((BYTE)(w))
+#define HIBYTE(w)  ((BYTE)(((WORD)(w)) >> 8))
+#define LOWORD(l)  ((WORD)(l))
+#define HIWORD(l)  ((WORD)(((DWORD)(l)) >> 16))
+inline void ZeroMemory(void* p, size_t n) { memset(p, 0, n); }
+struct RGBTRIPLE { BYTE rgbtBlue; BYTE rgbtGreen; BYTE rgbtRed; };
+
+// --- CRT case-insensitive compare + min/max (rule R9; avatar.cpp) ----------
+// Win32's <windef.h> min/max are macros (no type-checking), not templates —
+// matching that exactly avoids deduction failures on the original code's
+// mixed int/float/double call sites (e.g. avatar.cpp's max(float, double)).
+inline int stricmp(const char* a, const char* b) { return strcasecmp(a ? a : "", b ? b : ""); }
+#define min(a,b) (((a) < (b)) ? (a) : (b))
+#define max(a,b) (((a) > (b)) ? (a) : (b))
+
+// --- GetTickCount (rule R9; avatar.cpp CAvatarComplex::SetSequential, only
+//     reachable inside its CC_NO_UI-stubbed internals, but must still parse) -
+inline DWORD GetTickCount() { return 0; }
 
 // --- Win32 geometry & color -----------------------------------------------
 struct POINT { LONG x; LONG y; };
@@ -74,9 +104,16 @@ struct BITMAPINFO { BITMAPINFOHEADER bmiHeader; RGBQUAD bmiColors[1]; };
 #pragma pack(pop)
 typedef RGBQUAD* LPRGBQUAD;
 typedef BITMAPINFO* LPBITMAPINFO;
+typedef BITMAPINFOHEADER* LPBITMAPINFOHEADER;  // R9: avbfile.cpp ConvertMasksCommon
 #define BI_RGB  0u
 #define BI_RLE8 1u
 #define BI_RLE4 2u
+
+// --- C-runtime string/file helpers (rule R9; avbfile.cpp CAvatarFileStream) --
+inline int lstrlen(LPCSTR s) { return (int)strlen(s ? s : ""); }
+inline char* lstrcpy(char* dst, LPCSTR src) { return strcpy(dst, src ? src : ""); }
+#define __T(x) x
+inline FILE* _tfopen(LPCTSTR path, LPCTSTR mode) { return fopen(path, mode); }
 
 // --- legacy OS/2-style DIB header (wire-compatible; used only to detect the
 //     older BITMAPCOREHEADER format, rule R9 for dib.cpp) --------------------
@@ -96,6 +133,22 @@ struct BITMAPCOREHEADER {
 #define SRCCOPY        0x00CC0020
 #define DIB_RGB_COLORS 0
 
+// --- file existence check (rule R9; avatario.cpp uses GetFileAttributes()
+//     purely to test for file existence before opening) ---------------------
+DWORD GetFileAttributes(LPCSTR pszPath);
+#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+
+// --- MFC exception raisers (rule R9; avbfile.cpp ConvertMasksCommon and
+//     CChatBackdrop::LoadBackdrop call these on allocation/format failure).
+//     MFC's AfxThrowMemoryException()/AfxThrowUserException() throw
+//     CMemoryException*/CUserException*; matching our TRY/CATCH_ALL(e) shim
+//     (plain try/catch(...)), these just throw a generic marker so the
+//     surrounding catch(...) block still triggers. ---------------------------
+struct CMemoryException {};
+struct CUserException {};
+[[noreturn]] inline void AfxThrowMemoryException() { throw CMemoryException{}; }
+[[noreturn]] inline void AfxThrowUserException() { throw CUserException{}; }
+
 // --- diagnostics ------------------------------------------------------------
 void ccLog(const char* fmt, ...);
 #ifdef NDEBUG
@@ -105,6 +158,15 @@ void ccLog(const char* fmt, ...);
 #endif
 #define VERIFY(e) do { if (!(e)) ccLog("VERIFY failed: %s (%s:%d)", #e, __FILE__, __LINE__); } while (0)
 #define TRACE(...) ccLog(__VA_ARGS__)
+
+// --- MFC exception-handling macros (rule R9; used by lifted avbfile.cpp /
+//     avatario.cpp around `new` calls that could throw). MFC's TRY/CATCH_ALL
+//     wrap try/catch(CException*); we have no CException hierarchy, so these
+//     become plain try/catch(...) blocks - any thrown exception (e.g.
+//     std::bad_alloc from `new`) is treated the same as MFC's CATCH_ALL. ---
+#define TRY try
+#define CATCH_ALL(e) catch (...)
+#define END_CATCH_ALL
 
 // --- rendering types are opaque in this plan (rule R4) ----------------------
 class CDC;
@@ -199,7 +261,7 @@ class CCArrayBase {
 public:
     int GetSize() const { return (int)m_v.size(); }
     int GetUpperBound() const { return (int)m_v.size() - 1; }
-    void SetSize(int n) { m_v.resize((size_t)n); }
+    void SetSize(int n, int nGrowBy = -1) { (void)nGrowBy; m_v.resize((size_t)n); }
     void RemoveAll() { m_v.clear(); }
     T& operator[](int i) { return m_v[(size_t)i]; }
     const T& operator[](int i) const { return m_v[(size_t)i]; }
@@ -207,6 +269,7 @@ public:
     void SetAt(int i, T v) { m_v[(size_t)i] = v; }
     int Add(T v) { m_v.push_back(v); return (int)m_v.size() - 1; }
     void RemoveAt(int i) { m_v.erase(m_v.begin() + i); }
+    void FreeExtra() { m_v.shrink_to_fit(); }  // R9: releases unused capacity, like MFC's FreeExtra()
 protected:
     std::vector<T> m_v;
 };
@@ -214,5 +277,17 @@ class CDWordArray  : public CCArrayBase<DWORD> {};
 class CPtrArray    : public CCArrayBase<void*> {};
 class CObArray     : public CCArrayBase<CObject*> {};
 class CStringArray : public CCArrayBase<CString> {};
+
+// --- CTypedPtrArray (rule R9; avatar.h: CTypedPtrArray<CPtrArray, CPose*>) ---
+// MFC's CTypedPtrArray<BASE_CLASS, TYPE> is BASE_CLASS with typed accessors.
+// CPose* is stored as void* underneath (matches CPtrArray's element type).
+template <typename BaseArray, typename T>
+class CTypedPtrArray : public BaseArray {
+public:
+    T operator[](int i) const { return (T)(BaseArray::operator[](i)); }
+    T GetAt(int i) const { return (T)BaseArray::GetAt(i); }
+    void SetAt(int i, T v) { BaseArray::SetAt(i, (void*)v); }
+    int Add(T v) { return BaseArray::Add((void*)v); }
+};
 
 #endif // MFC_COMPAT_H

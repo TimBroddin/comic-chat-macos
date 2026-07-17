@@ -18,6 +18,7 @@ let package = Package(
                 .define("CC_NO_RENDER"),
                 .define("CC_NO_DIRSCAN"),
                 .define("CC_NO_UI"),
+                .define("CC_NO_PROTOCOL"),
             ],
             linkerSettings: [
                 .linkedLibrary("z")
