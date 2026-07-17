@@ -283,6 +283,7 @@ enum AVATARRECORDTYPE
 class CAvatarStream
 {
 public:
+	virtual ~CAvatarStream() {}  // R15: ~CAvatarX deletes through base; original lacked vdtor (UB + leak)
    #if defined(AVATAR_WRITE)
 	BOOL Write32(AVBINT32 val32)
 		{ return Write (&val32, sizeof(val32)) == sizeof(val32); }

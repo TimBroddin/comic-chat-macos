@@ -1,7 +1,39 @@
 #include "mfc_compat.h"
+#include "comicchat.h"
 #include <sys/stat.h>
 
+// Plan 2 Task 1: ccLog level gate. -1 = not yet initialized; lazily seeded
+// from CC_LOG_LEVEL on first use (default 2 if unset/unparsed). 0=silent,
+// 1=errors (ASSERT/VERIFY), 2=trace.
+static int g_ccLogLevel = -1;
+
+static void ccLogLevelEnsureInit() {
+    if (g_ccLogLevel != -1) return;
+    const char* env = getenv("CC_LOG_LEVEL");
+    g_ccLogLevel = (env != nullptr) ? atoi(env) : 2;
+}
+
+int ccLogWouldEmit(int level) {
+    ccLogLevelEnsureInit();
+    return g_ccLogLevel >= level;
+}
+
+void cc_set_log_level(int32_t level) {
+    g_ccLogLevel = level;
+}
+
 void ccLog(const char* fmt, ...) {
+    ccLogLevelEnsureInit();
+    if (g_ccLogLevel < 2) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
+void ccLogError(const char* fmt, ...) {
+    ccLogLevelEnsureInit();
+    if (g_ccLogLevel < 1) return;
     va_list ap; va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);

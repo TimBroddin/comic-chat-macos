@@ -155,13 +155,18 @@ struct CUserException {};
 [[noreturn]] inline void AfxThrowUserException() { throw CUserException{}; }
 
 // --- diagnostics ------------------------------------------------------------
-void ccLog(const char* fmt, ...);
+// Plan 2 Task 1: level-gated logging. 0=silent, 1=errors (ASSERT/VERIFY
+// failures), 2=trace (default). ccLogWouldEmit lets selftests assert the gate
+// itself rather than scraping stdout/stderr.
+void ccLog(const char* fmt, ...);       // TRACE-level (gate: level >= 2)
+void ccLogError(const char* fmt, ...);  // error-level (gate: level >= 1); ASSERT/VERIFY
+int  ccLogWouldEmit(int level);
 #ifdef NDEBUG
 #define ASSERT(e) ((void)0)
 #else
-#define ASSERT(e) do { if (!(e)) { ccLog("ASSERT failed: %s (%s:%d)", #e, __FILE__, __LINE__); abort(); } } while (0)
+#define ASSERT(e) do { if (!(e)) { ccLogError("ASSERT failed: %s (%s:%d)", #e, __FILE__, __LINE__); abort(); } } while (0)
 #endif
-#define VERIFY(e) do { if (!(e)) ccLog("VERIFY failed: %s (%s:%d)", #e, __FILE__, __LINE__); } while (0)
+#define VERIFY(e) do { if (!(e)) ccLogError("VERIFY failed: %s (%s:%d)", #e, __FILE__, __LINE__); } while (0)
 #define TRACE(...) ccLog(__VA_ARGS__)
 
 // --- MFC exception-handling macros (rule R9; used by lifted avbfile.cpp /

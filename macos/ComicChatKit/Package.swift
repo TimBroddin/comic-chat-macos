@@ -20,6 +20,7 @@ let package = Package(
                 .define("CC_NO_DIRSCAN"),
                 .define("CC_NO_UI"),
                 .define("CC_NO_PROTOCOL"),
+                .unsafeFlags(["-Wno-tautological-undefined-compare"]),
             ],
             linkerSettings: [
                 .linkedLibrary("z")

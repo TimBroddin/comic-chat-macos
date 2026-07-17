@@ -332,6 +332,19 @@ static void testMapWordToPtrRemoveDuringIteration() {
     CC_CHECK(map.Lookup(3, found) == TRUE && found == &c);
 }
 
+// --- Plan 2 Task 1: ccLog level gate selftest --------------------------------
+// Entry debt fix: ccLog had no level gate at all. Verifies the gate itself
+// (ccLogWouldEmit), not stdout/stderr content, per the brief.
+
+static void cc_selftest_loglevel() {
+    cc_set_log_level(2);  // start from a known state: default level
+    CC_CHECK(ccLogWouldEmit(2) == 1);
+    cc_set_log_level(1);
+    CC_CHECK(ccLogWouldEmit(2) == 0);
+    cc_set_log_level(2);
+    CC_CHECK(ccLogWouldEmit(2) == 1);
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -351,5 +364,6 @@ extern "C" int32_t cc_run_selftests(void) {
     testShimStringApis2();
     testMapWordToPtr();
     testMapWordToPtrRemoveDuringIteration();
+    cc_selftest_loglevel();
     return g_failures;
 }
