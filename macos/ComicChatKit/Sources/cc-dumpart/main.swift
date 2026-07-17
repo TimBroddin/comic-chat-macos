@@ -10,6 +10,10 @@ import ComicChatKit
 //
 // cc-dumpart --png <file.avb> <poseIndex> <out.png> — exports a single pose
 // as a PNG file.
+//
+// cc-dumpart --strip <out.png> — renders a built-in demo comic strip (two
+// comicart avatars, a 4-line conversation) through CGCanvas and writes it as a
+// PNG. The Plan 2 exit-milestone demo.
 
 let args = CommandLine.arguments
 
@@ -29,10 +33,17 @@ do {
         let avatar = try AvatarFile(path: filePath)
         let image = try avatar.poseImage(poseIndex)
         try exportPNG(artImage: image, toPath: outPath)
+    } else if args.count >= 2 && args[1] == "--strip" {
+        guard args.count == 3 else {
+            FileHandle.standardError.write(Data("usage: cc-dumpart --strip <out.png>\n".utf8))
+            exit(64) // EX_USAGE
+        }
+        try renderDemoStrip(toPath: args[2])
     } else {
         guard args.count > 1 else {
             FileHandle.standardError.write(Data("usage: cc-dumpart <art-dir>\n".utf8))
             FileHandle.standardError.write(Data("       cc-dumpart --png <file.avb> <poseIndex> <out.png>\n".utf8))
+            FileHandle.standardError.write(Data("       cc-dumpart --strip <out.png>\n".utf8))
             exit(64) // EX_USAGE
         }
         let artDir = args[1]
