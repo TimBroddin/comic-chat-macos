@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "ComicChatKit", targets: ["ComicChatKit"]),
+        .executable(name: "cc-dumpart", targets: ["cc-dumpart"]),
     ],
     targets: [
         .target(
@@ -33,6 +34,11 @@ let package = Package(
             name: "ComicChatKitTests",
             dependencies: ["ComicChatKit"],
             resources: [.copy("Fixtures")]
+        ),
+        .executableTarget(
+            name: "cc-dumpart",
+            dependencies: ["ComicChatKit"],
+            path: "Sources/cc-dumpart"
         ),
     ],
     cxxLanguageStandard: .cxx17

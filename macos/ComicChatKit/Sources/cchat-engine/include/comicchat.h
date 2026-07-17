@@ -48,6 +48,11 @@ void         cc_backdrop_close(cc_backdrop* bd); /* no-op if bd == NULL */
 const char*  cc_backdrop_name(const cc_backdrop* bd); /* never NULL; "" if unknown */
 int32_t      cc_backdrop_image(const cc_backdrop* bd, cc_image* out); /* 0 = ok */
 
+/* CRC32 (zlib polynomial/algorithm) of an arbitrary byte buffer. Used by
+ * cc-dumpart / the golden catalog test to fingerprint decoded RGBA buffers
+ * without embedding raw pixel data in the golden JSON. */
+uint32_t cc_crc32(const uint8_t* data, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
