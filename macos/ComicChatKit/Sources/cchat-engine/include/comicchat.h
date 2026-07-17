@@ -59,6 +59,58 @@ int32_t      cc_backdrop_image(const cc_backdrop* bd, cc_image* out); /* 0 = ok 
  * without embedding raw pixel data in the golden JSON. */
 uint32_t cc_crc32(const uint8_t* data, size_t len);
 
+/* ============================================================================
+ * Canvas boundary (Plan 2, spec §4.3). All coordinates are MM_TWIPS logical
+ * units (1/1440 inch, y-up) exactly as the original GDI code used them; the
+ * implementation maps to device space. Text params are raw bytes (CP-1252 by
+ * default). color values are GDI COLORREF (0x00BBGGRR). */
+
+typedef struct cc_font_spec {
+    char    face[64];     /* e.g. "Comic Sans MS" */
+    int32_t height;       /* LOGFONT lfHeight in twips; negative = char height */
+    int32_t weight;       /* 400 normal, 700 bold */
+    uint8_t italic, underline, strikeout, charset;
+} cc_font_spec;
+
+typedef struct cc_text_metrics { /* the TEXTMETRIC fields the engine reads; twips */
+    int32_t height, ascent, descent, internal_leading, external_leading;
+    int32_t ave_char_width, max_char_width;
+} cc_text_metrics;
+
+enum { CC_PATH_MOVE = 0, CC_PATH_LINE = 1, CC_PATH_CUBIC = 2, CC_PATH_CLOSE = 3 };
+/* CC_PATH_CUBIC appears as THREE consecutive entries (control1, control2,
+ * endpoint), all with verb CC_PATH_CUBIC. */
+typedef struct cc_path_pt { int32_t verb; int32_t x, y; } cc_path_pt;
+
+typedef struct cc_canvas_ops {
+    /* measurement — must work with no drawing surface active */
+    void (*measure_text)(void* ctx, const cc_font_spec* f, const char* bytes,
+                         int32_t len, int32_t* out_w, int32_t* out_h);
+    void (*font_metrics)(void* ctx, const cc_font_spec* f, cc_text_metrics* out);
+    /* drawing */
+    void (*draw_text)(void* ctx, const cc_font_spec* f, int32_t x, int32_t y,
+                      uint32_t color, int32_t bk_opaque, uint32_t bk_color,
+                      const char* bytes, int32_t len);
+    void (*fill_rect)(void* ctx, int32_t l, int32_t t, int32_t r, int32_t b,
+                      uint32_t color);
+    void (*draw_image)(void* ctx, const cc_image* img,
+                       int32_t dl, int32_t dt, int32_t dr, int32_t db,
+                       int32_t sl, int32_t st, int32_t sr, int32_t sb);
+    void (*path)(void* ctx, const cc_path_pt* pts, int32_t n,
+                 int32_t do_fill, uint32_t fill_color,
+                 int32_t do_stroke, uint32_t stroke_color, int32_t stroke_width,
+                 int32_t dashed);
+    void (*clip_push)(void* ctx, int32_t l, int32_t t, int32_t r, int32_t b);
+    void (*clip_pop)(void* ctx);
+    int32_t (*is_printing)(void* ctx);
+} cc_canvas_ops;
+
+typedef struct cc_canvas { const cc_canvas_ops* ops; void* ctx; } cc_canvas;
+
+/* Register the canvas used for LAYOUT-TIME text measurement (the original's
+ * shared MM_TWIPS CClientDC). Must outlive all layout calls. */
+void cc_set_metrics_canvas(cc_canvas* canvas);
+
 #ifdef __cplusplus
 }
 #endif

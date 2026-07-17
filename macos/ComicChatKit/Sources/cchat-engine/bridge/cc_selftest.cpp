@@ -2,6 +2,8 @@
 #include "mfc_compat.h"
 #include "engine_context.h"
 #include "dib.h"
+#include "cc_canvas.h"
+#include "cc_recording_canvas.h"
 #include <unistd.h>   // mkstemp, close (testShimFileApis)
 
 static int g_failures;
@@ -368,6 +370,71 @@ static void cc_selftest_loglevel() {
     cc_set_log_level(2);
 }
 
+// --- Plan 2 Task 2: canvas C vtable + C++ wrapper + recording canvas --------
+// Drives every cc_canvas_ops entry once through CCanvas, over a
+// CCRecordingCanvas, and asserts the exact log line each op produces. The
+// log format is a stable contract documented in cc_recording_canvas.h; every
+// later task's selftests assert against these exact shapes, so this test
+// must not drift from that format.
+
+static void cc_selftest_canvas() {
+    CCRecordingCanvas rec;
+    CCanvas canvas(rec.handle());
+
+    cc_font_spec font;
+    memset(&font, 0, sizeof(font));
+    strcpy(font.face, "Comic Sans MS");
+    font.height = -240;
+    font.weight = 400;
+
+    int32_t w = 0, h = 0;
+    canvas.measure_text(&font, "hello", 5, &w, &h);
+    CC_CHECK(w == 600 && h == 240);
+
+    cc_text_metrics tm;
+    memset(&tm, 0, sizeof(tm));
+    canvas.font_metrics(&font, &tm);
+    CC_CHECK(tm.height == 240);
+    CC_CHECK(tm.ascent == 190);
+    CC_CHECK(tm.descent == 50);
+    CC_CHECK(tm.internal_leading == 40);
+    CC_CHECK(tm.external_leading == 20);
+    CC_CHECK(tm.ave_char_width == 120);
+    CC_CHECK(tm.max_char_width == 240);
+
+    canvas.draw_text(&font, 100, -200, 0x00000000, 0, 0x00FFFFFF, "hi", 2);
+    canvas.fill_rect(0, 0, 2400, -2400, 0x00FFFFFF);
+
+    cc_image img;
+    memset(&img, 0, sizeof(img));
+    canvas.draw_image(&img, 0, 0, 1200, -1600, 0, 0, 60, 80);
+
+    cc_path_pt pts[5];
+    pts[0] = { CC_PATH_MOVE, 0, 0 };
+    pts[1] = { CC_PATH_LINE, 10, 0 };
+    pts[2] = { CC_PATH_CUBIC, 20, 0 };
+    pts[3] = { CC_PATH_CUBIC, 30, 10 };
+    pts[4] = { CC_PATH_CUBIC, 40, 10 };
+    canvas.path(pts, 5, 1, 0x000000FF, 1, 0x00FF0000, 20, 0);
+
+    canvas.clip_push(0, 0, 2400, -2400);
+    canvas.clip_pop();
+
+    int32_t printing = canvas.is_printing();
+    CC_CHECK(printing == 0);
+
+    const std::vector<std::string>& log = rec.log();
+    CC_CHECK(log.size() == 6);
+    size_t i = 0;
+    CC_CHECK(i < log.size() && log[i++] == "text 100,-200 color=000000 \"hi\"");
+    CC_CHECK(i < log.size() && log[i++] == "rect 0,0,2400,-2400 fill=FFFFFF");
+    CC_CHECK(i < log.size() && log[i++] == "image 0,0,1200,-1600 src=0,0,60,80");
+    CC_CHECK(i < log.size() && log[i++] ==
+        "path n=5 fill=1 stroke=1 w=20 dashed=0 [M 0,0 L 10,0 C 20,0 30,10 40,10]");
+    CC_CHECK(i < log.size() && log[i++] == "clip+ 0,0,2400,-2400");
+    CC_CHECK(i < log.size() && log[i++] == "clip-");
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -388,5 +455,6 @@ extern "C" int32_t cc_run_selftests(void) {
     testMapWordToPtr();
     testMapWordToPtrRemoveDuringIteration();
     cc_selftest_loglevel();
+    cc_selftest_canvas();
     return g_failures;
 }
