@@ -19,6 +19,15 @@ int32_t cc_run_selftests(void);
  * of cc_run_selftests because the C++ selftests take no path argument. */
 int32_t cc_run_bodydraw_selftest(const char* avatar_path);
 
+/* Plan 2 Task 8: panel orchestrator + body-placement camera selftest. Opens the
+ * avatar at avatar_path (a real .avb fixture) TWICE (two avatars A/B), wires two
+ * session users + the talk-to graph, drives LayoutAvatars/AddLine, and
+ * characterizes camera facing/order, panel-break rules, and orchestration
+ * (panel count + balloon bboxes inside panel unit rects). Returns 0 on success
+ * (failure count otherwise). Kept out of cc_run_selftests because it needs the
+ * fixture path. */
+int32_t cc_run_panel_selftest(const char* avatar_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env

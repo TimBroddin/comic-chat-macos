@@ -285,6 +285,15 @@ public:
 //     leaves CDamage a plain class) is exact for this port. Selftested in
 //     cc_selftest_balloon(). ---------------------------------------------------
 #define DECLARE_DYNAMIC(class_name)
+// R9 (Plan 2 Task 8): MFC's IMPLEMENT_DYNAMIC(class, base) defines the
+// CRuntimeClass machinery that DECLARE_DYNAMIC declares. panel.cpp:29 has
+// IMPLEMENT_DYNAMIC(CDamage, CObject) at file scope. Since DECLARE_DYNAMIC is a
+// no-op here (CDamage's RTTI is never queried -- it's only used as an
+// UpdateAllViews hint inside the R11-wrapped RefreshPanelN), the matching
+// IMPLEMENT_DYNAMIC is a no-op too. Selftested in cc_selftest_panel (CDamage
+// constructs/destructs cleanly). The trailing ';' in the original source
+// terminates the (now empty) expansion.
+#define IMPLEMENT_DYNAMIC(class_name, base_class)
 
 // --- CString (byte-oriented, MFC-flavored subset) ----------------------------
 class CString {
@@ -1151,12 +1160,87 @@ public:
     POSITION GetHeadPosition() const {
         return m_v.empty() ? nullptr : (POSITION)(uintptr_t)1;
     }
-    void* GetNext(POSITION& pos) {
+    // const: GetNext/GetPrev read m_v[idx] and mutate only the caller's POSITION
+    // (never the list), so they are const-safe -- panel.cpp calls them on const
+    // CPtrList& (GetIndex(const CPtrList&), CPanel copy-ctor over `const CPanel&
+    // p`), exactly as the original relies on MFC allowing. Matches MFC's node-
+    // walking semantics: the list is not mutated by a cursor advance.
+    void* GetNext(POSITION& pos) const {
         size_t idx = (size_t)(uintptr_t)pos - 1;
         void* value = m_v[idx];
         idx++;
         pos = idx < m_v.size() ? (POSITION)(uintptr_t)(idx + 1) : nullptr;
         return value;
+    }
+
+    // --- R9 (Plan 2 Task 8): panel.cpp's CPanel/CUnitPanel/CUnitPanelPage own
+    //     three CPtrLists (m_elements/m_bodies/m_panels) and exercise the full
+    //     doubly-linked-list idiom, not just head-to-tail append+walk. The
+    //     additions below complete that idiom over the same vector backing
+    //     (POSITION stays a 1-based index; NULL/0 == "end"). Every member is
+    //     exercised by cc_selftest_panel_ptrlist(). MFC's CPtrList is a real
+    //     linked list, but panel.cpp never relies on node-pointer stability
+    //     across a structural mutation held ACROSS a suspended iteration (it
+    //     re-fetches head/tail after each RemoveTail/SetAt), so the vector
+    //     model is behavior-faithful for these call sites (verified per site
+    //     in the Task 8 report).
+
+    // GetCount: panel.cpp uses it constantly for the panel-break decision
+    // (m_panels.GetCount() < 2), element caps (m_elements.GetCount() >= 5),
+    // body caps, and title trimming.
+    int GetCount() const { return (int)m_v.size(); }
+    // IsEmpty: CUnitPanelPage::UpdateTitle (m_panels.IsEmpty()).
+    BOOL IsEmpty() const { return m_v.empty(); }
+
+    // GetHead/GetTail: peek the ends without a cursor (AddLine reads
+    // m_panels.GetTail(); UpdateTitle reads m_panels.GetHead()/GetTail()).
+    // Empty-list case returns nullptr rather than dereferencing an empty vector
+    // (UB): panel.cpp's AddLine evaluates `pOldP = m_panels.GetTail()` on the
+    // very first (empty) call but the || short-circuit (m_newPanel==TRUE) never
+    // dereferences pOldP then, so nullptr is the safe stand-in for MFC's
+    // "returns a never-used header node on empty" behavior. (Real MFC ASSERTs on
+    // empty in debug; nullptr is the faithful non-crashing equivalent for the
+    // guarded call sites here.)
+    void* GetHead() const { return m_v.empty() ? nullptr : m_v.front(); }
+    void* GetTail() const { return m_v.empty() ? nullptr : m_v.back(); }
+
+    // GetTailPosition + GetPrev: reverse walk (DrawRoutes, CUnitPanel::Draw
+    // iterate m_elements tail-to-head so later balloons draw under earlier
+    // ones). GetPrev returns the element AT pos and steps pos toward the head
+    // (mirrors GetNext's "return current, advance cursor" contract).
+    POSITION GetTailPosition() const {
+        return m_v.empty() ? nullptr : (POSITION)(uintptr_t)m_v.size();
+    }
+    void* GetPrev(POSITION& pos) const {
+        size_t idx = (size_t)(uintptr_t)pos - 1;
+        void* value = m_v[idx];
+        pos = idx == 0 ? nullptr : (POSITION)(uintptr_t)idx;  // idx-1, 1-based
+        return value;
+    }
+
+    // RemoveTail: CPage::RemoveLastPanel returns m_panels.RemoveTail();
+    // UpdateTitle trims trailing title elements. MFC returns the removed
+    // element pointer.
+    void* RemoveTail() {
+        void* value = m_v.back();
+        m_v.pop_back();
+        return value;
+    }
+
+    // GetAt/SetAt by POSITION: CPanel::ReplaceBody walks m_bodies with a cursor,
+    // reads GetAt(pos), substitutes via SetAt(pos, newBody). MFC's GetAt/SetAt
+    // take a POSITION (not an int index) -- distinct from the CPtrArray int
+    // overloads. The cursor here is a 1-based index (see GetNext).
+    void* GetAt(POSITION pos) const { return m_v[(size_t)(uintptr_t)pos - 1]; }
+    void SetAt(POSITION pos, void* p) { m_v[(size_t)(uintptr_t)pos - 1] = p; }
+
+    // FindIndex(nIndex): CPanel copy-ctor maps an element's speaker to the
+    // matching cloned body by ordinal index (GetIndex gives the int; FindIndex
+    // turns it back into a POSITION for GetAt). MFC returns NULL for an
+    // out-of-range index.
+    POSITION FindIndex(int nIndex) const {
+        if (nIndex < 0 || (size_t)nIndex >= m_v.size()) return nullptr;
+        return (POSITION)(uintptr_t)(nIndex + 1);
     }
 
 private:

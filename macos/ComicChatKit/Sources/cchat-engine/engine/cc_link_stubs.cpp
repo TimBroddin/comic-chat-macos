@@ -14,26 +14,51 @@
 // lifted_singles.cpp instead of leaving it stubbed.
 //
 // Task 7 lifted bodycam.cpp: the ten CBodySingle/CBodyDouble draw+bbox stubs
-// that lived here are gone, replaced by their real (now LIVE) bodies. The one
-// remaining engine stub is CPanelElement::SetBBox (owning file panel.cpp,
-// Plan 2 Task 8, which deletes it).
+// that lived here are gone, replaced by their real (now LIVE) bodies. Task 8
+// lifted panel.cpp: CPanelElement::SetBBox (the last original Plan-1 stub) is
+// gone too — all thirteen Plan-1 link stubs are now retired. What remains here
+// is later-plan debt: the intl.c CP-1252/MIME stubs (Plan 3) and, added by
+// Task 8, the CUserInfo::GetQualifiedName vtable-completeness trap (Plan 3,
+// paired with the CUserInfo ctor/GetScreenName R12a singles in
+// lifted_singles.cpp — the R17 session user table made CUserInfo linkable).
 
 #include "mfc_compat.h"
 #include "bbox.h"
 #include "pe.h"
 #include "dib.h"
 #include "avatar.h"
+#include "userinfo.h"  // Task 8: CUserInfo::GetQualifiedName R12(b) trap stub
 
-// --- CPanelElement (pe.h) — real bodies in panel.cpp / balloon.cpp ---
-// Task 6 lifted balloon.cpp, which defines the copy-ctor (balloon.cpp:641)
-// and GetBBox (balloon.cpp:647) that were stubbed here (Task 4). Those two
-// stubs are gone. SetBBox's owner is panel.cpp:542 (Task 8, still stubbed).
+// --- CPanelElement (pe.h) — real body now LIVE ------------------------------
+// Task 8 lifted panel.cpp, which defines CPanelElement::SetBBox (panel.cpp:542,
+// the real body). That R12(b) trap stub — the LAST original Plan-1 link stub —
+// is gone. All thirteen of Plan 1's link stubs are now retired. (The remaining
+// stubs in this file are Plan-2/Plan-3 debt registered by later tasks, not the
+// original Plan-1 set.)
 
-// owning file: panel.cpp:542
-BOOL CPanelElement::SetBBox(int /*left*/, int /*bottom*/, int /*right*/, int /*top*/) {
-    ASSERT(0);
-    return FALSE;
+// --- CUserInfo (userinfo.h) — R12(b) vtable-completeness trap (Task 8) -------
+// The R17 session user table (engine_context.h CCSessionUser) embeds a
+// CUserInfo by value; lifted_singles.cpp lifts its default ctor + GetScreenName
+// (R12a) to make it constructible + anchor the vtable. The one remaining vtable
+// slot, GetQualifiedName, touches theApp.m_bShowIdentity (UI) in the original
+// (userinfo.cpp:179) and is never called on a session user by any lifted code,
+// so it is a trap stub here rather than a verbatim lift. Owning file
+// userinfo.cpp (Plan 3, which lifts the real body and deletes this stub).
+const char* CUserInfo::GetQualifiedName() {
+    ASSERT(0);  // never called on session users (UI-only path)
+    return GetScreenName();  // safe non-null fallback if ever reached in release
 }
+
+// GetMyNickName (setupdlg.cpp — UI, Plan 3): CUserInfo::IsSelf() is an INLINE
+// virtual in userinfo.h (strcmp(GetName(), GetMyNickName())). Being virtual it
+// sits in the CUserInfo vtable, so emitting that vtable (anchored by the
+// GetScreenName R12a single in lifted_singles.cpp) forces GetMyNickName to link
+// even though no lifted code CALLS IsSelf on a session user. Return "" -- the
+// headless port has no "self" user (matching MyAvatarID()==0's "no self
+// selected" posture), so IsSelf() correctly reports FALSE for every session
+// user (strcmp(name, "") != 0 for any non-empty nick). Plan 3 lifts the real
+// body and deletes this stub.
+const char* GetMyNickName() { return ""; }
 
 // --- CBodySingle / CBodyDouble (avatar.h) — real bodies now LIVE ------------
 // Task 7 lifted bodycam.cpp, which defines all ten CBodySingle/CBodyDouble

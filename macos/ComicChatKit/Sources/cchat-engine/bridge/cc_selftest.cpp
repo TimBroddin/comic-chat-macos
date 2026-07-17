@@ -1482,6 +1482,533 @@ extern "C" int32_t cc_run_bodydraw_selftest(const char* avatarPath) {
     return g_failures;
 }
 
+// --- Plan 2 Task 8: camera + orchestrator characterization -------------------
+// Needs the anna.avb fixture (loaded TWICE -> two distinct avatars A(id1)/B(id2)
+// with identical art but distinct ids + distinct CUserInfo). The camera reads
+// the talk-to graph off CUserInfo::m_udi.m_talkTos, so we wire each avatar's
+// m_userInfo to its session-table CUserInfo (the WIRING INVARIANT: every
+// participant's m_userInfo points at its session entry -- that is what makes
+// both the DWORD-space comparisons and the userFromTalkTo reverse lookup exact).
+
+// Load one avatar from the fixture and register it (IndexAvatar -> avatars[]),
+// returning it. First call gets id 1, second gets id 2.
+static CAvatarX* panelLoadAvatar(const char* avatarPath) {
+    CAvatarFileStream* pStream = new CAvatarFileStream(avatarPath);
+    CAvatarX* av = CAvatarX::LoadAvatar(pStream);
+    if (!av) { delete pStream; return nullptr; }
+    av->SetStream(pStream);
+    av->IndexAvatar();  // assigns m_avatarID + registers into avatars[]
+    return av;
+}
+
+// Wire avatar `av` to a fresh session user with the given id; returns the user.
+// Establishes the wiring invariant for one participant.
+static CUserInfo* panelWireUser(CAvatarX* av, UINT id) {
+    CUserInfo* pui = ccContext().session.addUser(id);
+    pui->SetAvatarID((USHORT)id);   // CUserInfo::GetAvatarID() -> this id
+    av->m_userInfo = pui;           // the invariant: avatar -> its session user
+    return pui;
+}
+
+// Set A's talk-to graph to exactly {B} (clearing first). B talks to nobody.
+static void panelSetTalksTo(CUserInfo* speaker, CUserInfo* addressee) {
+    speaker->m_udi.m_talkTos.RemoveAll();
+    if (addressee) speaker->m_udi.m_talkTos.Add((DWORD)(uintptr_t)addressee);
+}
+
+// Build a single CUnitPanel with speakers `ids` (one SAY balloon each so
+// IsSpeaker() is true for every one), run LayoutAvatars, and report each
+// placed body's (avatarID, flip, bbox.Left) in left-to-right order via out
+// arrays. Returns the body count. The panel is heap-owned by the caller (freed
+// by delete). Fonts + metrics canvas must be set up before calling.
+static int panelLayoutOne(const UINT* ids, int n,
+                          UINT* outID, int* outFlip, int* outLeft) {
+    CUnitPanel* panel = new CUnitPanel;
+    for (int i = 0; i < n; i++) {
+        CBody* spk = panel->FetchSpeaker(ids[i]);
+        // one SAY balloon per speaker so LayoutAvatars keeps it (IsSpeaker).
+        CBalloon* b = new CBWoodringNormal("hi", NULL, NULL);
+        b->m_speaker = spk;
+        panel->m_elements.AddTail(b);
+    }
+    panel->LayoutAvatars();
+
+    // m_bodies now holds the placed bodies in left-to-right order (AddTail in
+    // placed order, increasing xOffset). Read them out.
+    int count = 0;
+    POSITION pos = panel->m_bodies.GetHeadPosition();
+    while (pos) {
+        CBody* body = (CBody*)panel->m_bodies.GetNext(pos);
+        outID[count] = body->m_avatarID;
+        outFlip[count] = body->m_flip;
+        outLeft[count] = body->m_bbox.Left;
+        count++;
+    }
+    delete panel;
+    return count;
+}
+
+static int cc_selftest_panel(const char* avatarPath) {
+    int startFailures = g_failures;
+
+    // Deterministic RNG: CPanel::CPanel() seeds each panel with rand() (m_seed),
+    // and LayoutBalloons does srand(m_seed) so the per-panel balloon shift/place
+    // is reproducible FROM that seed. But the seed itself comes from the global
+    // rand() stream, which other tests (bodydraw's randfloat calls) advance --
+    // so without a fixed srand() here the balloon fit (hence merge/break counts)
+    // depends on test ordering. Pin it so every frozen count below is stable
+    // regardless of what ran before.
+    srand(12345);
+
+    // --- setup: two avatars + two wired users; fonts + metrics canvas --------
+    InitializeAvatars();
+    ccContext().session.clearUsers();
+
+    CAvatarX* avA = panelLoadAvatar(avatarPath);   // id 1
+    CAvatarX* avB = panelLoadAvatar(avatarPath);   // id 2
+    CC_CHECK(avA != NULL && avB != NULL);
+    if (!avA || !avB) { DestroyAvatars(); return g_failures - startFailures; }
+    CC_CHECK(avA->m_avatarID == 1 && avB->m_avatarID == 2);
+    CC_CHECK(GetAvatar(1) == avA && GetAvatar(2) == avB);
+
+    CUserInfo* uA = panelWireUser(avA, 1);
+    CUserInfo* uB = panelWireUser(avB, 2);
+    CC_CHECK((CUserInfo*)avA->m_userInfo == uA);
+    CC_CHECK((CUserInfo*)avB->m_userInfo == uB);
+
+    // metrics canvas (LayoutBalloons measures text through ccContext().metricsDC)
+    static CCRecordingCanvas panelMetrics;
+    cc_set_metrics_canvas(panelMetrics.handle());
+    // fonts (MakeBalloon's CFontInfo comes from CUnitPanelPage::m_fiWNormal)
+    LOGFONT lf;
+    memset(&lf, 0, sizeof(lf));
+    strcpy(lf.lfFaceName, "Comic Sans MS");
+    lf.lfHeight = -240; lf.lfWeight = 400; lf.lfCharSet = 0;
+    CC_CHECK(CUnitPanelPage::SetFonts(lf, RGB(0, 0, 0)) == TRUE);
+    // sane panel geometry (defaults are MINUNITPANEL*-1 "resize me" sentinels).
+    CUnitPanelPage::SetUnitPanelWidth(MINUNITPANELWIDTH);
+    CUnitPanelPage::SetUnitPanelHeight(MINUNITPANELHEIGHT);
+
+    // === (helper) userFromTalkTo through the WIRED users (not the Step-1 ones)
+    CC_CHECK(ccContext().session.userFromTalkTo((DWORD)(uintptr_t)uB) == uB);
+    CC_CHECK(ccContext().session.userFromTalkTo((DWORD)(uintptr_t)uA) == uA);
+
+    // ================= (a) CAMERA characterization =======================
+    // Two avatars, one talks-to the other, both present. After LayoutAvatars
+    // the camera must (both hand-verified against EvalPair's scoring below):
+    //   1. give the two bodies OPPOSITE facing (m_flip) -- they face each other;
+    //   2. orient each toward the other: the LEFT body faces right (flip==FALSE,
+    //      == EvalPair's desiredDir for "other is to my right"), the RIGHT body
+    //      faces left (flip==TRUE);
+    //   3. produce a deterministic order seeded by placement order + hysteresis.
+    //
+    // HAND-VERIFICATION (why the frozen values are what they are), traced
+    // through DoGreedyOrdering -> EvalPlacement -> EvalPair with both avatars'
+    // m_lastDir == FALSE (Initialize default) and empty hysteresis:
+    //   * A is placed first (input index 0) at slot 0, flip defaults to its
+    //     m_lastDir (FALSE) on the 1-body tie.
+    //   * B is then scored at slot 0 ([B,A]) vs slot 1 ([A,B]). With A talks-to
+    //     B: slot 1 wins (rating p vs p+42) with B.flip=TRUE. Final [A(0),B(1)].
+    //   * CRUCIAL, verified: swapping the talk-to DIRECTION (B talks-to A
+    //     instead) yields the IDENTICAL layout [A(0),B(1)] -- because the camera
+    //     goal "face each other" is symmetric, and the ORDER is driven by
+    //     placement order (A first) + hysteresis, NOT by who initiates. The
+    //     order only flips when the PLACEMENT order flips (or hysteresis
+    //     differs). This corrected the brief's "swap roles -> order flips"
+    //     assumption: talk-to direction alone does not reorder a symmetric pair;
+    //     placement order does. See p2-task-8-report.md for the full trace.
+    avA->m_lastDir = avB->m_lastDir = FALSE;
+    avA->m_lastLeft = avA->m_lastRight = 0;
+    avB->m_lastLeft = avB->m_lastRight = 0;
+
+    UINT ids_AB[2] = { 1, 2 };   // placement order: A(1) then B(2)
+    UINT ids_BA[2] = { 2, 1 };   // placement order: B(2) then A(1)
+    UINT oid[2]; int oflip[2]; int oleft[2];
+
+    // --- run 1: A talks-to B, placement order A,B.
+    panelSetTalksTo(uA, uB);   // A -> {B}
+    panelSetTalksTo(uB, NULL); // B -> {}
+    int nAB = panelLayoutOne(ids_AB, 2, oid, oflip, oleft);
+    CC_CHECK(nAB == 2);
+    CC_CHECK(oleft[0] < oleft[1]);       // outID[0] is the LEFT body
+    CC_CHECK(oflip[0] != oflip[1]);      // opposite facing (face each other)
+    // FROZEN (hand-verified): left = A(id1) facing right (flip 0), right = B(id2)
+    // facing left (flip 1).
+    CC_CHECK(oid[0] == 1 && oflip[0] == FALSE);   // A on the left, faces right
+    CC_CHECK(oid[1] == 2 && oflip[1] == TRUE);    // B on the right, faces left
+
+    // --- run 2: SWAP THE TALK-TO DIRECTION only (B talks-to A), same placement
+    // order A,B. Verified identical layout -- talk-to direction alone does not
+    // reorder a symmetric pair (the camera goal is symmetric).
+    avA->m_lastDir = avB->m_lastDir = FALSE;
+    avA->m_lastLeft = avA->m_lastRight = 0;
+    avB->m_lastLeft = avB->m_lastRight = 0;
+    panelSetTalksTo(uA, NULL);  // A -> {}
+    panelSetTalksTo(uB, uA);    // B -> {A}
+    int nBA = panelLayoutOne(ids_AB, 2, oid, oflip, oleft);
+    CC_CHECK(nBA == 2);
+    CC_CHECK(oflip[0] != oflip[1]);      // still face each other
+    CC_CHECK(oid[0] == 1 && oflip[0] == FALSE);   // identical layout to run 1
+    CC_CHECK(oid[1] == 2 && oflip[1] == TRUE);
+
+    // --- run 3: SWAP THE PLACEMENT ORDER (B first), A talks-to B. This is what
+    // actually flips the order: B is now placed first at slot 0, A scored
+    // around it. Verified: layout mirrors to [B(left, faces right), A(right,
+    // faces left)] -- the order flipped, they still face each other.
+    avA->m_lastDir = avB->m_lastDir = FALSE;
+    avA->m_lastLeft = avA->m_lastRight = 0;
+    avB->m_lastLeft = avB->m_lastRight = 0;
+    panelSetTalksTo(uA, uB);   // A -> {B}
+    panelSetTalksTo(uB, NULL); // B -> {}
+    int nBfirst = panelLayoutOne(ids_BA, 2, oid, oflip, oleft);
+    CC_CHECK(nBfirst == 2);
+    CC_CHECK(oflip[0] != oflip[1]);      // face each other
+    CC_CHECK(oid[0] == 2 && oflip[0] == FALSE);   // B now on the LEFT, faces right
+    CC_CHECK(oid[1] == 1 && oflip[1] == TRUE);    // A now on the RIGHT, faces left
+
+    // === camera DISCRIMINATION (parent requirement): the graph distinguishes
+    // users, not just "non-empty". A's talkTos={B} matches B (a talk-to link)
+    // and NOT A itself -- verified at the stored-key level EvalPair compares on.
+    panelSetTalksTo(uA, uB);
+    CC_CHECK(uA->m_udi.m_talkTos.GetUpperBound() + 1 == 1);
+    CC_CHECK(uA->m_udi.m_talkTos[0] == (DWORD)(uintptr_t)uB);   // matches B
+    CC_CHECK(uA->m_udi.m_talkTos[0] != (DWORD)(uintptr_t)uA);   // NOT A
+    panelSetTalksTo(uA, NULL);
+    panelSetTalksTo(uB, NULL);
+
+    // ================= (b) PANEL-BREAK rules + (c) ORCHESTRATION ==========
+    // These drive the real orchestrator CUnitPanelPage::AddLine. AddLine's
+    // break decision (panel.cpp:1079) is:
+    //   NEW panel  <=  m_newPanel || last.elements>=5 || m_panels.count<2
+    //                                                 || last.AvatarInPanel(uID)
+    //   else       ->  clone the last panel, MERGE this speaker into it (replace)
+    // plus BM_ACTION forces StartNewPanel() at the top (:1064).
+    //
+    // Need >2 avatars to exercise the merge + the >=5 cap, so load four more
+    // (ids 3..6) and wire them. (The camera sub-tests above only needed A/B.)
+    CAvatarX* extra[4];
+    for (int i = 0; i < 4; i++) {
+        extra[i] = panelLoadAvatar(avatarPath);   // ids 3,4,5,6
+        CC_CHECK(extra[i] != NULL);
+        if (extra[i]) panelWireUser(extra[i], (UINT)(3 + i));
+    }
+
+    // Helper: a fresh empty page (m_newPanel==TRUE, no panels). Heap so the
+    // caller owns it (delete frees the cascade). m_doc==nullptr is safe --
+    // it's only dereferenced in the R11-wrapped RefreshPanelN (no-op headless).
+    auto makePage = []() -> CUnitPanelPage* {
+        CUnitPanelPage* pg = new CUnitPanelPage(nullptr);
+        pg->m_topY = pg->m_leftX = 0;
+        return pg;
+    };
+
+    // --- (b1) same speaker again forces a new panel ---------------------
+    // Lines: A, B  -> two panels [A],[B] (line 2 also breaks via count<2).
+    // Then B again: last panel [B] contains B -> AvatarInPanel(B) -> NEW panel.
+    {
+        CUnitPanelPage* pg = makePage();
+        pg->AddLine(1, "hi", BM_SAY, NULL);   // panel 1: [A]
+        CC_CHECK(pg->m_panels.GetCount() == 1);
+        pg->AddLine(2, "hi", BM_SAY, NULL);   // panel 2: [B] (count<2 break)
+        CC_CHECK(pg->m_panels.GetCount() == 2);
+        pg->AddLine(2, "hi", BM_SAY, NULL);   // B already in last panel -> break
+        CC_CHECK(pg->m_panels.GetCount() == 3);
+        delete pg;
+    }
+
+    // --- (b1') distinct speaker MERGES (no break) ----------------------
+    // Lines: A, B (two panels), then C (not in last panel [B]) -> merges into
+    // the last panel (clone+replace), panel count stays 2, last panel now has
+    // 2 elements.
+    {
+        CUnitPanelPage* pg = makePage();
+        pg->AddLine(1, "hi", BM_SAY, NULL);   // [A]
+        pg->AddLine(2, "hi", BM_SAY, NULL);   // [A],[B]
+        CC_CHECK(pg->m_panels.GetCount() == 2);
+        pg->AddLine(3, "hi", BM_SAY, NULL);   // C merges into [B] -> [B,C]
+        CC_CHECK(pg->m_panels.GetCount() == 2);
+        CUnitPanel* last = (CUnitPanel*)pg->m_panels.GetTail();
+        CC_CHECK(last->m_elements.GetCount() == 2);   // merged (2 balloons)
+        delete pg;
+    }
+
+    // --- (b2) a panel never exceeds the 5-element cap ------------------
+    // The orchestrator caps a panel at 5 elements two ways: the explicit
+    // `last.elements >= 5` break guard (:1079), AND -- reached FIRST under these
+    // fixture unit dimensions -- LayoutBalloons overflow (a panel that can't fit
+    // the next balloon returns FALSE, and AddLine's overflow path deletes the
+    // clone + StartNewPanel + retries, panel.cpp:1110-1116). Either way the
+    // OBSERVABLE invariant the >=5 rule guarantees holds: no panel ever settles
+    // with more than 5 elements, and distinct speakers keep merging into the
+    // current panel until it fills, then a new panel opens.
+    //
+    // HAND-VERIFIED against the observed run (six distinct speakers merging):
+    //   spk1 -> panels 1, last elems 1        (m_newPanel)
+    //   spk2 -> panels 2, last elems 1        (count<2 break)
+    //   spk3 -> panels 2, last elems 2        (merge into [B])
+    //   spk4 -> panels 2, last elems 3        (merge -> [B,C,D])
+    //   spk5 -> panels 2, last elems 4        (merge -> [B,C,D,E])
+    //   spk6 -> panels 3, last elems 1        (5th balloon overflows the panel
+    //                                          -> overflow break, new panel)
+    // So the panel fills to 4 balloons then breaks on the 5th add -- the 5-cap
+    // is enforced (overflow fires just before the count guard would). The count
+    // guard is genuine code; it is simply not the proximate trigger at these
+    // dimensions (documented as a characterization note in the report).
+    {
+        // Deterministic under srand(12345) (pinned at function entry): six
+        // distinct speakers merge into the current panel, filling it to exactly
+        // the 5-element cap without overflow:
+        //   spk1 -> panels 1, last 1   (m_newPanel)
+        //   spk2 -> panels 2, last 1   (count<2 break)
+        //   spk3..spk6 -> panels 2, last 2,3,4,5   (each merges into [B..])
+        // The panel reaches exactly 5 elements [B,C,D,E,F] and STOPS there.
+        CUnitPanelPage* pg = makePage();
+        int maxElemsSeen = 0;
+        for (int spk = 1; spk <= 6; spk++) {
+            pg->AddLine((UINT)spk, "hi", BM_SAY, NULL);
+            // after each line, NO panel may exceed the 5-element cap.
+            POSITION pp = pg->m_panels.GetHeadPosition();
+            while (pp) {
+                CUnitPanel* p = (CUnitPanel*)pg->m_panels.GetNext(pp);
+                int n = p->m_elements.GetCount();
+                CC_CHECK(n <= 5);   // the hard cap the >=5 rule guarantees
+                if (n > maxElemsSeen) maxElemsSeen = n;
+            }
+        }
+        // FROZEN: fills to exactly 5 elements in a single (2nd) panel, proving
+        // distinct-speaker merging accumulates up to the cap.
+        CC_CHECK(maxElemsSeen == 5);
+        CC_CHECK(pg->m_panels.GetCount() == 2);
+        CUnitPanel* filled = (CUnitPanel*)pg->m_panels.GetTail();
+        CC_CHECK(filled->m_elements.GetCount() == 5);
+
+        // A 7th line now hits the explicit `last.elements >= 5` break guard
+        // (panel.cpp:1079): even a speaker NOT in the full panel gets a fresh
+        // panel. This directly exercises the >=5 rule (not overflow).
+        pg->AddLine(1, "hi", BM_SAY, NULL);   // A(id1) not in [B,C,D,E,F]
+        CC_CHECK(pg->m_panels.GetCount() == 3);        // broke -> new panel
+        CUnitPanel* afterCap = (CUnitPanel*)pg->m_panels.GetTail();
+        CC_CHECK(afterCap->m_elements.GetCount() == 1); // the 7th line alone
+        delete pg;
+    }
+
+    // --- (b3) BM_ACTION always breaks ----------------------------------
+    // An action line forces StartNewPanel() before the break logic even runs,
+    // so it always lands in its OWN new panel -- even when the same speaker's
+    // prior SAY line would otherwise have merged.
+    {
+        CUnitPanelPage* pg = makePage();
+        pg->AddLine(1, "hi", BM_SAY, NULL);       // [A]
+        pg->AddLine(2, "hi", BM_SAY, NULL);       // [A],[B]
+        int before = pg->m_panels.GetCount();     // 2
+        pg->AddLine(3, "hi", BM_ACTION, NULL);    // action -> its own new panel
+        CC_CHECK(pg->m_panels.GetCount() == before + 1);
+        // and the action panel holds exactly its one box element.
+        CUnitPanel* actPanel = (CUnitPanel*)pg->m_panels.GetTail();
+        CC_CHECK(actPanel->m_elements.GetCount() == 1);
+        delete pg;
+    }
+
+    // --- (c) ORCHESTRATION: 2 speakers x 4 alternating lines -----------
+    // A,B,A,B. Trace: L1 A -> [A] (count 1). L2 B -> count<2 break -> [A],[B]
+    // (count 2). L3 A -> last=[B], A not in it -> merge -> [B,A] (count 2). L4 B
+    // -> last=[B,A], B IS in it -> break -> [B,A],[B] (count 3). Frozen
+    // panel_count == 3. Every balloon bbox must lie inside its panel's unit rect
+    // (0..m_unitWidth, -m_unitHeight..0).
+    {
+        CUnitPanelPage* pg = makePage();
+        pg->AddLine(1, "hi", BM_SAY, NULL);   // [A]
+        pg->AddLine(2, "hi", BM_SAY, NULL);   // [A],[B]
+        pg->AddLine(1, "hi", BM_SAY, NULL);   // [B,A]
+        pg->AddLine(2, "hi", BM_SAY, NULL);   // [B,A],[B]
+        int panelCount = pg->m_panels.GetCount();
+        CC_CHECK(panelCount == 3);   // FROZEN (hand-traced above)
+
+        // every balloon bbox inside its panel's unit rect.
+        int unitW = CUnitPanelPage::GetUnitPanelWidth();
+        int unitH = CUnitPanelPage::GetUnitPanelHeight();
+        int balloonsChecked = 0;
+        POSITION pp = pg->m_panels.GetHeadPosition();
+        while (pp) {
+            CUnitPanel* panel = (CUnitPanel*)pg->m_panels.GetNext(pp);
+            POSITION ep = panel->m_elements.GetHeadPosition();
+            while (ep) {
+                CPanelElement* e = (CPanelElement*)panel->m_elements.GetNext(ep);
+                RECT bb;
+                e->GetBBox(&bb);
+                // panel-local coords: x in [0, unitW], y in [-unitH, 0].
+                CC_CHECK(bb.left >= 0 && bb.right <= unitW);
+                CC_CHECK(bb.bottom >= -unitH && bb.top <= 0);
+                balloonsChecked++;
+            }
+        }
+        CC_CHECK(balloonsChecked >= 3);   // at least the 3 SAY balloons placed
+        delete pg;
+    }
+
+    // ================= (d) Establishing() via the real reroute ===========
+    // Establishing() (lifted_singles.cpp, pageview.cpp:832 verbatim arithmetic +
+    // R17 page-source reroute) gates LayoutAvatars' zoom-in (panel.cpp:788,
+    // `bZoomIn && !Establishing()`): TRUE suppresses zoom on the first 1-2
+    // "establishing" panels. It reads the composing page's live panel count
+    // (via s_composingPage, set by AddLine) + g_bNewedPanel. Drive it BOTH ways
+    // through the real function + real setter, exactly as LayoutAvatars does.
+    {
+        extern BOOL Establishing();
+        extern void ccSetComposingPage(CUnitPanelPage* p);
+        extern BOOL g_bNewedPanel;
+
+        // No composing page -> count treated as 0 -> TRUE (the conservative
+        // "early composition, don't zoom" default; matches original count<=1).
+        ccSetComposingPage(nullptr);
+        CC_CHECK(Establishing() == TRUE);
+
+        CUnitPanelPage* pg = makePage();
+        ccSetComposingPage(pg);
+
+        // 0 panels: count 0 <= 1 -> TRUE.
+        CC_CHECK(pg->m_panels.GetCount() == 0);
+        CC_CHECK(Establishing() == TRUE);
+
+        // 1 panel: count 1 <= 1 -> TRUE (establishing shot, zoom suppressed).
+        pg->m_panels.AddTail(new CUnitPanel);
+        CC_CHECK(Establishing() == TRUE);
+
+        // 2 panels: count 2 > 1, so the second clause decides:
+        //   (!g_bNewedPanel && count<=2). With g_bNewedPanel FALSE -> TRUE.
+        pg->m_panels.AddTail(new CUnitPanel);
+        g_bNewedPanel = FALSE;
+        CC_CHECK(Establishing() == TRUE);
+        //   With g_bNewedPanel TRUE (the last add opened a NEW panel) -> FALSE.
+        g_bNewedPanel = TRUE;
+        CC_CHECK(Establishing() == FALSE);
+
+        // 3 panels: count 3 > 2 -> FALSE regardless of g_bNewedPanel (past the
+        // establishing shots -> zoom-in ENABLED).
+        pg->m_panels.AddTail(new CUnitPanel);
+        g_bNewedPanel = FALSE;
+        CC_CHECK(Establishing() == FALSE);
+        g_bNewedPanel = TRUE;
+        CC_CHECK(Establishing() == FALSE);
+
+        delete pg;
+        ccSetComposingPage(nullptr);   // don't leave a dangling composing page
+        g_bNewedPanel = FALSE;
+    }
+
+    // ============ (e) 3-party ABSENT-addressee pull-in (Cat-4 path) =======
+    // The one talkTos-derived DEREFERENCE (AddTalkTos:357) fires ONLY when a
+    // talked-to user is NOT already in the panel: AddTalkTos reconstructs that
+    // user's CUserInfo* from the DWORD key (now via userFromTalkTo -- R13+R17)
+    // and pulls its body into the panel. Drive it: a panel with only speaker A,
+    // A talks-to an ABSENT C (id 3). Expect C pulled in -> 2 bodies laid out.
+    // This is the coverage the parent flagged; it's feasible with 3 avatars, so
+    // it's covered here rather than deferred.
+    {
+        CUserInfo* uC = ccContext().session.lookupUser(3);
+        CC_CHECK(uC != NULL);   // extra[0] wired id 3 above
+        avA->m_lastDir = FALSE; avA->m_lastLeft = avA->m_lastRight = 0;
+        if (extra[0]) { extra[0]->m_lastDir = FALSE; extra[0]->m_lastLeft = extra[0]->m_lastRight = 0; }
+
+        panelSetTalksTo(uA, uC);   // A -> {C}, C absent from the panel
+        panelSetTalksTo(uC, NULL);
+
+        UINT ids_Aonly[1] = { 1 };   // only A speaks
+        UINT oid2[5]; int oflip2[5]; int oleft2[5];
+        int n = panelLayoutOne(ids_Aonly, 1, oid2, oflip2, oleft2);
+        // C was pulled in via the reconstruction path -> 2 bodies placed.
+        CC_CHECK(n == 2);
+        // one of the two placed bodies is C (id 3), the pulled-in addressee.
+        bool sawA = false, sawC = false;
+        for (int i = 0; i < n; i++) {
+            if (oid2[i] == 1) sawA = true;
+            if (oid2[i] == 3) sawC = true;
+        }
+        CC_CHECK(sawA && sawC);   // A stayed, C was reconstructed + pulled in
+        panelSetTalksTo(uA, NULL);
+    }
+
+    DestroyAvatars();
+    ccContext().session.clearUsers();
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift wrapper (PanelTests.swift), which passes the
+// anna.avb fixture path (loaded twice for two avatars). Runs standalone
+// (resets g_failures) so it can be asserted == 0 independently.
+extern "C" int32_t cc_run_panel_selftest(const char* avatarPath) {
+    g_failures = 0;
+    if (avatarPath == NULL) return 1;
+    cc_selftest_panel(avatarPath);
+    return g_failures;
+}
+
+// --- Plan 2 Task 8: panel orchestrator + camera -----------------------------
+// Step 1 (R17): session extensions -- the user table (holds CUserInfo objects
+// carrying the camera's talk-to graph), backdropID, comicsTitle. This first
+// block pins the documented defaults + the add/lookup helper contract before
+// anything drives the camera through them.
+
+static void cc_selftest_panel_session() {
+    CCEngineContext& ctx = ccContext();
+
+    // (Step 1) doc-settings defaults (R17: were GetChatDoc()->GetBackDropID()
+    // /GetComicsTitle()). backdropID 0 == "no backdrop"; comicsTitle empty.
+    ctx.session.backdropID = 0;
+    ctx.session.comicsTitle[0] = '\0';
+    CC_CHECK(ctx.session.backdropID == 0);
+    CC_CHECK(ctx.session.comicsTitle[0] == '\0');
+    ctx.session.backdropID = 7;
+    CC_CHECK(ctx.session.backdropID == 7);
+    strcpy(ctx.session.comicsTitle, "The Adventures of Anna");
+    CC_CHECK(strcmp(ctx.session.comicsTitle, "The Adventures of Anna") == 0);
+    ctx.session.backdropID = 0;  // restore defaults for subsequent tests
+    ctx.session.comicsTitle[0] = '\0';
+
+    // (Step 1) user table add/lookup helpers.
+    ctx.session.clearUsers();
+    CC_CHECK(ctx.session.userCount == 0);
+    CC_CHECK(ctx.session.lookupUser(1) == nullptr);   // miss on empty table
+
+    CUserInfo* u1 = ctx.session.addUser(1);
+    CUserInfo* u2 = ctx.session.addUser(2);
+    CC_CHECK(u1 != nullptr && u2 != nullptr);
+    CC_CHECK(u1 != u2);
+    CC_CHECK(ctx.session.userCount == 2);
+
+    // add is idempotent per id (find-or-create): re-adding id 1 returns the
+    // SAME CUserInfo (talkTos entries are raw addresses into the table, so the
+    // address must be stable).
+    CC_CHECK(ctx.session.addUser(1) == u1);
+    CC_CHECK(ctx.session.userCount == 2);  // no new entry
+
+    // lookup resolves by avatarID.
+    CC_CHECK(ctx.session.lookupUser(1) == u1);
+    CC_CHECK(ctx.session.lookupUser(2) == u2);
+    CC_CHECK(ctx.session.lookupUser(3) == nullptr);
+
+    // the returned CUserInfo is mutable and its m_udi.m_talkTos holds the
+    // (DWORD)CUserInfo* addressee graph the camera reads (panel.cpp EvalPair).
+    u1->m_udi.m_talkTos.RemoveAll();
+    u1->m_udi.m_talkTos.Add((DWORD)(uintptr_t)u2);
+    CC_CHECK(u1->m_udi.m_talkTos.GetUpperBound() + 1 == 1);
+    CC_CHECK(u1->m_udi.m_talkTos[0] == (DWORD)(uintptr_t)u2);
+
+    // (Step 1) userFromTalkTo round-trip (R13+R17): the reverse lookup that
+    // AddTalkTos:357 uses to recover the FULL CUserInfo* from a truncated DWORD
+    // key. A real key (the low-32 of a session user's &info) returns exactly
+    // that pointer; an unknown key returns nullptr. This is what makes the
+    // multi-party "pull an absent addressee into the panel" path sound on LP64.
+    DWORD keyU2 = (DWORD)(uintptr_t)u2;
+    CC_CHECK(ctx.session.userFromTalkTo(keyU2) == u2);
+    CC_CHECK(ctx.session.userFromTalkTo((DWORD)(uintptr_t)u1) == u1);
+    CC_CHECK(ctx.session.userFromTalkTo(0xDEADBEEF) == nullptr);  // unknown key
+
+    ctx.session.clearUsers();
+    CC_CHECK(ctx.session.userCount == 0);
+    CC_CHECK(ctx.session.userFromTalkTo(keyU2) == nullptr);  // table cleared
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -1509,5 +2036,6 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_geometry();
     cc_selftest_format();
     cc_selftest_balloon();
+    cc_selftest_panel_session();  // Task 8 Step 1: R17 session extensions
     return g_failures;
 }

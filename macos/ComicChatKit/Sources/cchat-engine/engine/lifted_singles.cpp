@@ -24,13 +24,56 @@
 //   comes when a later plan lifts bbox.cpp (delete these then).
 //
 // Entry 2: panel.cpp static DATA member (owning file: panel.cpp:59, Plan 2
-//   Task 8). CUnitPanelPage::m_unitWidth is declared in panel.h (lifted
-//   header-only) but defined in panel.cpp; balloon.cpp (GetFormatInfoCommon)
-//   and fonts.cpp (UpdateTitleFonts) read it. Lifted verbatim with its
-//   original initializer per the Task 6 amendment. Task 8 deletes it.
+//   Task 8). CUnitPanelPage::m_unitWidth was lifted here header-only in Task 6
+//   (balloon.cpp/fonts.cpp read it before panel.cpp existed). Task 8 lifts
+//   panel.cpp, which defines m_unitWidth at file scope with the same verbatim
+//   initializer -- so this entry is DELETED here (ODR: exactly one definition).
+//
+// Entry 3: CUserInfo constructibility (owning file: userinfo.cpp, Plan 3 --
+//   NOT scheduled for a lift in this plan; the intl.c/MIME userinfo debt is
+//   already registered as Plan 3 in cc_link_stubs.cpp). Plan 2 Task 8's R17
+//   session user table (engine_context.h CCSessionUser) embeds a CUserInfo BY
+//   VALUE (the brief's mandated {UINT id; CUserInfo info} shape), because the
+//   camera (panel.cpp EvalPair/AddTalkTos) reads the addressee graph off
+//   CUserInfo::m_udi.m_talkTos. That by-value member needs CUserInfo's default
+//   ctor + vtable anchor to link. Lifted verbatim (R12a):
+//     * CUserInfo::CUserInfo()   -- userinfo.cpp:111 (trivial field zeroing)
+//     * CUserInfo::GetScreenName -- userinfo.cpp:172 (first non-inline virtual,
+//                                   emits the vtable; self-contained, no theApp)
+//   The one remaining vtable slot, GetQualifiedName (userinfo.cpp:179, touches
+//   theApp.m_bShowIdentity -- UI), is an R12(b) trap stub in cc_link_stubs.cpp
+//   (never called on session users). Plan 3 lifts userinfo.cpp and deletes
+//   both this entry and that stub.
+//
+// Entry 4: pageview.cpp cross-file singles referenced by panel.cpp's lifted
+//   layout path (owning file: pageview.cpp -- NOT lifted; the Task-10 headless
+//   compositor replaces its Draw/scroll machinery per R16). The parent-agent
+//   ruling (Task 8) placed these here rather than in panel.cpp file scope to
+//   keep panel.cpp's fidelity diff ~= original:
+//     * g_bNewedPanel (pageview.cpp:830) -- R12(a): a plain BOOL data global.
+//       Written ONLY by the lifted CUnitPanelPage::AddLine (panel.cpp:1076/
+//       :1084 -- verified the exhaustive writer set: pageview.cpp defines it,
+//       panel.cpp writes it, nothing else); read by Establishing() below.
+//     * Establishing() (pageview.cpp:832) -- R12(a) body + R17 reroute. Called
+//       by the CROWN-JEWEL CUnitPanel::LayoutAvatars (panel.cpp:788,
+//       `bZoomIn && !Establishing()`) to suppress zoom-in on the first 1-2
+//       (establishing) panels. The original read the live first-page panel
+//       count via GetView()->GetDocument()->m_pages; the R17 reroute reads it
+//       off s_composingPage (the CUnitPanelPage currently being composed, set
+//       by AddLine/AddReaction). In the headless single-page model (discovery
+//       §7: pagination deferred, m_panelsPerColumn=-1) the first page IS the
+//       page being composed, so this is exact. Null composing-page -> count 0
+//       -> TRUE (the conservative "early composition, don't zoom" default,
+//       identical to the original's count<=1 branch). Arithmetic otherwise
+//       verbatim.
+//     * ccSetComposingPage() -- the R17 reroute setter (non-original glue;
+//       lives here with the code it serves).
 // --------------------------------------------------------------------------
 
 #include "mfc_compat.h"
+#include "engine_context.h"  // Entry 3: CCSessionUser embeds CUserInfo (userinfo.h
+                             // via engine_context.h); Entry 4 unused but harmless
+#include "userinfo.h"   // Entry 3: CUserInfo ctor + GetScreenName singles
 #include "bbox.h"
 #include "vector2d.h"   // LARGESHORT (make_empty's SRECT sentinel)
 #include "traj.h"       // CTraj/CSpline fwd chain used by balloon.h
@@ -40,7 +83,7 @@
 #include "avatar.h"     // CBody (balloon.h + panel.h)
 #include "balloon.h"    // CFontInfo/CBalloon (panel.h's CUnitPanelPage decl needs them)
 #include "backdrop.h"   // CBackDrop (panel.h's CPanel decl)
-#include "panel.h"      // CUnitPanelPage (for m_unitWidth definition)
+#include "panel.h"      // CUnitPanelPage (Entry 4 Establishing reads m_panels)
 
 // --- Entry 1: bbox.cpp geometry helpers (verbatim; provenance per line) -----
 
@@ -101,7 +144,53 @@ RECT SRECTToRECT(SRECT &s) {
 	return r;
 }
 
-// --- Entry 2: panel.cpp static DATA member (verbatim, with initializer) -----
+// --- Entry 2: panel.cpp static DATA member -- DELETED in Task 8 -------------
+// CUnitPanelPage::m_unitWidth is now defined by the lifted panel.cpp at file
+// scope (verbatim, same initializer). Defining it here too would violate ODR.
 
-// lifted verbatim from panel.cpp:59 — full file comes in Plan 2 Task 8
-int		CUnitPanelPage::m_unitWidth			= MINUNITPANELWIDTH-1;  // triggers a resize if not overridden
+// --- Entry 3: CUserInfo constructibility (verbatim; R12a) --------------------
+
+// lifted verbatim from userinfo.cpp:111 — full file comes in Plan 3
+CUserInfo::CUserInfo()
+{
+	m_uRequests		= 0;
+	m_flags			= 0;
+	m_avatarID		= 0;
+	m_uMsgCount		= 0;
+	m_uIntervalStart= 0;
+	m_bbValidUDI	= 0;
+}
+
+// lifted verbatim from userinfo.cpp:172 — full file comes in Plan 3.
+// First non-inline virtual of CUserInfo: anchors the vtable. Self-contained
+// (reads only members), so it is faithful to lift as-is.
+CString & CUserInfo::GetScreenName() {
+	if (m_flags & UF_SCREENNAME)
+		return m_strScreenName;
+	else
+		return m_strName;
+}
+
+// --- Entry 4: pageview.cpp cross-file singles (R12a + R17) -------------------
+
+// lifted verbatim from pageview.cpp:830 — full file NOT lifted (R16 compositor
+// replaces pageview.cpp's Draw/scroll). R12(a): plain BOOL data global written
+// only by the lifted panel.cpp AddLine.
+BOOL g_bNewedPanel = FALSE;
+
+// R17 reroute machinery (non-original glue): the CUnitPanelPage currently being
+// composed, set by panel.cpp's AddLine/AddReaction at entry. Stands in for the
+// original's GetView()->GetDocument()->m_pages.GetHead() (first page == the
+// page being composed, single-page headless model — discovery §7).
+static CUnitPanelPage* s_composingPage = NULL;
+void ccSetComposingPage(CUnitPanelPage* p) { s_composingPage = p; }
+
+// lifted from pageview.cpp:832 — arithmetic verbatim; ONLY the page-source read
+// rerouted (R17) from GetView()->GetDocument()->m_pages to s_composingPage.
+// Null composing-page -> count 0 -> TRUE (conservative "establishing, don't
+// zoom" default, identical to the original's count<=1 branch).
+BOOL Establishing() {
+	int count = s_composingPage ? s_composingPage->m_panels.GetCount() : 0;
+	if (count <= 1 || (!g_bNewedPanel && count <= 2)) return TRUE;
+	else return FALSE;
+}
