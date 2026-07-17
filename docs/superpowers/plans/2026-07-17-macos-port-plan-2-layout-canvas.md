@@ -218,11 +218,11 @@ Adapter semantics (implement exactly):
 - [ ] **Step 3: Run + fidelity diff** — `swift test` green; diff format.cpp vs original, every hunk rule-attributed; R11 exclusions listed individually.
 - [ ] **Step 4: Commit** — `git commit -m "macos: lift format.h/.cpp formatting half (Plan 2 Task 5)"`
 
-### Task 6: Lift balloon.h/.cpp + fonts.cpp + userinfo.h; delete 2 trap stubs
+### Task 6: Lift balloon.h/.cpp + fonts.cpp + userinfo.h + arc.cpp; delete trap stubs
 
 **Files:**
-- Create (lift): `engine/balloon.h`, `engine/balloon.cpp`, `engine/fonts.cpp`, `engine/userinfo.h` (sources: `v2.5-beta-1-modern/<same>`)
-- Modify: `engine/cc_link_stubs.cpp` (delete `CPanelElement` copy-ctor + `GetBBox` stubs — owners balloon.cpp:641/647)
+- Create (lift): `engine/balloon.h`, `engine/balloon.cpp`, `engine/fonts.cpp`, `engine/userinfo.h`, `engine/arc.cpp` (sources: `v2.5-beta-1-modern/<same>`; arc.cpp added by plan amendment 2026-07-17 — it is in `chat.mak`, balloon.cpp:1526/1528 allocates `CArc` for tail arcs, and Task 4 discovered `CArc::Draw/Dash` (traj.cpp:98–106) call its `DrawArc2`/`DashArc2`; arc.cpp needs only R1, includes are traj.h/vector2d.h/math.h)
+- Modify: `engine/cc_link_stubs.cpp` (delete `CPanelElement` copy-ctor + `GetBBox` stubs — owners balloon.cpp:641/647 — plus the Task 4 R12(b) stubs for `DrawArc2`/`DashArc2` once arc.cpp is lifted)
 - Modify: `shim/engine_context.h` (+`.cpp` if split) — R17 additions
 - Modify: `bridge/cc_selftest.cpp`
 
