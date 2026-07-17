@@ -12,14 +12,13 @@ import ComicChatKit
 // as a PNG file.
 
 let args = CommandLine.arguments
-guard args.count > 1 else {
-    FileHandle.standardError.write(Data("usage: cc-dumpart <art-dir>\n".utf8))
-    FileHandle.standardError.write(Data("       cc-dumpart --png <file.avb> <poseIndex> <out.png>\n".utf8))
-    exit(64) // EX_USAGE
-}
 
 do {
-    if args.count >= 4 && args[1] == "--png" {
+    if args.count >= 2 && args[1] == "--png" {
+        guard args.count == 5 else {
+            FileHandle.standardError.write(Data("usage: cc-dumpart --png <file.avb> <poseIndex> <out.png>\n".utf8))
+            exit(64) // EX_USAGE
+        }
         let filePath = args[2]
         guard let poseIndex = Int(args[3]) else {
             FileHandle.standardError.write(Data("cc-dumpart: poseIndex must be an integer\n".utf8))
@@ -31,6 +30,11 @@ do {
         let image = try avatar.poseImage(poseIndex)
         try exportPNG(artImage: image, toPath: outPath)
     } else {
+        guard args.count > 1 else {
+            FileHandle.standardError.write(Data("usage: cc-dumpart <art-dir>\n".utf8))
+            FileHandle.standardError.write(Data("       cc-dumpart --png <file.avb> <poseIndex> <out.png>\n".utf8))
+            exit(64) // EX_USAGE
+        }
         let artDir = args[1]
         let catalog = try buildCatalog(artDir: artDir)
         let encoder = JSONEncoder()
