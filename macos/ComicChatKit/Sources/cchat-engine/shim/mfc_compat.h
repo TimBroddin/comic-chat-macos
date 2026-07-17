@@ -73,9 +73,28 @@ struct RGBQUAD { BYTE rgbBlue; BYTE rgbGreen; BYTE rgbRed; BYTE rgbReserved; };
 struct BITMAPINFO { BITMAPINFOHEADER bmiHeader; RGBQUAD bmiColors[1]; };
 #pragma pack(pop)
 typedef RGBQUAD* LPRGBQUAD;
+typedef BITMAPINFO* LPBITMAPINFO;
 #define BI_RGB  0u
 #define BI_RLE8 1u
 #define BI_RLE4 2u
+
+// --- legacy OS/2-style DIB header (wire-compatible; used only to detect the
+//     older BITMAPCOREHEADER format, rule R9 for dib.cpp) --------------------
+#pragma pack(push, 2)
+struct BITMAPCOREHEADER {
+    DWORD bcSize;
+    WORD  bcWidth;
+    WORD  bcHeight;
+    WORD  bcPlanes;
+    WORD  bcBitCount;
+};
+#pragma pack(pop)
+
+// --- raster-op / DIB-color constants (declarations only stay live per R4;
+//     values match Win32 exactly since dib.h uses SRCCOPY as a default
+//     parameter value that must compile even with drawing stubbed out) ------
+#define SRCCOPY        0x00CC0020
+#define DIB_RGB_COLORS 0
 
 // --- diagnostics ------------------------------------------------------------
 void ccLog(const char* fmt, ...);
