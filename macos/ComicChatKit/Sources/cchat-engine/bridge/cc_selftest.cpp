@@ -2,6 +2,7 @@
 #include "mfc_compat.h"
 #include "engine_context.h"
 #include "dib.h"
+#include <unistd.h>   // mkstemp, close (testShimFileApis)
 
 static int g_failures;
 #define CC_CHECK(e) do { if (!(e)) { g_failures++; ccLog("SELFTEST FAIL: %s (%s:%d)", #e, __FILE__, __LINE__); } } while (0)
@@ -106,6 +107,135 @@ static void testDibCreate() {
     CC_CHECK(dib.GetNumClrEntries() == 256);
 }
 
+// --- Task 4 R9 shim additions: selftests (review fix) -----------------------
+// mfc_compat.h added these while lifting avbfile/avatario/avatar (Task 4);
+// review flagged that none had selftests per R9's own mandate. Grouped below.
+
+static void testShimFileApis() {
+    // GetFileAttributes: existence check only (avatario.cpp's LoadAvatarInfo).
+    char tmpTemplate[] = "/tmp/cc_selftest_fileapis_XXXXXX";
+    int fd = mkstemp(tmpTemplate);
+    CC_CHECK(fd != -1);
+    if (fd != -1) {
+        close(fd);
+        CC_CHECK(GetFileAttributes(tmpTemplate) != INVALID_FILE_ATTRIBUTES);
+        remove(tmpTemplate);
+        CC_CHECK(GetFileAttributes(tmpTemplate) == INVALID_FILE_ATTRIBUTES);
+    }
+
+    // lstrlen / lstrcpy / _tfopen (avbfile.cpp CAvatarFileStream ctor/Open()).
+    char buf[64];
+    CC_CHECK(lstrlen("hello") == 5);
+    CC_CHECK(lstrcpy(buf, "hello") == buf);
+    CC_CHECK(strcmp(buf, "hello") == 0);
+
+    char tmpTemplate2[] = "/tmp/cc_selftest_tfopen_XXXXXX";
+    int fd2 = mkstemp(tmpTemplate2);
+    CC_CHECK(fd2 != -1);
+    if (fd2 != -1) {
+        close(fd2);
+        FILE* f = _tfopen(tmpTemplate2, __T("rb"));
+        CC_CHECK(f != NULL);
+        if (f != NULL) {
+            fclose(f);
+        }
+        remove(tmpTemplate2);
+    }
+}
+
+static void testShimStringApis() {
+    // stricmp (avatar.cpp: GetAvatar/GetAvatar2/GetAvatar3/GetNextAvatarName).
+    CC_CHECK(stricmp("Anna", "anna") == 0);
+    CC_CHECK(stricmp("ABC", "abc") == 0);
+    int cmpDiff = stricmp("abc", "abd");
+    int cmpRef = strcasecmp("abc", "abd");
+    CC_CHECK(cmpDiff != 0);
+    // sign should agree with the real strcasecmp we delegate to.
+    CC_CHECK((cmpDiff < 0) == (cmpRef < 0));
+    CC_CHECK((cmpDiff > 0) == (cmpRef > 0));
+}
+
+static void testShimCollections2() {
+    // CTypedPtrArray<CPtrArray, T*> (avatar.h: m_arrPoses).
+    int a = 1, b = 2, c = 3;
+    CTypedPtrArray<CPtrArray, int*> arr;
+    CC_CHECK(arr.GetSize() == 0);
+    arr.Add(&a);
+    arr.Add(&b);
+    arr.Add(&c);
+    CC_CHECK(arr.GetSize() == 3);
+    CC_CHECK(arr.GetAt(0) == &a);
+    CC_CHECK(arr.GetAt(1) == &b);
+    CC_CHECK(arr[2] == &c);
+    *arr.GetAt(1) = 42;
+    CC_CHECK(b == 42);
+
+    // CCArrayBase::SetSize(n, growBy) + FreeExtra (avatar.cpp: m_arrPoses.SetSize(0,16),
+    // avbfile.cpp: pAvatar->m_arrPoses.FreeExtra()).
+    CDWordArray arr2;
+    arr2.SetSize(0, 16);  // growBy is a capacity hint only; size must still be 0.
+    CC_CHECK(arr2.GetSize() == 0);
+    arr2.SetSize(5, 100);
+    CC_CHECK(arr2.GetSize() == 5);
+    for (int i = 0; i < 5; i++) arr2.SetAt(i, (DWORD)i);
+    arr2.FreeExtra();
+    CC_CHECK(arr2.GetSize() == 5);  // FreeExtra trims capacity, not size.
+    for (int i = 0; i < 5; i++) CC_CHECK(arr2.GetAt(i) == (DWORD)i);
+}
+
+static void testShimMacros() {
+    // ZeroMemory (avatar.cpp CPose ctor, avbfile.cpp ConvertMasksCommon).
+    BYTE buf[16];
+    memset(buf, 0xAA, sizeof(buf));
+    ZeroMemory(buf, sizeof(buf));
+    bool allZero = true;
+    for (size_t i = 0; i < sizeof(buf); i++) if (buf[i] != 0) allZero = false;
+    CC_CHECK(allZero);
+
+    // RGBTRIPLE (avbfile.cpp CAvatarDIB::Load PM-DIB color table conversion).
+    CC_CHECK(sizeof(RGBTRIPLE) == 3);
+
+    // LOBYTE/HIBYTE/LOWORD/HIWORD (avbfile.cpp ConvertMasksCommon, CAvatarX::LoadAvatar).
+    CC_CHECK(LOWORD(0x12345678u) == 0x5678);
+    CC_CHECK(HIWORD(0x12345678u) == 0x1234);
+    CC_CHECK(LOBYTE((WORD)0x1234) == 0x34);
+    CC_CHECK(HIBYTE((WORD)0x1234) == 0x12);
+
+    // GetTickCount (avatar.cpp CAvatarComplex::SetSequential, CC_NO_UI-stubbed
+    // internals; stub always returns 0, so consecutive calls stay monotonic).
+    DWORD t1 = GetTickCount();
+    DWORD t2 = GetTickCount();
+    CC_CHECK(t2 >= t1);
+
+    // min/max macros (avatar.cpp CBodyDouble::GetDimInfo, CEmotionOpts::Add).
+    CC_CHECK(min(3, 5) == 3);
+    CC_CHECK(max(3, 5) == 5);
+    CC_CHECK(min(-1, 1) == -1);
+    CC_CHECK(max(-1, 1) == 1);
+
+    // AfxThrowMemoryException / AfxThrowUserException (avbfile.cpp
+    // ConvertMasksCommon / CChatBackdrop::LoadBackdrop): both are
+    // [[noreturn]] and unconditionally throw, matching MFC's
+    // AfxThrowXxxException() semantics. They don't abort — they throw a
+    // C++ exception the caller's TRY/CATCH_ALL(e) (== try/catch(...)) is
+    // expected to catch, so they CAN be exercised safely here.
+    bool caughtMemory = false;
+    try {
+        AfxThrowMemoryException();
+    } catch (const CMemoryException&) {
+        caughtMemory = true;
+    }
+    CC_CHECK(caughtMemory);
+
+    bool caughtUser = false;
+    try {
+        AfxThrowUserException();
+    } catch (const CUserException&) {
+        caughtUser = true;
+    }
+    CC_CHECK(caughtUser);
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -118,5 +248,9 @@ extern "C" int32_t cc_run_selftests(void) {
     testCStringMidClamping();
     testDibHelpers();
     testDibCreate();
+    testShimFileApis();
+    testShimStringApis();
+    testShimCollections2();
+    testShimMacros();
     return g_failures;
 }
