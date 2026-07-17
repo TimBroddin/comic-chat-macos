@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - All work on branch `macos-port`; repo root is `/Users/timbroddin/Projects/comic-chat`.
-- New code lives only under `macos/`; `v2.5-beta-1-modern/` is read-only reference. **Plan 2 addition:** `artifacts-modern/inc/format.h` is also read-only lift source (the original build's `ARTINC` include dir; `format.h` does not exist in `v2.5-beta-1-modern/`).
+- New code lives only under `macos/`; `v2.5-beta-1-modern/` is read-only reference. **Plan 2 addition:** `artifacts/inc/format.h` is also read-only lift source (the original build's `ARTINC` include dir; `format.h` does not exist in `v2.5-beta-1-modern/`).
 - No Win32/MFC headers anywhere under `macos/` — the shim (`mfc_compat.h`) is the only provider of those names.
 - The C bridge header `comicchat.h` is pure C (`extern "C"`, no C++ types) and is the **only** interface the Swift targets use.
 - `CString` is byte-oriented (spec §4.5) — never widen to UTF-16. Canvas text parameters are raw bytes (CP-1252 by default); only the Swift canvas implementations convert for display.
@@ -206,7 +206,7 @@ Adapter semantics (implement exactly):
 ### Task 5: Lift format.h + format.cpp (formatting/measurement half)
 
 **Files:**
-- Create (lift): `engine/format.h` (source: **`artifacts-modern/inc/format.h`**, 68 lines — provenance comment at top), `engine/format.cpp` (source: `v2.5-beta-1-modern/format.cpp`, 1507 lines)
+- Create (lift): `engine/format.h` (source: **`artifacts/inc/format.h`**, 68 lines — provenance comment at top), `engine/format.cpp` (source: `v2.5-beta-1-modern/format.cpp`, 1507 lines)
 - Modify: `bridge/cc_selftest.cpp`
 
 **Interfaces:**
