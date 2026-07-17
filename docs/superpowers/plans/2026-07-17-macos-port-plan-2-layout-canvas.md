@@ -261,7 +261,7 @@ Known R-work for balloon.cpp (from `[TM]`/`[CM]` — implementer verifies the fu
 **Files:**
 - Create (lift): `engine/panel.cpp` (panel.h already lifted in Task 6 per amendment)
 - Modify: `engine/cc_link_stubs.cpp` (delete the `CPanelElement::SetBBox` stub — its real body lands with panel.cpp. Amendment 2026-07-17: the FILE STAYS — it now also hosts the Task 6 intl.c stubs (`GetMime`/`iBytesofChar`/`FindSubStringForINTLThatFits`), which are Plan 3 debt; with SetBBox gone, all 13 original Plan 1 stubs are retired)
-- Modify: `engine/lifted_singles.cpp` (delete the `m_unitWidth` static definition — panel.cpp defines it; the bbox.cpp singles and SRECTToRECT stay)
+- Modify: `engine/lifted_singles.cpp` (delete the `m_unitWidth` static definition — panel.cpp defines it; the bbox.cpp singles and SRECTToRECT stay. **Amendment 2026-07-17 (Task 8 escalation ruling):** `Establishing()` + `g_bNewedPanel` (pageview.cpp:832/:830 — pageview.cpp is never lifted) are added here R12(a)-verbatim, with Establishing's one singleton read (`GetView()->GetDocument()->m_pages.GetHead()`) rerouted R17-style to a `s_composingPage` static set via `ccSetComposingPage(this)` — two one-line R17-listed additions at the top of `AddLine`/`AddReaction`. Faithful under the single-page headless model (composing page == first page). Title/starring functions (`AddTitle`/`UpdateTitle`/`ShowInfo`/`AddStars`) are R11-wrapped: title rendering is a known functional deferral this plan.)
 - Modify: `shim/engine_context.h` — R17 session additions (users, backdrop id, title)
 - Modify: `bridge/cc_selftest.cpp`
 
