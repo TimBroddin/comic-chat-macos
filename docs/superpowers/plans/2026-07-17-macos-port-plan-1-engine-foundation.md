@@ -34,6 +34,7 @@ When a copied original file fails to compile, fix it **only** in these ways, in 
 | R8 | Includes of UI/doc headers (`chatdoc.h`, `binddoc.h`, `ui.h`, `userinfo.h`, `pageview.h`, `histent.h`) | Delete the include. If a type from them is genuinely needed by model code, forward-declare it and keep usage pointer-opaque; if a code path needs their behavior, `#ifndef CC_NO_UI` it out. |
 | R9 | A missing MFC type/member the shim lacks | Add the **minimal** member to `mfc_compat.h`, with a selftest exercising it. Never add speculatively. |
 | R10 | Original code needed by a lifted call site or a task-mandated test, but disabled in the original build (`#if 0`, dead `#ifdef`) | Re-enable it **verbatim** (move the definition out of the disabled region, changing nothing else); note it in the report. Added 2026-07-17 during Task 3 for `CDIB::GetNumClrEntries()`. |
+| R11 | A whole function in a lifted file serves the UI/session layer (my-avatar selection, screen-name lookup, body-cam refresh, chat-doc access) and is not required by the load/parse path | Wrap the **entire definition** in `#ifndef CC_NO_UI`. Exception for vtable completeness: if it overrides a virtual that lifted code instantiates (e.g. `SetSequential`), keep the definition and wrap only the UI-dependent internals, with a safe no-op/failure `#else`. Header declarations stay. List every R11 exclusion individually in the report. Added 2026-07-17 during Task 4 for `avatar.cpp` (`SetMyAvatar` ×2, `GetScreenName`, `RefreshBodyCam`/`RefreshBodyPreview` call sites, `SetSequential` overrides). |
 
 Anything not covered above: stop and flag rather than improvise.
 
@@ -627,7 +628,8 @@ git -C /Users/timbroddin/Projects/comic-chat commit -m "macos: lift dib (parse-o
 ### Task 4: Lift the avatar loading chain (`avbfile`, `avatario`, `avatar` + headers)
 
 **Files:**
-- Create (copies, then Edit Rules): `engine/bbox.h`, `engine/vector2d.h`, `engine/vector2d.cpp`, `engine/pe.h`, `engine/avatar.h`, `engine/avatar.cpp`, `engine/avatario.h`, `engine/avatario.cpp`, `engine/avbfile.h`, `engine/avbfile.cpp`
+- Create (copies, then Edit Rules): `engine/bbox.h`, `engine/vector2d.h`, `engine/vector2d.cpp`, `engine/pe.h`, `engine/avatar.h`, `engine/avatar.cpp`, `engine/avatario.h`, `engine/avatario.cpp`, `engine/avbfile.h`, `engine/avbfile.cpp`, `engine/backdrop.h`
+- *(Correction 2026-07-17: `backdrop.h` moved here from Task 5 — `avbfile.cpp` includes it and implements `CChatBackdrop::LoadBackdrop/LoadFromBmp/Load` in its trailing section, which stays in `avbfile.cpp` as original code. Task 5 lifts only `backdrop.cpp`.)*
 - Modify: `bridge/cc_selftest.cpp`, `include/comicchat.h`, `bridge/engine.cpp`
 
 **Interfaces:**
@@ -703,7 +705,7 @@ git -C /Users/timbroddin/Projects/comic-chat commit -m "macos: lift avbfile/avat
 ### Task 5: Lift `backdrop` (`.bgb` loading)
 
 **Files:**
-- Create (copies, then Edit Rules): `engine/backdrop.h`, `engine/backdrop.cpp`
+- Create (copies, then Edit Rules): `engine/backdrop.cpp` (`backdrop.h` already lifted in Task 4; `CChatBackdrop`'s `Load*` methods already came with `avbfile.cpp`)
 - Modify: `bridge/engine.cpp`, `include/comicchat.h`
 - Test: `Tests/ComicChatKitTests/SelfTests.swift`
 
