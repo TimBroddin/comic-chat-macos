@@ -542,22 +542,28 @@ git -C /Users/timbroddin/Projects/comic-chat commit -m "macos: MFC-compat shim, 
 
 ---
 
-### Task 3: Lift `memblst` and `dib` (DIB parsing without drawing)
+### Task 3: Lift `dib` (DIB parsing without drawing)
+
+> **Plan correction (2026-07-17, during execution):** `memblst.h/.cpp` was
+> originally listed here on the mistaken assumption it was a memory-block
+> utility. It is actually the member-list UI control
+> (`CMemberListCtrl : public CListCtrl`) — UI code that is never lifted.
+> `avatar.cpp`'s `#include "memblst.h"` is dead (no symbols used) and is
+> deleted under R8 in Task 4.
 
 **Files:**
-- Create (copy from `v2.5-beta-1-modern/`, then edit per rules): `Sources/cchat-engine/engine/memblst.h`, `engine/memblst.cpp`, `engine/dib.h`, `engine/dib.cpp`
+- Create (copy from `v2.5-beta-1-modern/`, then edit per rules): `engine/dib.h`, `engine/dib.cpp`
 - Modify: `Sources/cchat-engine/bridge/cc_selftest.cpp`
 
 **Interfaces:**
 - Consumes: shim from Task 2.
-- Produces: `CDIB` (create-from-memory, `GetWidth/GetHeight`, `GetBitsAddress`, `GetClrTabAddress`, `GetNumClrEntries`, `Convert8ToNonRLE`, `StorageWidth`), `DIBStorageWidth(UINT,UINT)`, `NumDIBColorEntries(BITMAPINFO*)`, `CMemBlaster` (as declared in `memblst.h`) — the exact classes `avbfile.cpp` links against in Task 4.
+- Produces: `CDIB` (create-from-memory, `GetWidth/GetHeight`, `GetBitsAddress`, `GetClrTabAddress`, `GetNumClrEntries`, `Convert8ToNonRLE`, `StorageWidth`), `DIBStorageWidth(UINT,UINT)`, `NumDIBColorEntries(BITMAPINFO*)` — the exact classes `avbfile.cpp` links against in Task 4.
 
-- [ ] **Step 1: Copy the four files**
+- [ ] **Step 1: Copy the two files**
 
 ```bash
 cd /Users/timbroddin/Projects/comic-chat
-cp v2.5-beta-1-modern/memblst.h v2.5-beta-1-modern/memblst.cpp \
-   v2.5-beta-1-modern/dib.h v2.5-beta-1-modern/dib.cpp \
+cp v2.5-beta-1-modern/dib.h v2.5-beta-1-modern/dib.cpp \
    macos/ComicChatKit/Sources/cchat-engine/engine/
 ```
 
@@ -606,15 +612,13 @@ Expected: compile failure — `dib.h` still includes `stdafx.h` / uses Win32 nam
 Known edits (discovered during planning):
 - `dib.cpp`: R1 (`stdafx.h` → `mfc_compat.h`); R4 — the three `CDIB::Draw(CDC*, ...)` overload bodies use `StretchDIBits`; wrap each body per R4; R6 — delete `Load(WORD wResid)` and both `Save` overloads (write path out of scope).
 - `dib.h`: delete the `Load`/`Save` declarations removed above; keep everything else byte-identical.
-- `memblst.*`: R1; expected otherwise portable (it is a memory-block list utility). Apply R9 only if the compiler proves otherwise.
-
 Run: `swift test` after each edit round until: PASS (all selftests green).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git -C /Users/timbroddin/Projects/comic-chat add macos/
-git -C /Users/timbroddin/Projects/comic-chat commit -m "macos: lift memblst + dib (parse-only, draw bodies stubbed per R4)"
+git -C /Users/timbroddin/Projects/comic-chat commit -m "macos: lift dib (parse-only, draw bodies stubbed per R4)"
 ```
 
 ---
@@ -626,7 +630,7 @@ git -C /Users/timbroddin/Projects/comic-chat commit -m "macos: lift memblst + di
 - Modify: `bridge/cc_selftest.cpp`, `include/comicchat.h`, `bridge/engine.cpp`
 
 **Interfaces:**
-- Consumes: `CDIB`, `CMemBlaster`, shim, `ccContext()`.
+- Consumes: `CDIB`, shim, `ccContext()`.
 - Produces: working `.avb` load path (original classes `CAvatarFileStream`, `CAvatarDIB`, `CAvatarX`/`CAvatarSimple`/`CAvatarComplex`, `CPose`); temporary C hook `cc_smoke_load_avatar(const char* path, char* name_out, size_t name_cap, int32_t* pose_count_out) -> int32_t` (0 on success) used by tests until Task 6 replaces it with the real API.
 
 - [ ] **Step 1: Copy the ten files** (same `cp` pattern as Task 3, from `v2.5-beta-1-modern/`).
@@ -664,7 +668,7 @@ Expected: compile failure (`cc_smoke_load_avatar` undeclared) — then, after St
 
 Known edits (discovered during planning):
 - `avbfile.cpp`, `avatario.cpp`: R1; R2 (`chat.h`/`theApp.GetAvatarDir()` → `engine_context.h`/`ccContext().avatarDir` — e.g. `avatario.cpp:20` `path.Format("%s\\%s.avb", ...)` also needs R3); zlib — keep the `ZLIB` namespace declarations in `avbfile.h` as-is; system `libz` (already linked in Task 1) provides `compress`/`compress2`/`uncompress` with exactly those signatures.
-- `avatar.cpp`: R1; R8 (drop `binddoc.h`, `chatdoc.h`, `ui.h`, `userinfo.h`, `chat.h`, `chatprot.h` includes); R5 (`<io.h>` avatar-file scan); R4 (any `CBody::Draw`/GDI bodies); R9 for stragglers.
+- `avatar.cpp`: R1; R8 (drop `binddoc.h`, `chatdoc.h`, `ui.h`, `userinfo.h`, `chat.h`, `chatprot.h`, and `memblst.h` includes — `memblst.h` is the member-list UI control and no symbol from it is used in `avatar.cpp`); R5 (`<io.h>` avatar-file scan); R4 (any `CBody::Draw`/GDI bodies); R9 for stragglers.
 - `avatar.h`, `avbfile.h`, `pe.h`: keep byte-identical if possible; `pe.h`'s `virtual void Draw(CDC*, POINT*, RECT*) = 0` compiles against the shim's forward-declared `CDC`.
 - `AVATAR_READ` is already the only mode enabled in `avbfile.h` (`AVATAR_WRITE` off) — leave as-is; R6 applies to any write-path stragglers.
 
