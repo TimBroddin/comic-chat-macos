@@ -28,6 +28,15 @@ int32_t cc_run_bodydraw_selftest(const char* avatar_path);
  * fixture path. */
 int32_t cc_run_panel_selftest(const char* avatar_path);
 
+/* Plan 2 Task 10: strip session API + headless compositor selftest. Opens the
+ * avatar at avatar_path (loaded twice -> two participants) and the backdrop at
+ * backdrop_path (a real .bgb fixture), drives cc_strip_create/add_participant/
+ * set_backdrop/add_line over a fixed 2x4 conversation, and asserts panel_count,
+ * get_size==GetBBox, and (Step 3) the FULL recording-canvas compose log against
+ * a frozen snapshot. Returns 0 on success (failure count otherwise). Kept out of
+ * cc_run_selftests because it needs fixture paths. */
+int32_t cc_run_strip_selftest(const char* avatar_path, const char* backdrop_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env
@@ -126,6 +135,79 @@ typedef struct cc_canvas { const cc_canvas_ops* ops; void* ctx; } cc_canvas;
 /* Register the canvas used for LAYOUT-TIME text measurement (the original's
  * shared MM_TWIPS CClientDC). Must outlive all layout calls. */
 void cc_set_metrics_canvas(cc_canvas* canvas);
+
+/* ============================================================================
+ * Scripted-strip session (Plan 2 Task 10). Drives the full lifted layout
+ * engine end-to-end: opens participant avatars, wires the session user table
+ * (the talk-to/camera graph), ingests scripted lines through the panel
+ * orchestrator (CUnitPanelPage::AddLine), and composites the finished page onto
+ * a cc_canvas headlessly (the R16 replacement for CUnitPanelPage::Draw).
+ *
+ * THREADING CONTRACT (Task 8 review amendment, binding): the engine uses
+ * process-global mutable state -- the avatar registry (avatar.cpp `avatars[]`),
+ * the session/settings (ccContext().session), the font statics
+ * (CUnitPanelPage's CFontInfo/CFont statics), the backdrop registries
+ * (backdrop.cpp backRecS/backMapS), and the composing-page back-pointer
+ * (s_composingPage). There is NO internal locking. ALL cc_* calls (strip API
+ * and every other cc_* entry point) must originate from ONE thread at a time;
+ * concurrent calls are undefined behavior. The Swift Strip wrapper (Task 11)
+ * documents and enforces the same single-threaded contract.
+ *
+ * Modes mirror defines.h BM_* values exactly (defines.h:63-70). */
+enum { CC_MODE_SAY = 0x0001, CC_MODE_WHISPER = 0x0002,
+       CC_MODE_THINK = 0x0004, CC_MODE_ACTION = 0x0008 };
+
+typedef struct cc_strip cc_strip;
+
+/* Create an empty strip session. Initializes the avatar registry, resets the
+ * session user table, installs the comics fonts from the session face/size
+ * defaults, and sets sane unit-panel geometry.
+ *
+ * DETERMINISM (Task 8 review amendment, binding): the live layout path consumes
+ * the global rand() stream -- CPanel::CPanel() seeds each panel with
+ * m_seed = rand() (panel.cpp:604), and CUnitPanel::LayoutBalloons reseeds via
+ * srand(m_seed) so per-panel balloon shift/fit is reproducible FROM that seed.
+ * Because the seed itself is drawn from the global stream, an unseeded stream
+ * would make identical scripts yield different strips depending on prior rand()
+ * consumers. cc_strip_create() therefore seeds the global stream
+ * deterministically (srand(0x5EED)) so identical scripts yield byte-identical
+ * strips. */
+cc_strip* cc_strip_create(void);
+void      cc_strip_destroy(cc_strip* s);            /* no-op if NULL */
+
+/* Open the avatar at avb_path, register it (GetAvatar(id) then finds it), create
+ * its session user entry, and wire m_userInfo -> that entry (the Task 8 wiring
+ * invariant). nick names the participant. Returns the assigned participant id
+ * (>= 1) on success, -1 on failure. */
+int32_t   cc_strip_add_participant(cc_strip* s, const char* nick,
+                                   const char* avb_path);   /* >=0 id, -1 fail */
+
+/* Load the .bgb at bgb_path and register it so every subsequently-created panel
+ * inherits it (via ccContext().session.backdropID, read by CPanel::CPanel).
+ * Returns 0 on success, non-zero on failure. Call before add_line for the
+ * backdrop to appear in composed panels. */
+int32_t   cc_strip_set_backdrop(cc_strip* s, const char* bgb_path); /* 0 ok */
+
+/* Ingest one scripted line spoken by `speaker` (a participant id from
+ * add_participant). `modes` is a bitwise-OR of CC_MODE_* (mirroring BM_*).
+ * `addressees`/`n_addr` name who the speaker is talking to (participant ids);
+ * they populate the speaker's talk-to graph (the camera's facing/order input).
+ * Runs the original ingestion chain (talk-to wiring, ChatPreSendText emotion
+ * inference, CUnitPanelPage::AddLine). Returns 0 on success. */
+int32_t   cc_strip_add_line(cc_strip* s, int32_t speaker,
+                            const char* text_bytes, uint32_t modes,
+                            const int32_t* addressees, int32_t n_addr); /* 0 ok */
+
+/* Number of panels laid out so far. */
+int32_t   cc_strip_panel_count(const cc_strip* s);
+
+/* Bounding box of the finished page in twips (width, height >= 0). Matches
+ * CUnitPanelPage::GetBBox's row/column arithmetic. */
+void      cc_strip_get_size(const cc_strip* s, int32_t* out_w, int32_t* out_h);
+
+/* Composite the finished page onto `canvas` (the R16 headless replacement for
+ * CUnitPanelPage::Draw). Returns 0 on success. */
+int32_t   cc_strip_compose(cc_strip* s, cc_canvas* canvas); /* 0 ok */
 
 #ifdef __cplusplus
 }

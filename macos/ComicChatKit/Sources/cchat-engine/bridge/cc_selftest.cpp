@@ -2176,6 +2176,240 @@ static void cc_selftest_textpose() {
     DestroyEmotionRules();
 }
 
+// --- Plan 2 Task 10: cc_strip session API + headless compositor --------------
+// Drives the ENTIRE lifted layout engine end-to-end for the first time: opens
+// two participants (anna.avb loaded twice -> two avatars with distinct ids +
+// distinct CUserInfo), sets a backdrop (field.bgb), ingests a fixed 2x4
+// alternating conversation through the panel orchestrator, and composites the
+// finished page onto a recording canvas via cc_strip_compose (the R16 headless
+// replacement for CUnitPanelPage::Draw).
+//
+// This runs in the serialized suite (StripTests.swift): like the panel/bodydraw
+// selftests it mutates the process-global avatar registry + session + font
+// statics + backdrop registries. Determinism is now ENGINE-owned
+// (cc_strip_create seeds srand(0x5EED) -- Task 8 review amendment), so the
+// frozen panel counts + snapshot are stable regardless of what ran before; the
+// srand pin here is redundant belt-and-braces kept for pattern consistency with
+// cc_selftest_panel (which predates the engine-side seeding).
+
+// Forward-declare the cc_strip internals the metrics assertions reach: the
+// GetBBox comparison needs the live page, so cc_strip exposes it. Declared here
+// (cc_compose.cpp defines the struct) rather than in comicchat.h because it is
+// a test-only C++ view into the opaque C handle.
+struct cc_strip;
+extern CUnitPanelPage* cc_strip_page(cc_strip* s);   // cc_compose.cpp (test hook)
+
+static int cc_selftest_strip(const char* avatarPath, const char* backdropPath) {
+    int startFailures = g_failures;
+
+    // Redundant belt-and-braces RNG pin (see header comment) -- cc_strip_create
+    // seeds it engine-side too.
+    srand(12345);
+
+    // --- recording metrics canvas: layout-time text measurement routes here.
+    static CCRecordingCanvas stripMetrics;
+    cc_set_metrics_canvas(stripMetrics.handle());
+
+    cc_strip* s = cc_strip_create();
+    CC_CHECK(s != NULL);
+    if (!s) return g_failures - startFailures;
+
+    // --- two participants (anna.avb twice -> ids 1, 2).
+    int32_t a = cc_strip_add_participant(s, "Anna", avatarPath);
+    int32_t b = cc_strip_add_participant(s, "Boris", avatarPath);
+    CC_CHECK(a == 1);
+    CC_CHECK(b == 2);
+    if (a < 0 || b < 0) { cc_strip_destroy(s); return g_failures - startFailures; }
+
+    // --- backdrop (field.bgb): registered so composed panels blit it.
+    CC_CHECK(cc_strip_set_backdrop(s, backdropPath) == 0);
+
+    // --- fixed 2x4 alternating conversation, each line addressing the other.
+    int32_t aAddr[1] = { b };
+    int32_t bAddr[1] = { a };
+    CC_CHECK(cc_strip_add_line(s, a, "Hello there", CC_MODE_SAY, aAddr, 1) == 0);
+    CC_CHECK(cc_strip_add_line(s, b, "Hi yourself", CC_MODE_SAY, bAddr, 1) == 0);
+    CC_CHECK(cc_strip_add_line(s, a, "How are you", CC_MODE_SAY, aAddr, 1) == 0);
+    CC_CHECK(cc_strip_add_line(s, b, "Doing great", CC_MODE_SAY, bAddr, 1) == 0);
+
+    // --- panel_count > 0.
+    int32_t panelCount = cc_strip_panel_count(s);
+    CC_CHECK(panelCount > 0);
+
+    // --- get_size matches CUnitPanelPage::GetBBox exactly.
+    int32_t w = 0, h = 0;
+    cc_strip_get_size(s, &w, &h);
+    {
+        CUnitPanelPage* page = cc_strip_page(s);
+        CC_CHECK(page != NULL);
+        if (page) {
+            RECT bbox;
+            page->GetBBox(&bbox);
+            CC_CHECK(w == bbox.right - bbox.left);
+            CC_CHECK(h == bbox.top - bbox.bottom);   // y-up: top > bottom
+        }
+    }
+
+    // --- compose onto a recording canvas: non-empty log; each panel emits
+    //     >= 1 text (a balloon) and >= 1 image (backdrop and/or body blit).
+    CCRecordingCanvas compose;
+    CC_CHECK(cc_strip_compose(s, compose.handle()) == 0);
+    const std::vector<std::string>& log = compose.log();
+    CC_CHECK(!log.empty());
+
+    int textLines = 0, imageLines = 0;
+    for (size_t i = 0; i < log.size(); i++) {
+        if (log[i].compare(0, 5, "text ") == 0) textLines++;
+        if (log[i].compare(0, 6, "image ") == 0) imageLines++;
+    }
+    // Aggregate sanity (Step 1's coarse gate): at least one text (a balloon) +
+    // one image (backdrop/body blit) per panel. The Step 3 snapshot below pins
+    // the EXACT per-panel line sequence, which strictly subsumes this.
+    CC_CHECK(textLines >= panelCount);
+    CC_CHECK(imageLines >= panelCount);
+
+    // ================= STEP 3: FULL-LOG SNAPSHOT =========================
+    // The entire recording-canvas compose log, frozen after hand-reviewing every
+    // line for plausibility. Because determinism is engine-owned (cc_strip_create
+    // seeds srand(0x5EED)), this log is byte-identical across runs AND
+    // independent of test order (verified: the same 64 lines whether the strip
+    // selftest runs standalone or after the whole serialized battery).
+    //
+    // STRUCTURE (2x4 alternating A,B,A,B -> FOUR panels in a 2-per-row grid;
+    // unitWidth==unitHeight==2300, both interstices 144, so the row/col advance
+    // is 2300+144 = 2444):
+    //   Panel 1 origin (0,0)        rows[0..13]
+    //   Panel 2 origin (2444,0)     rows[14..29]   (x += 2444 = unitW+vInterstice)
+    //   Panel 3 origin (0,-2444)    rows[30..45]   (new row: y -= 2444 = unitH+hInterstice)
+    //   Panel 4 origin (2444,-2444) rows[46..63]
+    // The A,B,A,B script yields four panels (not three like the panel selftest's
+    // 2x4 trace): this strip ALSO sets a backdrop and runs ChatPreSendText emotion
+    // inference (both absent from the panel selftest), and seeds srand(0x5EED) not
+    // 12345 -- all of which shift balloon fit, so line 3 (A) opens its own panel
+    // here rather than merging. panel_count == 4, get_size == 4744x4744 (2x2 grid)
+    // are frozen from this same run and cross-checked against GetBBox above.
+    //
+    // PER-PANEL ORDER exactly follows CUnitPanel::Draw (panel.cpp:714-759):
+    //   1. clip setup: GetClipBox (no log) then IntersectClipRect(&rect) +
+    //      IntersectClipRect(dmgRect) -> TWO identical "clip+" lines at the panel
+    //      unit rect in canvas space (panel.cpp:725-727). For panel 1 that is
+    //      0,0,2300,-2300; for panel 2, shifted by the (-2444,0) window origin to
+    //      2444,0,4744,-2300; etc. (SetWindowOrg sign per Task 3's locked
+    //      semantics: org = -loc, so a panel-local rect maps to +loc in output.)
+    //   2. backdrop: m_backDrop.Draw (panel.cpp:729) -> one "image" blitting the
+    //      315x315 field.bgb to the full panel rect. Panels 3/4 show a non-zero
+    //      src top (src=0,74,... / 0,78,...) because their taller emotion poses
+    //      drive a larger LayoutAvatars zoom, which shifts m_backDrop's SetBBox
+    //      crop (backdrop.cpp:353-356 src-rect math). This is faithful, not noise.
+    //   3. bodies (head->tail, panel.cpp:733-742): each of the two bodies
+    //      (Anna + Boris) emits its pose-plane blits -- the doubled image lines
+    //      are the image+mask compositing the recording canvas logs per body.
+    //   4. balloon (elements tail->head, panel.cpp:745-752): the CBWoodring cloud
+    //      spline ("path ... fillc=FFFFFF strokec=000000", the white cloud with a
+    //      black outline) then the balloon "text". Text color 000000 == the
+    //      session comicsColor default (RGB 0,0,0).
+    //   5. border (panel.cpp:754-755, DrawBorder): a 5-point closed "path" tracing
+    //      the panel unit rectangle in stroke width 120 (2*m_borderWidth).
+    //   6. clip restore: SelectClipRgn(NULL) -> "clip-" then
+    //      IntersectClipRect(&oldClip) -> "clip+" of the +/-2^28 base sentinel
+    //      (panel.cpp:757-758). The trailing clip+ of the last panel is the final
+    //      line of the whole log.
+    // Every balloon "text" carries the exact line bytes in A,B,A,B order:
+    //   "Hello there" (panel 1), "Hi yourself" (panel 2), "How are you" (panel 3),
+    //   "Doing great" (panel 4) -- confirming speaker->panel->balloon threading.
+    // No line was inexplicable; the snapshot is frozen verbatim from that run.
+    static const char* kExpected[] = {
+        "clip+ 0,0,2300,-2300",
+        "clip+ 0,0,2300,-2300",
+        "image 0,0,2300,-2300 src=0,0,315,315",
+        "image 457,-1319,951,-2301 src=0,0,185,368",
+        "image 406,-1090,911,-1451 src=0,0,189,135",
+        "image 457,-1319,951,-2301 src=0,0,185,368",
+        "image 406,-1090,911,-1451 src=0,0,189,135",
+        "image 1884,-1309,1355,-2301 src=0,0,198,372",
+        "image 1892,-1090,1387,-1451 src=0,0,189,135",
+        "image 1884,-1309,1355,-2301 src=0,0,198,372",
+        "image 1892,-1090,1387,-1451 src=0,0,189,135",
+        "path n=53 fill=1 fillc=FFFFFF stroke=1 strokec=000000 w=28 dashed=0 [M 1474,-373 C 1474,-373 1474,-373 1483,-376 C 1492,-379 1531,-392 1575,-386 C 1618,-381 1779,-344 1851,-335 C 1923,-327 2084,-327 2119,-295 C 2155,-265 2155,-124 2119,-84 C 2083,-43 1922,-6 1851,-6 C 1779,-6 1618,-43 1547,-43 C 1475,-44 1314,-7 1243,-7 C 1171,-6 1010,-43 939,-51 C 867,-60 706,-60 671,-92 C 635,-122 635,-263 671,-303 C 707,-344 868,-381 939,-381 C 1011,-381 1172,-344 1216,-338 C 1260,-332 1297,-344 1305,-347 C 1314,-349 1314,-349 1314,-349 C 1145,-574 932,-758 689,-890 C 983,-768 1249,-592 1474,-373 Z]",
+        "text 735,-80 color=000000 \"Hello there\"",
+        "path n=5 fill=0 fillc=000000 stroke=1 strokec=000000 w=120 dashed=0 [M 0,-2300 L 0,0 L 2300,0 L 2300,-2300 Z]",
+        "clip-",
+        "clip+ -268435456,268435456,268435456,-268435456",
+        "clip+ 2444,0,4744,-2300",
+        "clip+ 2444,0,4744,-2300",
+        "image 2444,0,4744,-2300 src=0,0,315,315",
+        "image 2873,-1285,3409,-2301 src=0,0,206,391",
+        "image 2839,-1090,3331,-1442 src=0,0,189,135",
+        "image 2873,-1285,3409,-2301 src=0,0,206,391",
+        "image 2839,-1090,3331,-1442 src=0,0,189,135",
+        "image 4296,-1319,3802,-2301 src=0,0,185,368",
+        "image 4347,-1090,3842,-1451 src=0,0,189,135",
+        "image 4296,-1319,3802,-2301 src=0,0,185,368",
+        "image 4347,-1090,3842,-1451 src=0,0,189,135",
+        "path n=53 fill=1 fillc=FFFFFF stroke=1 strokec=000000 w=28 dashed=0 [M 3734,-373 C 3734,-373 3734,-373 3743,-376 C 3752,-379 3791,-392 3835,-386 C 3878,-381 4039,-344 4111,-335 C 4183,-327 4344,-327 4379,-295 C 4415,-265 4415,-124 4379,-84 C 4343,-43 4182,-6 4111,-6 C 4039,-6 3878,-43 3807,-43 C 3735,-44 3574,-7 3503,-7 C 3431,-6 3270,-43 3199,-51 C 3127,-60 2966,-60 2931,-92 C 2895,-122 2895,-263 2931,-303 C 2967,-344 3128,-381 3199,-381 C 3271,-381 3432,-344 3476,-338 C 3520,-332 3557,-344 3565,-347 C 3574,-349 3574,-349 3574,-349 C 3704,-558 3870,-741 4064,-890 C 3917,-743 3805,-567 3734,-373 Z]",
+        "text 2995,-80 color=000000 \"Hi yourself\"",
+        "path n=5 fill=0 fillc=000000 stroke=1 strokec=000000 w=120 dashed=0 [M 2444,-2300 L 2444,0 L 4744,0 L 4744,-2300 Z]",
+        "clip-",
+        "clip+ -268435456,268435456,268435456,-268435456",
+        "clip+ 0,-2444,2300,-4744",
+        "clip+ 0,-2444,2300,-4744",
+        "image 0,-2444,2300,-4744 src=0,74,160,233",
+        "image 178,-3994,1177,-5924 src=0,0,191,369",
+        "image 0,-3534,989,-4256 src=0,0,189,138",
+        "image 178,-3994,1177,-5924 src=0,0,191,369",
+        "image 0,-3534,989,-4256 src=0,0,189,138",
+        "image 2233,-3918,1176,-5924 src=0,0,206,391",
+        "image 2300,-3534,1330,-4227 src=0,0,189,135",
+        "image 2233,-3918,1176,-5924 src=0,0,206,391",
+        "image 2300,-3534,1330,-4227 src=0,0,189,135",
+        "path n=53 fill=1 fillc=FFFFFF stroke=1 strokec=000000 w=28 dashed=0 [M 899,-2817 C 899,-2817 899,-2817 908,-2820 C 917,-2823 956,-2836 1000,-2830 C 1043,-2825 1204,-2788 1276,-2779 C 1348,-2771 1509,-2771 1544,-2739 C 1580,-2709 1580,-2568 1544,-2528 C 1508,-2487 1347,-2450 1276,-2450 C 1204,-2450 1043,-2487 972,-2487 C 900,-2488 739,-2451 668,-2451 C 596,-2450 435,-2487 364,-2495 C 292,-2504 131,-2504 96,-2536 C 60,-2566 60,-2707 96,-2747 C 132,-2788 293,-2825 364,-2825 C 436,-2825 597,-2788 641,-2782 C 685,-2776 722,-2788 730,-2791 C 739,-2793 739,-2793 739,-2793 C 709,-2985 641,-3169 539,-3334 C 691,-3184 813,-3009 899,-2817 Z]",
+        "text 160,-2524 color=000000 \"How are you\"",
+        "path n=5 fill=0 fillc=000000 stroke=1 strokec=000000 w=120 dashed=0 [M 0,-4744 L 0,-2444 L 2300,-2444 L 2300,-4744 Z]",
+        "clip-",
+        "clip+ -268435456,268435456,268435456,-268435456",
+        "clip+ 2444,-2444,4744,-4744",
+        "clip+ 2444,-2444,4744,-4744",
+        "image 2444,-2444,4744,-4744 src=0,78,151,229",
+        "image 2461,-3991,3565,-6063 src=0,0,198,372",
+        "image 2444,-3534,3497,-4287 src=0,0,189,135",
+        "image 2461,-3991,3565,-6063 src=0,0,198,372",
+        "image 2444,-3534,3497,-4287 src=0,0,189,135",
+        "image 4674,-3953,3563,-6061 src=0,0,206,391",
+        "image 4744,-3533,3725,-4278 src=0,0,189,138",
+        "image 4674,-3953,3563,-6061 src=0,0,206,391",
+        "image 4744,-3533,3725,-4278 src=0,0,189,138",
+        "path n=50 fill=1 fillc=FFFFFF stroke=1 strokec=000000 w=28 dashed=0 [M 3920,-2817 C 3920,-2817 3920,-2817 3946,-2812 C 3972,-2807 4091,-2783 4153,-2777 C 4216,-2771 4377,-2771 4413,-2739 C 4449,-2709 4449,-2568 4413,-2528 C 4377,-2487 4216,-2450 4145,-2450 C 4073,-2450 3912,-2487 3841,-2487 C 3769,-2488 3608,-2451 3537,-2451 C 3465,-2450 3304,-2487 3233,-2495 C 3161,-2504 3000,-2504 2965,-2536 C 2929,-2566 2929,-2707 2965,-2747 C 3001,-2788 3162,-2825 3233,-2825 C 3305,-2825 3466,-2788 3528,-2785 C 3589,-2782 3707,-2806 3733,-2811 C 3759,-2816 3759,-2816 3759,-2816 C 3869,-3014 4015,-3189 4189,-3334 C 4064,-3183 3972,-3007 3920,-2817 Z]",
+        "text 3029,-2524 color=000000 \"Doing great\"",
+        "path n=5 fill=0 fillc=000000 stroke=1 strokec=000000 w=120 dashed=0 [M 2444,-4744 L 2444,-2444 L 4744,-2444 L 4744,-4744 Z]",
+        "clip-",
+        "clip+ -268435456,268435456,268435456,-268435456",
+    };
+    const size_t nExpected = sizeof(kExpected) / sizeof(kExpected[0]);
+    CC_CHECK(log.size() == nExpected);
+    if (log.size() == nExpected) {
+        for (size_t i = 0; i < nExpected; i++) {
+            if (log[i] != kExpected[i]) {
+                g_failures++;
+                ccLog("STRIP SNAPSHOT MISMATCH at line %zu:\n  expected: %s\n  actual:   %s",
+                      i, kExpected[i], log[i].c_str());
+            }
+        }
+    }
+
+    cc_strip_destroy(s);
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift wrapper (StripTests.swift), which passes the
+// anna.avb + field.bgb fixture paths. Runs standalone (resets g_failures).
+extern "C" int32_t cc_run_strip_selftest(const char* avatarPath,
+                                         const char* backdropPath) {
+    g_failures = 0;
+    if (avatarPath == NULL || backdropPath == NULL) return 1;
+    cc_selftest_strip(avatarPath, backdropPath);
+    return g_failures;
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();

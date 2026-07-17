@@ -325,6 +325,21 @@ void DestroyEmotionList(CPtrList &list) {
 		free(unit->arg);
 		free(unit);
 	}
+	list.RemoveAll();  // R15 (Plan 2 Task 10): the original frees every STRINGUNIT
+	// but leaves its (now dangling) pointer in `list`. Benign in the original
+	// (rules are built once at startup, torn down only at process exit -- the
+	// dead list is never read again), but UB the moment anything re-runs the
+	// text->emotion path after a DestroyEmotionRules: InitializeEmotionRules
+	// AddTail's fresh units BEHIND the stale dangling ones, and
+	// GetEmotionsFromString then dereferences freed memory (use-after-free ->
+	// SIGSEGV/SIGABRT). Task 10's cc_strip is the first such re-runner (its
+	// create/destroy lifecycle re-inits the rules, and two strips in one process
+	// hit it). RemoveAll clears the freed pointers so the list is genuinely empty
+	// -- exactly what the function's name already promises. Frees the same
+	// memory; only the post-condition (empty list, not dangling list) changes.
+	// Confirmed against the READ-ONLY original (v2.5-beta-1-modern/textpose.cpp:
+	// DestroyEmotionList is byte-identical there, sans this RemoveAll). NEW R15
+	// instance -- registered for plan-amendment ratification in the Task 10 report.
 }
 
 void DestroyEmotionRules() {

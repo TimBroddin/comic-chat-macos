@@ -42,4 +42,19 @@ struct EngineGlobalStateSelfTests {
         let path = fixture("anna.avb")
         #expect(cc_run_panel_selftest(path) == 0)
     }
+
+    // Plan 2 Task 10: the cc_strip session API + headless compositor -- the task
+    // that drives the entire lifted layout engine end-to-end for the first time.
+    // Opens two participants (anna.avb twice), sets a backdrop (field.bgb),
+    // ingests a fixed 2x4 alternating conversation through the panel
+    // orchestrator, and composites the finished page onto a recording canvas via
+    // cc_strip_compose (the R16 replacement for CUnitPanelPage::Draw). Asserts
+    // panel_count, get_size==GetBBox, and the FULL frozen compose-log snapshot.
+    // Serialized here because it mutates the same process-global registry +
+    // session + font statics + backdrop registries as the tests above.
+    @Test func stripSelfTestPasses() {
+        let avatar = fixture("anna.avb")
+        let backdrop = fixture("field.bgb")
+        #expect(cc_run_strip_selftest(avatar, backdrop) == 0)
+    }
 }
