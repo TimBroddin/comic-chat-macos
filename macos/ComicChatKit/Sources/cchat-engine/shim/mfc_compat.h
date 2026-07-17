@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <strings.h>
+#include <unordered_map>
 
 // --- scalar typedefs -------------------------------------------------------
 typedef int            BOOL;
@@ -114,6 +115,10 @@ inline int lstrlen(LPCSTR s) { return (int)strlen(s ? s : ""); }
 inline char* lstrcpy(char* dst, LPCSTR src) { return strcpy(dst, src ? src : ""); }
 #define __T(x) x
 inline FILE* _tfopen(LPCTSTR path, LPCTSTR mode) { return fopen(path, mode); }
+
+// --- lstrcmpi (rule R9; backdrop.cpp NotifyDownloadedBackdrop uses it as a
+//     case-insensitive string compare, same semantics as stricmp) -----------
+inline int lstrcmpi(LPCSTR a, LPCSTR b) { return strcasecmp(a ? a : "", b ? b : ""); }
 
 // --- legacy OS/2-style DIB header (wire-compatible; used only to detect the
 //     older BITMAPCOREHEADER format, rule R9 for dib.cpp) --------------------
@@ -288,6 +293,52 @@ public:
     T GetAt(int i) const { return (T)BaseArray::GetAt(i); }
     void SetAt(int i, T v) { BaseArray::SetAt(i, (void*)v); }
     int Add(T v) { return BaseArray::Add((void*)v); }
+};
+
+// --- POSITION (rule R9; backdrop.cpp FlushBackDropCache iterates a
+//     CMapWordToPtr with GetStartPosition()/GetNextAssoc(), MFC's generic
+//     "iteration cursor" idiom). MFC declares it as `void*` (NULL = end of
+//     collection); we do the same. --------------------------------------------
+typedef void* POSITION;
+
+// --- CMapWordToPtr (rule R9; backdrop.cpp backMapS/backMapP cache backdrop
+//     art by WORD backID). MFC's CMapWordToPtr is a WORD->void* hash map with
+//     Lookup/SetAt/RemoveKey/RemoveAll and POSITION-based iteration via
+//     GetStartPosition()/GetNextAssoc(). Backed by std::unordered_map; POSITION
+//     here is that map's node in disguise, encoded as an index into a stable
+//     key list captured at GetStartPosition() time (simplest correct mapping
+//     for backdrop.cpp's single linear iterate-and-optionally-delete use). ---
+class CMapWordToPtr {
+public:
+    explicit CMapWordToPtr(int /*nBlockSize*/ = 0) {}
+
+    BOOL Lookup(WORD key, void*& value) const {
+        auto it = m_map.find(key);
+        if (it == m_map.end()) return FALSE;
+        value = it->second;
+        return TRUE;
+    }
+    void SetAt(WORD key, void* value) { m_map[key] = value; }
+    BOOL RemoveKey(WORD key) { return (BOOL)m_map.erase(key); }
+    void RemoveAll() { m_map.clear(); }
+
+    POSITION GetStartPosition() const {
+        m_iterKeys.clear();
+        m_iterKeys.reserve(m_map.size());
+        for (auto& kv : m_map) m_iterKeys.push_back(kv.first);
+        return m_iterKeys.empty() ? nullptr : (POSITION)(uintptr_t)1;
+    }
+    void GetNextAssoc(POSITION& pos, WORD& key, void*& value) const {
+        size_t idx = (size_t)(uintptr_t)pos - 1;
+        key = m_iterKeys[idx];
+        value = m_map.at(key);
+        idx++;
+        pos = idx < m_iterKeys.size() ? (POSITION)(uintptr_t)(idx + 1) : nullptr;
+    }
+
+private:
+    std::unordered_map<WORD, void*> m_map;
+    mutable std::vector<WORD> m_iterKeys;
 };
 
 #endif // MFC_COMPAT_H

@@ -6,6 +6,21 @@ import cchat_engine
     #expect(cc_run_selftests() == 0)
 }
 
+@Test func smokeLoadFieldBackdrop() throws {
+    // 5 deletions: SelfTests.swift → ComicChatKitTests → Tests → ComicChatKit → macos → repo root
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let field = repoRoot.appendingPathComponent("v2.5-beta-1-modern/comicart/field.bgb").path
+    var name = [CChar](repeating: 0, count: 256)
+    var w: Int32 = 0, h: Int32 = 0
+    #expect(cc_smoke_load_backdrop(field, &name, 256, &w, &h) == 0)
+    #expect(w > 0 && h > 0)
+}
+
 @Test func smokeLoadAnna() throws {
     // comicart/ lives at the repo root; locate it relative to this source file.
     // NOTE: the brief's original 4-call chain landed one level short (at

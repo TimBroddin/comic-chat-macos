@@ -20,6 +20,16 @@ int32_t cc_run_selftests(void);
 int32_t cc_smoke_load_avatar(const char* path, char* name_out, size_t name_cap,
                              int32_t* pose_count_out);
 
+/* Temporary smoke-test hook for the backdrop loading chain (Task 5). Loads the
+ * .bgb (or .bmp) file at `path` via the original
+ * CAvatarFileStream/CChatBackdrop::LoadBackdrop code, copies the backdrop's
+ * URL (best-effort truncated to name_cap; empty string if none) into
+ * name_out, and writes the loaded DIB's width/height into width_out/
+ * height_out. Returns 0 on success, non-zero on any failure. Replaced by the
+ * real cc_backdrop_* API in Task 6. */
+int32_t cc_smoke_load_backdrop(const char* path, char* name_out, size_t name_cap,
+                               int32_t* width_out, int32_t* height_out);
+
 #ifdef __cplusplus
 }
 #endif

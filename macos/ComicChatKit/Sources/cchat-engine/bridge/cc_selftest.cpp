@@ -236,6 +236,53 @@ static void testShimMacros() {
     CC_CHECK(caughtUser);
 }
 
+// --- Task 5 R9 shim additions: selftests -------------------------------------
+// mfc_compat.h added these while lifting backdrop.cpp (Task 5): lstrcmpi
+// (NotifyDownloadedBackdrop) and CMapWordToPtr/POSITION (backMapS/backMapP
+// caches + FlushBackDropCache's iteration).
+
+static void testShimStringApis2() {
+    // lstrcmpi (backdrop.cpp NotifyDownloadedBackdrop).
+    CC_CHECK(lstrcmpi("Anna", "anna") == 0);
+    CC_CHECK(lstrcmpi("ABC", "abc") == 0);
+    CC_CHECK(lstrcmpi("abc", "abd") != 0);
+}
+
+static void testMapWordToPtr() {
+    // CMapWordToPtr + POSITION (backdrop.cpp backMapS/backMapP,
+    // GetBackDropArtFromID/FlushBackDropFromID/FlushBackDropCache).
+    int a = 1, b = 2, c = 3;
+    CMapWordToPtr map(10);
+
+    void* found = nullptr;
+    CC_CHECK(map.Lookup(1, found) == FALSE);
+
+    map.SetAt(1, &a);
+    map.SetAt(2, &b);
+    map.SetAt(3, &c);
+    CC_CHECK(map.Lookup(2, found) == TRUE && found == &b);
+
+    // Iterate via POSITION/GetNextAssoc and verify every key/value round-trips.
+    int seen = 0;
+    POSITION pos = map.GetStartPosition();
+    while (pos) {
+        WORD key;
+        void* value;
+        map.GetNextAssoc(pos, key, value);
+        CC_CHECK(key >= 1 && key <= 3);
+        seen++;
+    }
+    CC_CHECK(seen == 3);
+
+    CC_CHECK(map.RemoveKey(2) == TRUE);
+    CC_CHECK(map.Lookup(2, found) == FALSE);
+    CC_CHECK(map.RemoveKey(2) == FALSE);  // already removed
+
+    map.RemoveAll();
+    CC_CHECK(map.Lookup(1, found) == FALSE);
+    CC_CHECK(map.GetStartPosition() == nullptr);  // empty map has no iteration
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -252,5 +299,7 @@ extern "C" int32_t cc_run_selftests(void) {
     testShimStringApis();
     testShimCollections2();
     testShimMacros();
+    testShimStringApis2();
+    testMapWordToPtr();
     return g_failures;
 }
