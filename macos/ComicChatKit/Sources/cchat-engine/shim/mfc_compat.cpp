@@ -10,7 +10,18 @@ static int g_ccLogLevel = -1;
 static void ccLogLevelEnsureInit() {
     if (g_ccLogLevel != -1) return;
     const char* env = getenv("CC_LOG_LEVEL");
-    g_ccLogLevel = (env != nullptr) ? atoi(env) : 2;
+    if (env != nullptr && env[0] != '\0') {
+        char* endptr;
+        long val = strtol(env, &endptr, 10);
+        // Only accept if entire string parsed (endptr points to NUL)
+        if (*endptr == '\0') {
+            g_ccLogLevel = (val < 0) ? 0 : (val > 2) ? 2 : (int)val;
+        } else {
+            g_ccLogLevel = 2;  // invalid parse -> default
+        }
+    } else {
+        g_ccLogLevel = 2;  // unset or empty -> default
+    }
 }
 
 int ccLogWouldEmit(int level) {
@@ -19,7 +30,8 @@ int ccLogWouldEmit(int level) {
 }
 
 void cc_set_log_level(int32_t level) {
-    g_ccLogLevel = level;
+    // Clamp to valid range [0, 2]
+    g_ccLogLevel = (level < 0) ? 0 : (level > 2) ? 2 : level;
 }
 
 void ccLog(const char* fmt, ...) {

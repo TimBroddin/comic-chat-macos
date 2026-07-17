@@ -343,6 +343,29 @@ static void cc_selftest_loglevel() {
     CC_CHECK(ccLogWouldEmit(2) == 0);
     cc_set_log_level(2);
     CC_CHECK(ccLogWouldEmit(2) == 1);
+
+    // Test clamping on both paths:
+    // At level 0, neither level 1 nor 2 should emit
+    cc_set_log_level(0);
+    CC_CHECK(ccLogWouldEmit(1) == 0);
+    CC_CHECK(ccLogWouldEmit(2) == 0);
+
+    // At level 1, level 1 should emit but level 2 should not
+    cc_set_log_level(1);
+    CC_CHECK(ccLogWouldEmit(1) == 1);
+    CC_CHECK(ccLogWouldEmit(2) == 0);
+
+    // cc_set_log_level(99) should clamp to 2 (acts as level 2)
+    cc_set_log_level(99);
+    CC_CHECK(ccLogWouldEmit(2) == 1);
+
+    // cc_set_log_level(-5) should clamp to 0 (acts as level 0)
+    cc_set_log_level(-5);
+    CC_CHECK(ccLogWouldEmit(1) == 0);
+    CC_CHECK(ccLogWouldEmit(2) == 0);
+
+    // Restore to level 2 (default) so later tests see TRACE behavior
+    cc_set_log_level(2);
 }
 
 extern "C" int32_t cc_run_selftests(void) {
