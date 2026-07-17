@@ -1,4 +1,4 @@
-// Lifted from artifacts-modern/inc/format.h (documented plan exception: this
+// Lifted from artifacts/inc/format.h (documented plan exception: this
 // header does not exist in v2.5-beta-1-modern/ -- it lives only in the
 // original build's ARTINC include dir; format.cpp's original #include
 // "format.h" resolved to this file via the include path, not a project-local
