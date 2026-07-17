@@ -162,13 +162,17 @@ entry-debt Task 1) — full detail in the roadmap's "Plan 2 — DONE" section:**
   signing agent intermittently fails mid-session with "failed to fill whole
   buffer" / "agent returned an error" even when unlocked — this is not
   necessarily an unlock problem, it can recur task-to-task. **Unsigned
-  range:** commits `d1da855..21448f2` (Tasks 6 through 11, 13 commits) on
-  this branch are UNSIGNED — verified directly against the raw commit
-  objects (`git cat-file commit <sha> | grep gpgsig`; `git log --format=%G?`
-  is unreliable in this environment because `gpg.ssh.allowedSignersFile`
-  isn't configured for verification, it always reports `N`). This range
-  could be re-signed (interactive rebase + re-sign) before any eventual
-  merge to `main`, but has not been.
+  range (corrected, final review):** commits `d1da855..HEAD` of this branch
+  (all commits from Task 6 onward, including the final-review fix commit) are
+  UNSIGNED — verified directly against the raw commit objects
+  (`git cat-file commit <sha> | grep gpgsig`; `git log --format=%G?` is
+  unreliable in this environment because `gpg.ssh.allowedSignersFile` isn't
+  configured for verification, it always reports `N`). At the time of this
+  correction that range is `d1da855..41d36ed` inclusive — 15 commits — but
+  stating it as `d1da855..HEAD` keeps the note accurate as further unsigned
+  commits (starting with this fix itself) land on top. This range could be
+  re-signed (interactive rebase + re-sign) before any eventual merge to
+  `main`, but has not been.
 - Swift test files resolve the repo root with **FIVE**
   `deletingLastPathComponent()` calls from `#filePath` (established Plan 1,
   confirmed still correct through Plan 2 — count them if you add a new test

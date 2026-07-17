@@ -113,6 +113,14 @@ typedef struct cc_canvas_ops {
                          int32_t len, int32_t* out_w, int32_t* out_h);
     void (*font_metrics)(void* ctx, const cc_font_spec* f, cc_text_metrics* out);
     /* drawing */
+    /* draw_text's `y` is the GDI TA_TOP box-TOP -- the top of the text cell
+     * in y-up space, matching the original's default GDI text-alignment mode
+     * (TA_TOP, never changed to TA_BASELINE) -- NOT a CoreText/baseline-style
+     * origin. Implementations whose text API positions by baseline must
+     * convert: baseline = y - ascent (ascent from font_metrics/
+     * cc_text_metrics, in the same twips space as `y`). Getting this
+     * backwards shifts every glyph down by roughly one ascent's worth of
+     * twips (final review; see also cc_text_metrics.ascent above). */
     void (*draw_text)(void* ctx, const cc_font_spec* f, int32_t x, int32_t y,
                       uint32_t color, int32_t bk_opaque, uint32_t bk_color,
                       const char* bytes, int32_t len);
@@ -161,7 +169,7 @@ void cc_set_metrics_canvas(cc_canvas* canvas);
  * concurrent calls are undefined behavior. The Swift Strip wrapper (Task 11)
  * documents and enforces the same single-threaded contract.
  *
- * Modes mirror defines.h BM_* values exactly (defines.h:63-70). */
+ * Modes mirror defines.h BM_* values exactly (defines.h:63-66). */
 enum { CC_MODE_SAY = 0x0001, CC_MODE_WHISPER = 0x0002,
        CC_MODE_THINK = 0x0004, CC_MODE_ACTION = 0x0008 };
 
@@ -170,6 +178,21 @@ typedef struct cc_strip cc_strip;
 /* Create an empty strip session. Initializes the avatar registry, resets the
  * session user table, installs the comics fonts from the session face/size
  * defaults, and sets sane unit-panel geometry.
+ *
+ * ONE STRIP AT A TIME (final review, binding): cc_strip_create resets the
+ * process-global registries a strip drives -- the avatar registry
+ * (avatar.cpp `avatars[]`), the backdrop registries (backdrop.cpp
+ * backRecS/backMapS), the session user table (ccContext().session), and the
+ * emotion rule tables (textpose.cpp) -- and cc_strip_destroy frees all of
+ * them. These tables are shared process-wide state, not per-handle state: a
+ * second cc_strip_create before the first strip's cc_strip_destroy re-inits
+ * the tables out from under the first handle's avatars/users, and destroying
+ * either handle afterward frees state the other handle's `page` still
+ * references. Two coexisting cc_strip handles are therefore a use-after-free,
+ * not merely a data race -- create exactly one strip, drive it to
+ * completion, and destroy it before creating the next. This is a stricter
+ * requirement than the THREADING CONTRACT below (which governs concurrent
+ * threads); it applies even to sequential code on a single thread.
  *
  * DETERMINISM (Task 8 review amendment, binding): the live layout path consumes
  * the global rand() stream -- CPanel::CPanel() seeds each panel with
@@ -200,8 +223,10 @@ int32_t   cc_strip_set_backdrop(cc_strip* s, const char* bgb_path); /* 0 ok */
  * add_participant). `modes` is a bitwise-OR of CC_MODE_* (mirroring BM_*).
  * `addressees`/`n_addr` name who the speaker is talking to (participant ids);
  * they populate the speaker's talk-to graph (the camera's facing/order input).
- * Runs the original ingestion chain (talk-to wiring, ChatPreSendText emotion
- * inference, CUnitPanelPage::AddLine). Returns 0 on success. */
+ * `addressees` may be NULL only if `n_addr` is 0 (no addressees) -- NULL with
+ * a nonzero `n_addr` is rejected (-1), not treated as zero addressees (final
+ * review). Runs the original ingestion chain (talk-to wiring, ChatPreSendText
+ * emotion inference, CUnitPanelPage::AddLine). Returns 0 on success. */
 int32_t   cc_strip_add_line(cc_strip* s, int32_t speaker,
                             const char* text_bytes, uint32_t modes,
                             const int32_t* addressees, int32_t n_addr); /* 0 ok */

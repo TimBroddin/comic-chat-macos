@@ -112,6 +112,31 @@ table for exact citations):
 - `cc_avatar_icon_image` accessor note (Plan 1 handover, unchanged): the icon
   pose is excluded from the pose API by design; Plan 4 pickers need this
   bridge accessor added. Keep this entry — Plan 2 did not touch it.
+- **Balloon text sits high under fake layout metrics vs. real CoreText
+  drawing (final review, spec §9 divergence, cosmetic).** Layout runs against
+  the deterministic fake-metrics recording canvas (`cc_set_metrics_canvas`),
+  while composed drawing uses `CGCanvas`'s real CoreText metrics
+  (`CTFontGetAscent`/`GetDescent`/`GetLeading`). The two metric sources
+  disagree in magnitude, so balloon text renders a bit higher in its box than
+  a real-metrics-driven layout would place it. Not a correctness bug in
+  either metrics source individually — revisit once Plan 4 (or later) drives
+  layout from real CoreText metrics end-to-end instead of the fake recording
+  canvas.
+- **`CGCanvas`'s `TEXTMETRIC` heuristics are placeholders, not measured
+  values (final review).** `font_metrics`/`GetTextMetrics` synthesize
+  `aveCharWidth = (ascent + descent) / 2`, `maxCharWidth = 2 * aveCharWidth`,
+  and `internalLeading = 0` rather than querying CoreText for the font's real
+  per-glyph/leading metrics. These feed layout decisions (balloon sizing,
+  line wrap) today, so any real-metrics layout work in Plan 4 must replace
+  these three heuristics with actual CoreText-derived values, not just wire
+  up real ascent/descent/height.
+- **`StretchDIBits` re-decodes the DIB → RGBA on every blit (final review,
+  performance note).** The `CDC` adapter's `StretchDIBits` path converts the
+  palettized DIB to RGBA fresh each call rather than caching the decoded
+  image, so a panel redrawn every frame (e.g. an interactive Plan 4 view)
+  pays the full decode cost repeatedly. Not a correctness issue at today's
+  one-shot headless-compose usage; worth a cache if Plan 4 adds
+  frequently-redrawn interactive rendering.
 
 **Scaffolding state at Plan 2 exit** (see conventions section above for full
 detail): `CC_NO_RENDER` gone; `CC_NO_UI` shrunk but present; `CC_NO_PROTOCOL`

@@ -130,9 +130,11 @@ extension EngineGlobalStateSelfTests {
             // non-white-fraction check above only proves SOMETHING drew
             // somewhere on the page — the exact bug this test would have
             // missed (balloon text rendering 20x too small, see CGCanvas.swift
-            // drawText's textMatrix fix) leaves plenty of OTHER non-white
-            // pixels (balloon outline, avatar art, panel borders) so the >1%
-            // fraction check alone does not catch it.
+            // drawText's draw-font fix -- a CTFont built at 20x point size,
+            // NOT the textMatrix approach, which was tried first and reverted
+            // because it corrupted multi-glyph line layout) leaves plenty of
+            // OTHER non-white pixels (balloon outline, avatar art, panel
+            // borders) so the >1% fraction check alone does not catch it.
             //
             // Sampling directly inside the composited page's first-balloon
             // region turned out NOT to isolate glyph pixels reliably: the
@@ -141,7 +143,7 @@ extension EngineGlobalStateSelfTests {
             // the panel's top clip edge, AND the balloon's pixel footprint
             // overlaps the avatar head art drawn in the same panel -- so
             // "non-white pixels in that rect" is never zero, fix or no fix
-            // (verified: with the textMatrix fix reverted, that region still
+            // (verified: with the draw-font fix reverted, that region still
             // reported non-white pixels from surrounding art, giving a false
             // GREEN -- see the round-1 report's RED-evidence section).
             //

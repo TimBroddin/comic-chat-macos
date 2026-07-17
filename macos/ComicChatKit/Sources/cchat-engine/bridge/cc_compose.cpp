@@ -154,7 +154,9 @@ extern "C" void cc_strip_destroy(cc_strip* s) {
     if (!s) return;
     delete s->page;   // cascades: panels -> elements/bodies (CPage::~CPage).
                       // Deleted FIRST so no live CBackDrop references a backID
-                      // before DestroyBackDropArt frees the registry below.
+                      // before DestroyBackDropArt frees the registry below, and
+                      // so no live CPanelElement text draw touches the
+                      // CFontInfo statics DestroyFonts frees below.
     // Tear down the process-global tables this strip drove so the next strip
     // (or another global-state selftest) starts clean.
     DestroyAvatars();
@@ -162,6 +164,12 @@ extern "C" void cc_strip_destroy(cc_strip* s) {
     ccContext().session.backdropID = 0;    // clear the inherited backdrop id
     DestroyBackDropArt();                  // frees BDFileRecs + backdrop art cache
     if (s->emotionRulesInited) DestroyEmotionRules();
+    // Fonts (final review): SetFonts (cc_strip_create) leaks CFont/CFontInfo
+    // statics -- fonts.cpp:144 DestroyFonts frees the m_fonts/m_fontInfos
+    // lists and nulls the statics. Placed last, alongside the other global
+    // teardowns, since page (already deleted above) is the only consumer of
+    // the CFontInfo statics -- nothing after this point may touch them.
+    CUnitPanelPage::DestroyFonts();
     delete s;
 }
 
@@ -258,7 +266,12 @@ extern "C" int32_t cc_strip_set_backdrop(cc_strip* s, const char* bgb_path) {
 extern "C" int32_t cc_strip_add_line(cc_strip* s, int32_t speaker,
                                      const char* text_bytes, uint32_t modes,
                                      const int32_t* addressees, int32_t n_addr) {
+    // NULL addressees with nonzero n_addr is malformed input (final review):
+    // rather than dereference addressees[i] below, reject it outright,
+    // consistent with this function's existing error style (return -1 for
+    // any invalid argument, e.g. the !text_bytes check on this same line).
     if (!s || !s->page || !text_bytes || speaker <= 0) return -1;
+    if (!addressees && n_addr != 0) return -1;
 
     CUserInfo* spk = ccContext().session.lookupUser((UINT)speaker);
     if (!spk) return -1;   // unknown speaker id
