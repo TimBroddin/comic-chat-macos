@@ -256,11 +256,12 @@ Known R-work for balloon.cpp (from `[TM]`/`[CM]` — implementer verifies the fu
 - [ ] **Step 4: Run + fidelity diff** — `swift test` green (all suites). Diffs rule-attributed; every R11 exclusion and R14 transformation listed.
 - [ ] **Step 5: Commit** — `git commit -m "macos: lift bodycam CBody draw, retire CC_NO_RENDER + 10 stubs (Plan 2 Task 7)"`
 
-### Task 8: Lift panel.h/.cpp; delete last stub + cc_link_stubs.cpp
+### Task 8: Lift panel.cpp; delete last Plan-1 stub
 
 **Files:**
-- Create (lift): `engine/panel.h`, `engine/panel.cpp`
-- Delete: `engine/cc_link_stubs.cpp` (last stub `CPanelElement::SetBBox` panel.cpp:542 now has its real body; file becomes empty)
+- Create (lift): `engine/panel.cpp` (panel.h already lifted in Task 6 per amendment)
+- Modify: `engine/cc_link_stubs.cpp` (delete the `CPanelElement::SetBBox` stub — its real body lands with panel.cpp. Amendment 2026-07-17: the FILE STAYS — it now also hosts the Task 6 intl.c stubs (`GetMime`/`iBytesofChar`/`FindSubStringForINTLThatFits`), which are Plan 3 debt; with SetBBox gone, all 13 original Plan 1 stubs are retired)
+- Modify: `engine/lifted_singles.cpp` (delete the `m_unitWidth` static definition — panel.cpp defines it; the bbox.cpp singles and SRECTToRECT stay)
 - Modify: `shim/engine_context.h` — R17 session additions (users, backdrop id, title)
 - Modify: `bridge/cc_selftest.cpp`
 
