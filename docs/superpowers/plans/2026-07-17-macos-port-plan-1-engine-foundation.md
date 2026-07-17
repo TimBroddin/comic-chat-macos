@@ -916,7 +916,15 @@ swift run cc-dumpart ../../v2.5-beta-1-modern/comicart \
   > Tests/ComicChatKitTests/Fixtures/comicart-catalog.json
 ```
 
-**Verification of the golden (manual, once):** open the JSON and check the roster against the known shipped cast (anna, armando, bolo, buck, connor, cro, dan, denise, glenda, hugh, jordan, kirby, lance, lynnea, margaret, mike, … 32 files total) and that every avatar has plausible pose counts (>= 5) and non-empty pose names. Record the check in the commit message. (Spec §8 calls for Windows-build ground truth; the Windows build is not runnable on this machine, so the golden locks in *current* parser output after human spot-check — cross-checking against the Windows client happens in Plan 4's manual acceptance.)
+**Verification of the golden (manual, once):** open the JSON and check the roster against the known shipped cast (anna, armando, bolo, buck, connor, cro, dan, denise, glenda, hugh, jordan, kirby, lance, lynnea, margaret, mike, … 32 files total) and that every avatar has plausible pose counts and non-empty pose names. Record the check in the commit message. (Spec §8 calls for Windows-build ground truth; the Windows build is not runnable on this machine, so the golden locks in *current* parser output after human spot-check — cross-checking against the Windows client happens in Plan 4's manual acceptance.)
+
+> **Corrected during execution + final review (2026-07-17):** the original ">= 5
+> poses per avatar" sanity bar here was written blind and is wrong. Actual
+> distribution: 20 avatars with 14–30+ poses, and **5 single-pose minimal
+> avatars** (glenda, pedagog, rainbow, tux, waf — their `AK_NBODIES` tag counts
+> 1 body; verified against the format, and tux renders correctly). Task 7's
+> commit message repeats the wrong ">=5" claim; this note is the accurate
+> record. These 5 files are flagged for Plan 4's Windows cross-check.
 
 - [ ] **Step 4: Run to verify it passes** — `swift test`: catalog test green over all 32 files.
 

@@ -30,10 +30,20 @@ overloads, `avatar.cpp` body/pose drawing, `backdrop.cpp`).
 **Debt handed over by Plan 1 (delete as the owning files are lifted):**
 - `engine/cc_link_stubs.cpp` — trap stubs for virtuals owned by
   `bodycam.cpp`/`panel.cpp`/`wmini.cpp`/`balloon.cpp` (Edit Rule R12b).
-- `engine/lifted_singles.cpp` — verbatim single-function lifts the load path
-  needed early (R12a); fold back into their owning files when those are lifted.
+  (13 stubs, all tier-b. `lifted_singles.cpp`/R12a was never needed — no
+  load-path symbol required a verbatim single lift; do not expect that file.)
 - `CC_NO_PROTOCOL` define in Package.swift — removed by Plan 3
   (`EmotionToBytes`/`BytesToEmotion` in `avatario.cpp` re-enable then).
+- **From the Plan 1 final review (entry work for Plan 2):**
+  - `CAvatarStream` (avbfile.h:283) has no virtual destructor; `~CAvatarX`
+    deletes through the base → UB + small object leak per close. Fix via a
+    documented Edit Rule (add `virtual ~CAvatarStream() {}`), not silently.
+  - Add `-Wno-tautological-undefined-compare` to the engine target's
+    cxxSettings (34 warnings from the faithful `this != NULL` 1998 idiom are
+    drowning real ones).
+  - Before Plan 3's transcript tests: give `ccLog` a quiet mode
+    (`cc_set_log_level` or env var) — engine TRACE noise already leaks into
+    test output ("Deleting avatar: Xeno.") and will get much worse.
 
 **Dependency map (from include analysis, 2026-07-17):**
 - `balloon.cpp` includes `panel.h`, `script.h`, `pageview.h`, `format.h`,
