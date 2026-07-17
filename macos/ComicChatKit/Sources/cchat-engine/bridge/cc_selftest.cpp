@@ -2009,6 +2009,173 @@ static void cc_selftest_panel_session() {
     CC_CHECK(ctx.session.userFromTalkTo(keyU2) == nullptr);  // table cleared
 }
 
+// --- Plan 2 Task 9 R9 shim addition: CString::LoadString + the string-
+// resource registry (mfc_compat.h/.cpp) it's backed by. Exercised directly
+// here (hit/miss/overwrite) per R9's own mandate, separately from
+// cc_selftest_textpose()'s higher-level characterization (which exercises it
+// only transitively, through InitializeEmotionRules's real ID_RULE_* lookups).
+static void testLoadStringResource() {
+    // miss: an id nobody has registered.
+    CString s;
+    CC_CHECK(s.LoadString(0xFFFFF000) == FALSE);
+    CC_CHECK(s.IsEmpty());  // untouched by a miss, matching real MFC's contract
+
+    // hit: register then look up by the same id.
+    RegisterStringResource(0xFFFFF001, "hello world");
+    CC_CHECK(s.LoadString(0xFFFFF001) == TRUE);
+    CC_CHECK(s == "hello world");
+
+    // overwrite: re-registering the same id replaces the prior value.
+    RegisterStringResource(0xFFFFF001, "goodbye");
+    CString s2;
+    CC_CHECK(s2.LoadString(0xFFFFF001) == TRUE);
+    CC_CHECK(s2 == "goodbye");
+
+    // a second, distinct id is independent of the first.
+    RegisterStringResource(0xFFFFF002, "second");
+    CString s3;
+    CC_CHECK(s3.LoadString(0xFFFFF002) == TRUE);
+    CC_CHECK(s3 == "second");
+    CC_CHECK(s2 == "goodbye");  // unaffected by registering a different id
+
+    // the real ID_RULE_* registry (seeded by ccSeedEmotionRuleStrings, R17) is
+    // populated on ccContext()'s first call, regardless of test order -- force
+    // that here rather than relying on some earlier test having touched it.
+    ccContext();
+    CString shout;
+    CC_CHECK(shout.LoadString(ID_RULE_SHOUT) == TRUE);
+    CC_CHECK(shout == "AllCaps(\"\");9\nFindString(\"!!!\");9");
+}
+
+// --- Plan 2 Task 9: textpose.cpp text -> emotion rule tables -----------------
+// Characterization over GetEmotionsFromString (textpose.cpp:271) driven through
+// the REAL rule tables InitializeEmotionRules() (textpose.cpp:131) builds from
+// the verbatim chat.rc STRINGTABLE content ccSeedEmotionRuleStrings() seeds
+// (engine_context.cpp) -- so this exercises the actual production parse chain
+// (LoadCompositeRule/LoadSingleRule/RegisterRule), not a hand-built rule set.
+//
+// This is a PURE rule-table test: it touches neither the avatar registry nor
+// ccContext().session.users (it only reads ccContext().session.comicView,
+// which ChatPreSendText needs but GetEmotionsFromString does not), so per the
+// task brief it runs in the regular (non-serialized) selftest suite rather
+// than EngineGlobalStateSelfTests. InitializeEmotionRules/DestroyEmotionRules
+// DO mutate process-global static lists (generalRules/wordRules/sentenceRules,
+// textpose.cpp:208-212) -- but this function brackets every rule-table use
+// with its own Initialize/Destroy pair, leaving no state behind for other
+// tests to race against (unlike the avatar registry, which persists across
+// calls until DestroyAvatars()).
+//
+// Every case below was hand-traced against the specific rule-table line that
+// fires (cited per case) BEFORE being frozen here, per the brief's mandate.
+static void cc_selftest_textpose() {
+    void InitializeEmotionRules();
+    void DestroyEmotionRules();
+    void GetEmotionsFromString(CString &str, CEmotionOpts &emOpts);
+
+    InitializeEmotionRules();
+
+    // (1) ALL-CAPS -> the AllCaps("");9 clause of ID_RULE_SHOUT
+    // (chat.rc:2290, seeded verbatim in ccSeedEmotionRuleStrings). No lowercase
+    // letters and >1 uppercase letter -> CheckForUppers() TRUE (textpose.cpp:
+    // 26-35); capsStrength/capsEmotion were set to (9, EM_SHOUT) by that
+    // AllCaps clause (RegisterRule, textpose.cpp:249-252). The string avoids
+    // every other keyword (no "!!!" substring, no smileys, no ROTFL/LOL/HEHE,
+    // no i'm/i will/i'll/i am/are you/will you/did you/aren't/don't you, and
+    // does not start a sentence with You/I/Hi/Bye/Hello/Welcome/Howdy) so this
+    // is the ONLY rule that fires -> exactly one CEmotionOpts entry.
+    {
+        CEmotionOpts em;
+        CString s("THANKS FOR THAT");
+        GetEmotionsFromString(s, em);
+        CC_CHECK(em.m_nOpts == 1);
+        if (em.m_nOpts >= 1) {
+            CC_CHECK(em.m_emotions[0].m_emotion == EM_SHOUT);
+            CC_CHECK(em.m_emotions[0].m_intensity == 1.0f);
+            CC_CHECK(em.m_priorities[0] == 9);
+        }
+    }
+
+    // (2) rule-table keyword -> CheckWord*("ROTFL");11, the first clause of
+    // ID_RULE_LAUGH (chat.rc:2291). CheckWord (textpose.cpp:37-49) matches
+    // "rotfl" as a whole word (bounded by start-of-string/whitespace before,
+    // and whitespace after) in the lowercased buffer (case-insensitive:
+    // CheckWord* stores caseSensitive=FALSE, textpose.cpp:259-260). Mixed-case
+    // input -> CheckForUppers is FALSE (has lowercase letters) so AllCaps does
+    // NOT also fire; no smiley/other keyword substrings present -> exactly one
+    // rule fires.
+    {
+        CEmotionOpts em;
+        CString s("That was ROTFL funny");
+        GetEmotionsFromString(s, em);
+        CC_CHECK(em.m_nOpts == 1);
+        if (em.m_nOpts >= 1) {
+            CC_CHECK(em.m_emotions[0].m_emotion == EM_LAUGH);
+            CC_CHECK(em.m_emotions[0].m_intensity == 1.0f);
+            CC_CHECK(em.m_priorities[0] == 11);
+        }
+    }
+
+    // (3) neutral / no-rule-fires default. Not all-caps (mixed case), contains
+    // no substring/word/sentence-start keyword from ANY of the 8 populated
+    // rule tables (SHOUT/LAUGH/HAPPY/SAD/POINTOTHER/POINTSELF/WAVE/COY --
+    // ANGRY/SCARED/BORED are genuinely empty strings in chat.rc, registering
+    // no rules at all, textpose.cpp:249 RegisterRule never reached for them).
+    // GetEmotionsFromString's emOpts.m_nOpts is reset to 0 at entry
+    // (textpose.cpp:274) and nothing here bumps it -> the default is exactly
+    // "zero opinions", i.e. the avatar's GetBodyFromEmotion(emo) call in
+    // ChatPreSendText sees an empty CEmotionOpts (falls through to whatever
+    // GetBodyFromEmotion's own empty-opts default is -- out of scope here).
+    {
+        CEmotionOpts em;
+        CString s("The weather today");
+        GetEmotionsFromString(s, em);
+        CC_CHECK(em.m_nOpts == 0);
+    }
+
+    // (4) CheckStart* rule (a different mechanism from cases 2/5's CheckWord*):
+    // CheckStart*("Hello");5, from ID_RULE_WAVE (chat.rc:2296). StartCompare2
+    // (textpose.cpp:267-269) matches the lowercased buffer's PREFIX against
+    // "hello" (5 chars) with a non-alnum char following (a space here) ->
+    // fires EM_WAVE at priority 5. Not all-caps; contains no other rule's
+    // keyword (no "You"/"I"/"Hi"/"Bye"/"Welcome"/"Howdy" sentence start, no
+    // smiley, no ROTFL/LOL/HEHE, no are-you/i'm family) -> exactly one rule.
+    {
+        CEmotionOpts em;
+        CString s("Hello there, friend!");
+        GetEmotionsFromString(s, em);
+        CC_CHECK(em.m_nOpts == 1);
+        if (em.m_nOpts >= 1) {
+            CC_CHECK(em.m_emotions[0].m_emotion == EM_WAVE);
+            CC_CHECK(em.m_emotions[0].m_intensity == 1.0f);
+            CC_CHECK(em.m_priorities[0] == 5);
+        }
+    }
+
+    // (5) punctuation/question sentence, exercising CheckWord* again but on a
+    // DIFFERENT rule (POINTOTHER, not LAUGH) to show the mechanism generalizes:
+    // CheckWord*("are you");8, from ID_RULE_POINTOTHER (chat.rc:2294). "are
+    // you" appears as a whole word/phrase (preceded by string-start, followed
+    // by a space) in the lowercased "are you sure?" -> fires EM_POINTOTHER at
+    // priority 8. The trailing "?" is a sentence terminator (textpose.cpp:85's
+    // sentenceTerminator = ".!?") but GetNextSentenceStart finds nothing after
+    // it (end of string), so the sentence-walk loop runs its CheckStart* pass
+    // exactly once here too; "are" does not match any CheckStart* keyword
+    // (You/I/Hi/Bye/Hello/Welcome/Howdy) so only the CheckWord* rule fires.
+    {
+        CEmotionOpts em;
+        CString s("Are you sure?");
+        GetEmotionsFromString(s, em);
+        CC_CHECK(em.m_nOpts == 1);
+        if (em.m_nOpts >= 1) {
+            CC_CHECK(em.m_emotions[0].m_emotion == EM_POINTOTHER);
+            CC_CHECK(em.m_emotions[0].m_intensity == 1.0f);
+            CC_CHECK(em.m_priorities[0] == 8);
+        }
+    }
+
+    DestroyEmotionRules();
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -2037,5 +2204,7 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_format();
     cc_selftest_balloon();
     cc_selftest_panel_session();  // Task 8 Step 1: R17 session extensions
+    testLoadStringResource();     // Task 9 R9 shim: CString::LoadString
+    cc_selftest_textpose();       // Task 9: text -> emotion rule tables
     return g_failures;
 }

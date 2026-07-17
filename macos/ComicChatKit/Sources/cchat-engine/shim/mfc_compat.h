@@ -295,6 +295,22 @@ public:
 // terminates the (now empty) expansion.
 #define IMPLEMENT_DYNAMIC(class_name, base_class)
 
+// --- Win32 string-resource table (rule R9; Plan 2 Task 9, textpose.cpp's
+//     InitializeEmotionRules -> CString::LoadString(ruleIDs[i])). Real MFC/
+//     Win32 loads STRINGTABLE entries out of the .exe's compiled resource
+//     segment by numeric ID; this port has no resource compiler (R6: resource
+//     loading is out of scope), so the table is a plain registry a caller
+//     populates explicitly instead of the linker populating it implicitly.
+//     RegisterStringResource is idempotent-by-overwrite (last write for a
+//     given id wins) so re-registration (e.g. between selftest runs) is safe.
+//     The only current populator is engine_context.cpp's one-time seeding of
+//     the ID_RULE_* rule-table strings (R17 — see engine_context.h) -- LoadString
+//     itself is fully generic and knows nothing about that; a lookup miss
+//     matches real LoadString's contract (returns FALSE, leaves the CString
+//     untouched by convention -- callers here follow suit).
+void RegisterStringResource(UINT id, const char* value);
+const char* LookupStringResource(UINT id); // nullptr if unregistered
+
 // --- CString (byte-oriented, MFC-flavored subset) ----------------------------
 class CString {
 public:
@@ -346,6 +362,17 @@ public:
     void MakeUpper() { for (auto& c : m_s) c = (char)toupper((unsigned char)c); }
     void MakeLower() { for (auto& c : m_s) c = (char)tolower((unsigned char)c); }
     int CompareNoCase(const char* s) const { return strcasecmp(m_s.c_str(), s ? s : ""); }
+
+    // R9 (Plan 2 Task 9): MFC's CString::LoadString(UINT nID) loads a
+    // STRINGTABLE resource by ID, returning TRUE and replacing the string's
+    // content on success, FALSE (content left UNCHANGED, matching real MFC)
+    // on a missing resource ID. Backed by the registry above.
+    BOOL LoadString(UINT id) {
+        const char* v = LookupStringResource(id);
+        if (v == nullptr) return FALSE;
+        m_s = v;
+        return TRUE;
+    }
 
 private:
     std::string m_s;

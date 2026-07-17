@@ -4,6 +4,26 @@
 #include "dib.h"        // full CDIB definition for CDC::DrawPoseImage (Task 7)
 #include "bridge_art.h" // bridge_decode_dib_pair_to_rgba (Task 7)
 #include <sys/stat.h>
+#include <unordered_map>
+
+// R9 (Plan 2 Task 9): the Win32 string-resource registry backing
+// CString::LoadString. See mfc_compat.h's comment above RegisterStringResource
+// for why this exists (no resource compiler on this port) and who populates it
+// (engine_context.cpp, R17, for the ID_RULE_* rule-table strings).
+static std::unordered_map<UINT, std::string>& stringResourceTable() {
+    static std::unordered_map<UINT, std::string> table;
+    return table;
+}
+
+void RegisterStringResource(UINT id, const char* value) {
+    stringResourceTable()[id] = value ? value : "";
+}
+
+const char* LookupStringResource(UINT id) {
+    auto& table = stringResourceTable();
+    auto it = table.find(id);
+    return it == table.end() ? nullptr : it->second.c_str();
+}
 
 // CClientDC (Plan 2 Task 3): a CDC auto-bound to the registered metrics
 // canvas. Defined here (not inline in the header) because it needs

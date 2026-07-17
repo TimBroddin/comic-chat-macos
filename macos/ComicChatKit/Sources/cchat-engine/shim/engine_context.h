@@ -68,6 +68,17 @@ struct CCSessionSettings {
     UINT     backdropID = 0;
     char     comicsTitle[128] = "";
 
+    // Plan 2 Task 9 (R17): textpose.cpp's ChatPreSendText read
+    // GetChatDoc()->m_bComicView (textpose.cpp:122) to gate emotion inference
+    // ("only has to do with Comics mode" -- chatdoc.cpp:211's comment on the
+    // same flag). theApp/CChatDoc's own field defaults FALSE (chat.cpp:162 --
+    // a general-purpose text-or-comic chat client that starts in text mode);
+    // this headless engine exists ONLY to run the comic pipeline (there is no
+    // text-chat-window mode here at all), so the session default is TRUE per
+    // the task brief -- the headless equivalent of "always in Comics mode
+    // unless a caller explicitly opts out."
+    BOOL     comicView = TRUE;
+
     // Plan 2 Task 8 (R17): the headless session user table (see CCSessionUser).
     CCSessionUser users[CC_SESSION_MAX_USERS];
     int          userCount = 0;
@@ -144,5 +155,38 @@ private:
 };
 
 CCEngineContext& ccContext();
+
+// Plan 2 Task 9 (R17): resource.h's ID_RULE_* STRINGTABLE ids (resource.h
+// itself is deleted per R8 -- ui.h/userinfo.h/chatprot.h/binddoc.h/chatdoc.h/
+// resource.h are all UI/doc/protocol/resource headers), verbatim from
+// resource.h:1001-1011. textpose.cpp's static ruleIDs[] (textpose.cpp:19-21)
+// names these directly, so they must be visible wherever that array is built;
+// declared here (not in textpose.cpp) because ccSeedEmotionRuleStrings() below
+// registers string content against these same numeric ids and textpose.cpp
+// already includes this header (R2).
+#define ID_RULE_SHOUT      63032
+#define ID_RULE_LAUGH      63033
+#define ID_RULE_HAPPY      63034
+#define ID_RULE_SAD        63035
+#define ID_RULE_POINTOTHER 63036
+#define ID_RULE_POINTSELF  63037
+#define ID_RULE_WAVE       63038
+#define ID_RULE_COY        63039
+#define ID_RULE_ANGRY      63040
+#define ID_RULE_SCARED     63041
+#define ID_RULE_BORED      63042
+
+// Plan 2 Task 9 (R17 + R9): seeds the CString::LoadString registry
+// (mfc_compat.h/.cpp) with the eleven ID_RULE_* STRINGTABLE entries
+// textpose.cpp's InitializeEmotionRules() (textpose.cpp:131) loads by ID --
+// the resource data resource.h's deletion (R8) would otherwise strand.
+// Verbatim from chat.rc:2290-2304 (RC "" is an escaped literal quote; every
+// value below reproduces that content exactly, quotes included). Idempotent
+// (RegisterStringResource overwrites), so calling it more than once (e.g.
+// once per selftest run) is harmless. Called once by ccContext()'s first
+// construction (engine_context.cpp) so it's always populated before any
+// caller can reach InitializeEmotionRules() -- mirroring how the original's
+// resource segment was simply always present, regardless of call order.
+void ccSeedEmotionRuleStrings();
 
 #endif
