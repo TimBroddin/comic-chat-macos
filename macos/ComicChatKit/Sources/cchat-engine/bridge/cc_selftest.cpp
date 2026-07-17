@@ -430,7 +430,7 @@ static void cc_selftest_canvas() {
     CC_CHECK(i < log.size() && log[i++] == "rect 0,0,2400,-2400 fill=FFFFFF");
     CC_CHECK(i < log.size() && log[i++] == "image 0,0,1200,-1600 src=0,0,60,80");
     CC_CHECK(i < log.size() && log[i++] ==
-        "path n=5 fill=1 fillc=0000FF stroke=1 strokec=FF0000 w=20 dashed=0 [M 0,0 L 10,0 C 20,0 30,10 40,10]");
+        "path n=5 fill=1 fillc=FF0000 stroke=1 strokec=0000FF w=20 dashed=0 [M 0,0 L 10,0 C 20,0 30,10 40,10]");
     CC_CHECK(i < log.size() && log[i++] == "clip+ 0,0,2400,-2400");
     CC_CHECK(i < log.size() && log[i++] == "clip-");
 }
