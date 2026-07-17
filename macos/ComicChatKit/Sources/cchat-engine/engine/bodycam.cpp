@@ -455,6 +455,79 @@ void UpdateEmotion(CEmotion &emotion) {
 	GetBodyCam()->UpdateEmotion(emotion);
 }
 
+// Restored (Task 7 review fix, Finding 1): these two methods were dropped
+// during the initial lift instead of being R11-wrapped like the rest of the
+// CBodyCam widget half. They are called from CC_NO_UI-wrapped code below
+// (CBodyCam::RefreshBody at ~897 calls DrawBody; CBodyCam::RecalcRetainedBMP
+// at ~1091 calls GetBodyRect), so their absence would break any future
+// non-CC_NO_UI build. Restored verbatim from bodycam.cpp:458-513, placed here
+// to match the original's relative ordering (immediately after FlipBodyBox,
+// immediately before CBodyDouble::DrawBody) as closely as this file's
+// CC_NO_UI restructuring allows -- FlipBodyBox and CBodyDouble::DrawBody now
+// live after the #endif as part of the "LIVE" CBody methods section, so these
+// two stay UI-side, at the tail of this #ifndef CC_NO_UI block. Both compile
+// out under CC_NO_UI today (fidelity + future-link correctness, not live
+// behavior).
+
+// verbatim from bodycam.cpp:458
+void CBodyCam::GetBodyRect(RECT &rect)
+{
+	GetClientRect(&rect);
+	rect.bottom -= m_bullSide;				   // subtract out bullseye
+}
+
+// verbatim from bodycam.cpp:464
+RECT CBodyCam::DrawBody(CDC *dc, CBody *body) {
+	// calculate region for body draw
+	RECT rect, rect2, brect;
+	GetBodyRect(rect);
+
+	if (rect.bottom >= rect.top) {		// if space shrinks to nothing or inverts, don't draw
+		rect.bottom -= rect.top;
+		int oldTop = rect.top;
+		rect.top = 0;
+		rect2 = rect;
+		rect2.bottom -= rect2.top;
+		rect2.top = 0;
+		rect2.left -= 1000;		// so character remains a fixed height, clipped to width
+		rect2.right += 1000;
+
+		// set up offscreen bitmap
+		CDC memDC;
+		VERIFY(memDC.CreateCompatibleDC(dc));
+		// RamuM
+		CPalette *oldPal;
+		CPalette *curPal = dc->GetCurrentPalette();
+
+		if (oldPal = memDC.SelectPalette(curPal, TRUE))
+			memDC.RealizePalette();
+
+		POINT point;
+		GetBrushOrgEx(dc->GetSafeHdc(),&point);
+		int iOldMode = memDC.SetStretchBltMode(STRETCHMODE); //COLORONCOLOR);
+		SetBrushOrgEx(memDC.GetSafeHdc(),point.x,point.y,&point);
+
+		CBitmap temp;
+		CBitmap *retCBit = temp.FromHandle(m_retSec);
+		CBitmap *bmpOld = memDC.SelectObject(retCBit); // must use a CBitmap
+
+		memDC.FillSolidRect(&m_bodyRect, RGB(255, 255, 255));
+		brect = body->DrawBody(&memDC, rect2, FALSE);   // note: is the clippath set up right from compatible dc?
+		VERIFY(dc->BitBlt(rect.left, oldTop, rect.right, rect.bottom, &memDC, 0, 0, SRCCOPY));
+
+		GetBrushOrgEx(memDC.GetSafeHdc(),&point);
+		memDC.SetStretchBltMode(iOldMode);
+		SetBrushOrgEx(memDC.GetSafeHdc(),point.x,point.y,&point);
+
+		memDC.SelectObject(bmpOld);		// cleanup
+		if (oldPal) memDC.SelectPalette(oldPal,TRUE);
+	} else {
+		brect.left = brect.right = brect.top = brect.bottom = 0;
+	}
+
+	return brect;
+}
+
 #endif // CC_NO_UI  -- end of the CBodyCam widget half (R11)
 
 
@@ -487,8 +560,12 @@ void CBodyDouble::FlipBodyBox(RECT &fullRect, RECT &headRect, RECT &torsoRect) {
 // mask polarity -- white=transparent, black=opaque -- proven by the pose-image
 // golden test). The mask is passed only when the original's guard
 // ((flags & *MASK) && GetMask()) held; otherwise NULL (fully opaque). Auras
-// (drawn MERGEPAINT-alone) collapse to a single DrawPoseImage of the aura plane
-// as a self-opaque sprite -- see the report's R14 note on the aura's color.
+// (drawn MERGEPAINT-alone, R14(v) fixed per the Task 7 review) collapse to a
+// single DrawAuraImage of the aura plane: RGB forced white, alpha set from
+// the aura bit (opaque where black/silhouette, transparent where
+// white/background) -- see bridge_decode_aura_to_white_alpha's derivation
+// (bridge_art.cpp) and the report's corrected R14 note on the aura's
+// pre-fix divergence.
 RECT CBodyDouble::DrawBody(CDC *dc, RECT &clientRect, BOOL drawNimbus) {
 	RECT fullRect, headRect, torsoRect;
 
@@ -507,14 +584,16 @@ RECT CBodyDouble::DrawBody(CDC *dc, RECT &clientRect, BOOL drawNimbus) {
 	if (m_flip) FlipBodyBox(fullRect, headRect, torsoRect);
 
 	if (drawNimbus) {
-		// (aura) torso nimbus: MERGEPAINT-alone -> one DrawPoseImage (no mask).
+		// (aura) torso nimbus: MERGEPAINT-alone -> one DrawAuraImage
+		// (R14(v): white-alpha decode, not the image/mask polarity).
 		if (torsoPose->GetAura ())
-			dc->DrawPoseImage(torsoPose->GetAura (), NULL,
+			dc->DrawAuraImage(torsoPose->GetAura (),
 							torsoRect.left, torsoRect.top,
 							torsoRect.right - torsoRect.left, torsoRect.bottom - torsoRect.top);
-		// (aura) head nimbus: MERGEPAINT-alone -> one DrawPoseImage (no mask).
+		// (aura) head nimbus: MERGEPAINT-alone -> one DrawAuraImage
+		// (R14(v): white-alpha decode, not the image/mask polarity).
 		if (headPose->GetAura ())
-			dc->DrawPoseImage(headPose->GetAura (), NULL,
+			dc->DrawAuraImage(headPose->GetAura (),
 						   headRect.left, headRect.top,
 						   headRect.right - headRect.left, headRect.bottom - headRect.top);
 	}
@@ -571,7 +650,9 @@ void CBodySingle::FlipBodyBox(RECT &fullBox) {
 // bridge_art.cpp); the drawing was originally blitted SRCAND-alone. Its pose
 // mask (if present) still supplies alpha via DrawPoseImage -- identical to the
 // pose-image golden path decode(drawing, mask). The aura (drawNimbus,
-// MERGEPAINT-alone) collapses to one DrawPoseImage of the aura plane.
+// MERGEPAINT-alone, R14(v) fixed per the Task 7 review) collapses to one
+// DrawAuraImage of the aura plane (white-alpha decode -- see
+// bridge_decode_aura_to_white_alpha in bridge_art.cpp).
 RECT CBodySingle::DrawBody(CDC *dc, RECT &clientRect, BOOL drawNimbus) {
 	RECT fullRect;
 
@@ -585,9 +666,10 @@ RECT CBodySingle::DrawBody(CDC *dc, RECT &clientRect, BOOL drawNimbus) {
 	GetBodyBox(pose, clientRect, fullRect);
 	if (m_flip) FlipBodyBox(fullRect);
 
-	// (aura) nimbus: MERGEPAINT-alone -> one DrawPoseImage (no mask).
+	// (aura) nimbus: MERGEPAINT-alone -> one DrawAuraImage
+	// (R14(v): white-alpha decode, not the image/mask polarity).
 	if (drawNimbus && pose->GetAura ())
-		dc->DrawPoseImage(pose->GetAura (), NULL,
+		dc->DrawAuraImage(pose->GetAura (),
 					   fullRect.left, fullRect.top,
 					   fullRect.right - fullRect.left, fullRect.bottom - fullRect.top);
 	// (drawing) SRCAND-alone -> one DrawPoseImage(drawing, mask). The single

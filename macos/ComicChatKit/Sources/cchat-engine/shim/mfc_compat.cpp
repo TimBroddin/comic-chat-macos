@@ -96,6 +96,33 @@ void CDC::DrawPoseImage(CDIB* image, CDIB* mask,
     cc_image_free(&img);
 }
 
+// R14(v) (Plan 2 Task 7 review fix): CDC::DrawAuraImage -- the aura
+// (whisper-nimbus) plane's MERGEPAINT-ALONE draw (bodycam.cpp DrawBody's
+// torso/head/single nimbus blits), collapsed into ONE alpha-composited
+// draw_image using the aura's own white-forcing polarity (NOT the image/mask
+// polarity DrawPoseImage uses -- see bridge_decode_aura_to_white_alpha's
+// derivation in bridge_art.cpp for why they differ). Defined here (not inline
+// in the header) for the same reason as DrawPoseImage: needs the full CDIB
+// definition and bridge_art.h, which mfc_compat.h keeps pointer-opaque.
+void CDC::DrawAuraImage(CDIB* aura, int destX, int destY, int destW, int destH) {
+    if (aura == nullptr) return;
+    BITMAPINFO* auraBmi = aura->GetBitmapInfoAddress();
+    void* auraBits = aura->GetBitsAddress();
+
+    int32_t w = 0, h = 0;
+    uint8_t* rgba = nullptr;
+    if (!bridge_decode_aura_to_white_alpha(auraBmi, auraBits, &w, &h, &rgba)) {
+        return;
+    }
+    cc_image img; img.width = w; img.height = h; img.rgba = rgba;
+    int32_t dl, dt, dr, db;
+    toLogical(destX, destY, dl, dt);
+    toLogical(destX + destW, destY + destH, dr, db);
+    // Source rect is the full decoded image, same convention as DrawPoseImage.
+    canvasWrap().draw_image(&img, dl, dt, dr, db, 0, 0, w, h);
+    cc_image_free(&img);
+}
+
 // R9: minimal GetFileAttributes() — used by avatario.cpp only to test
 // existence of a file before opening it.
 DWORD GetFileAttributes(LPCSTR pszPath) {

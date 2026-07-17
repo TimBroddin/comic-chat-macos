@@ -802,12 +802,32 @@ public:
     // (bodycam.cpp DrawBody). The mask supplies the alpha channel exactly as
     // the pose-image golden path does (bridge_decode_dib_pair_to_rgba reuses
     // the same decodeDibToRgba the golden test regression-locks). `mask` may
-    // be NULL for a self-opaque plane (a mask-less pose, or the aura sprite).
-    // The dest rect is logical coordinates (window origin applies), like every
-    // other GDI call; the src rect is the full decoded image. Defined out of
-    // line in mfc_compat.cpp (needs the full CDIB definition -- dib.h).
+    // be NULL for a self-opaque plane (a mask-less pose). NOT used for the
+    // aura plane -- see DrawAuraImage below, which has different (MERGEPAINT-
+    // alone) polarity. The dest rect is logical coordinates (window origin
+    // applies), like every other GDI call; the src rect is the full decoded
+    // image. Defined out of line in mfc_compat.cpp (needs the full CDIB
+    // definition -- dib.h).
     void DrawPoseImage(CDIB* image, CDIB* mask,
                        int destX, int destY, int destW, int destH);
+
+    // --- aura-plane blit with white-alpha decode (R14(v); Task 7 review fix)
+    // Draws one avatar pose's aura (whisper-nimbus) plane as a SINGLE alpha-
+    // composited draw_image, reproducing the original's MERGEPAINT-ALONE draw
+    // (no paired SRCAND, unlike the image/mask draw DrawPoseImage serves)
+    // exactly: dest forced WHITE where the aura bit is 1 (black/silhouette),
+    // dest UNTOUCHED (background shows through) where the aura bit is 0
+    // (white/background) -- see bridge_decode_aura_to_white_alpha's full ROP-
+    // algebra derivation in bridge_art.cpp. Collapsing that MERGEPAINT-alone
+    // draw to DrawPoseImage(aura, NULL, ...) (the prior, incorrect shape of
+    // this call site) would decode the aura plane through the image/mask
+    // polarity instead: fully opaque (an opaque box hiding the background)
+    // with the silhouette rendered black (an inverted halo) -- backwards on
+    // both color and coverage. This method exists specifically to avoid that.
+    // The dest rect is logical coordinates, like DrawPoseImage; the src rect
+    // is the full decoded image. Defined out of line in mfc_compat.cpp (needs
+    // the full CDIB definition -- dib.h).
+    void DrawAuraImage(CDIB* aura, int destX, int destY, int destW, int destH);
 
     // --- clip region (stack of rects, stored in canvas/device space -- i.e.
     //     with the window origin already applied, matching real GDI: a clip

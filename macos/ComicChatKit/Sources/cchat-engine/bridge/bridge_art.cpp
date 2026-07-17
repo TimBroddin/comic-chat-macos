@@ -247,6 +247,77 @@ bool bridge_decode_dib_pair_to_rgba(BITMAPINFO* imgBmi, void* imgBits,
     return decodeDibToRgba(&image, pMask, outWidth, outHeight, outRgba);
 }
 
+// Plan 2 Task 7 review fix (R14(v)): the aura (whisper-nimbus) plane is drawn
+// by the original with MERGEPAINT ALONE (bodycam.cpp's DrawBody, torso/head
+// nimbus and CBodySingle's nimbus -- no paired SRCAND, unlike the image/mask
+// draw decodeDibToRgba() above serves). MERGEPAINT computes
+// dest = (NOT src) OR dest, so per the aura plane's 2-entry palette
+// (index0 = white = background, index1 = black = silhouette, per
+// CPose::ConvertMasksCommon's `m_pdibs[2] (aura) bit = v != 0` at the top of
+// this file):
+//   aura bit = 1 (black):  dest = NOT(black) OR dest = white OR dest = white
+//                          -> destination forced WHITE (visible halo).
+//   aura bit = 0 (white):  dest = NOT(white) OR dest = black OR dest = dest
+//                          -> destination UNTOUCHED (background shows
+//                             through unmodified).
+// Naively reusing decodeDibToRgba() (the image/mask polarity) on the aura
+// plane alone gets this backwards on two axes: it would decode the whole
+// plane fully opaque (an opaque box covering the background instead of an
+// untouched background) AND paint the black/silhouette pixels black instead
+// of forcing them white (an inverted, black halo instead of the correct
+// white one). This function reproduces the actual MERGEPAINT-alone effect
+// directly: RGB is unconditionally (255,255,255) -- the only color
+// MERGEPAINT can ever force the destination to -- and alpha is 255
+// (opaque white) where the aura bit is 1, 0 (transparent) where it is 0.
+// auraBmi must describe a 1bpp DIB (the only depth the aura plane is ever
+// stored at -- avbfile.cpp's ConvertMasksCommon always emits it 1bpp); any
+// other depth fails. Builds a transient CDIB over the caller's memory
+// (CDIB::Create copies the header, borrows the bits, same as the pair
+// decode above). Returns false (outputs untouched) on failure.
+bool bridge_decode_aura_to_white_alpha(BITMAPINFO* auraBmi, void* auraBits,
+                                        int32_t* outWidth, int32_t* outHeight,
+                                        uint8_t** outRgba) {
+    if (auraBmi == nullptr || auraBits == nullptr) return false;
+
+    CDIB aura;
+    if (!aura.Create(auraBmi, (BYTE*)auraBits)) return false;
+    aura.ConvertToNonRLE();
+
+    BITMAPINFOHEADER* pHeader = &aura.GetBitmapInfoAddress()->bmiHeader;
+    int width = pHeader->biWidth;
+    int height = pHeader->biHeight;
+    bool bottomUp = height > 0;
+    int absHeight = bottomUp ? height : -height;
+    int bitCount = (int)pHeader->biBitCount;
+
+    if (width <= 0 || absHeight <= 0) return false;
+    if (bitCount != 1) return false; // aura plane is always 1bpp
+
+    const uint8_t* bits = (const uint8_t*)aura.GetBitsAddress();
+    if (bits == nullptr) return false;
+    int storageWidth = aura.StorageWidth();
+
+    uint8_t* rgba = (uint8_t*)malloc((size_t)width * (size_t)absHeight * 4);
+    if (rgba == nullptr) return false;
+
+    for (int y = 0; y < absHeight; y++) {
+        int srcRow = bottomUp ? (absHeight - 1 - y) : y;
+        const uint8_t* rowPtr = bits + (size_t)srcRow * storageWidth;
+        uint8_t* outRow = rgba + (size_t)y * width * 4;
+        for (int x = 0; x < width; x++) {
+            int bit = readIndexedPixel(rowPtr, x, 1);
+            uint8_t alpha = (bit == 1) ? 255 : 0; // see MERGEPAINT-alone algebra above
+            uint8_t* px = outRow + (size_t)x * 4;
+            px[0] = 255; px[1] = 255; px[2] = 255; px[3] = alpha;
+        }
+    }
+
+    *outWidth = width;
+    *outHeight = absHeight;
+    *outRgba = rgba;
+    return true;
+}
+
 extern "C" void cc_image_free(cc_image* img) {
     if (img == nullptr) return;
     if (img->rgba != nullptr) {

@@ -16,6 +16,7 @@
 #include "balloon.h"    // Task 6: CFontInfo/CBalloon/CBWoodring* + ::BreakIntoLines
 #include "backdrop.h"
 #include "panel.h"      // Task 6: CUnitPanelPage (SetFonts + font statics)
+#include "bridge_art.h" // Task 7 review fix: bridge_decode_aura_to_white_alpha
 #include <unistd.h>   // mkstemp, close (testShimFileApis)
 
 // ::BreakIntoLines free function (balloon.cpp) — declared here for the
@@ -1414,6 +1415,56 @@ static int cc_selftest_bodydraw(const char* avatarPath) {
             CC_CHECK(log[2].rfind(bodydrawDestPrefix(refTorso), 0) == 0);
             CC_CHECK(log[3].rfind(bodydrawDestPrefix(refHead), 0) == 0);
         }
+    }
+
+    // --- (c) Task 7 review fix (R14(v)): decode-level guard. The recording
+    //     canvas above only sees blit GEOMETRY (dest rects, blit count/order)
+    //     -- it cannot see pixel semantics, so it cannot catch the aura's
+    //     color/alpha polarity being wrong. Call the new bridge decode
+    //     function directly on a tiny synthetic 1bpp aura DIB (2x1: one black
+    //     pixel, one white pixel; palette irrelevant -- the decode reads the
+    //     raw bit, not a color table) and check the exact output bytes.
+    //     Per the MERGEPAINT-alone derivation (bridge_art.cpp): bit=1 (black/
+    //     silhouette) -> opaque white {255,255,255,255}; bit=0 (white/
+    //     background) -> transparent {*,*,*,0}.
+    {
+        size_t infoSize = sizeof(BITMAPINFOHEADER) + 2 * sizeof(RGBQUAD);
+        BITMAPINFO* bmi = (BITMAPINFO*)calloc(1, infoSize);
+        bmi->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi->bmiHeader.biWidth = 2;
+        bmi->bmiHeader.biHeight = 1;
+        bmi->bmiHeader.biPlanes = 1;
+        bmi->bmiHeader.biBitCount = 1;
+        bmi->bmiHeader.biCompression = BI_RGB;
+        bmi->bmiHeader.biClrUsed = 2;
+        // Aura palette convention: index0 = white (background), index1 =
+        // black (silhouette) -- not consulted by the decode, but set anyway
+        // for a faithful synthetic DIB.
+        RGBQUAD* clr = (RGBQUAD*)((BYTE*)bmi + sizeof(BITMAPINFOHEADER));
+        clr[0].rgbRed = clr[0].rgbGreen = clr[0].rgbBlue = 255; // white
+        clr[1].rgbRed = clr[1].rgbGreen = clr[1].rgbBlue = 0;   // black
+
+        UINT storageWidth = DIBStorageWidth(2, 1);
+        BYTE* bits = (BYTE*)calloc(1, storageWidth);
+        // MSB-first packing (readIndexedPixel: bitIdx = 7 - (x % 8)): pixel 0
+        // (leftmost) = bit 7 = 1 (black); pixel 1 = bit 6 = 0 (white).
+        bits[0] = 0x80;
+
+        int32_t w = 0, h = 0;
+        uint8_t* rgba = nullptr;
+        bool ok = bridge_decode_aura_to_white_alpha(bmi, bits, &w, &h, &rgba);
+        CC_CHECK(ok == TRUE);
+        CC_CHECK(w == 2 && h == 1);
+        if (ok && rgba != nullptr) {
+            // Pixel 0: black/silhouette bit -> opaque white.
+            CC_CHECK(rgba[0] == 255 && rgba[1] == 255 && rgba[2] == 255 && rgba[3] == 255);
+            // Pixel 1: white/background bit -> fully transparent (RGB
+            // unconstrained by the contract; this decode still emits white).
+            CC_CHECK(rgba[7] == 0);
+            free(rgba);
+        }
+        free(bits);
+        free(bmi);
     }
 
     delete body;
