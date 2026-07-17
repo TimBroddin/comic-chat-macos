@@ -711,6 +711,61 @@ static void cc_selftest_canvas_truncated_cubic() {
     CC_CHECK(log[0].find("C ") == std::string::npos);
 }
 
+// --- Task 4 review fix round 1: CDC::PolyBezierTo + CMapStringToPtr --------
+// Task 4 added five R9 shim members; two (CDC::PolyBezierTo, CMapStringToPtr)
+// had no selftest coverage at all. Review flagged this against R9's own
+// mandate ("every shim addition gets a selftest exercising it"). Grouped
+// here, same pattern as the Task 4/5 shim-selftest blocks above.
+
+static void testMapStringToPtr() {
+    // CMapStringToPtr (spline.cpp's betaMatrixMap, keyed by a "%f*%f"
+    // tension/bias string -- see CBeta::SetMatrix). Same Lookup/SetAt/
+    // RemoveKey/RemoveAll/POSITION-iteration shape as CMapWordToPtr, just
+    // keyed by string. Exercise every member the shim implements: ctor,
+    // Lookup (hit + miss), SetAt (incl. overwrite), RemoveKey, RemoveAll,
+    // GetStartPosition/GetNextAssoc.
+    int a = 1, b = 2;
+    CMapStringToPtr map(10);
+
+    void* found = nullptr;
+    CC_CHECK(map.Lookup("0.400000*1.000000", found) == FALSE);  // miss: empty map
+
+    map.SetAt("0.400000*1.000000", &a);
+    map.SetAt("5.000000*1.000000", &b);
+    CC_CHECK(map.Lookup("0.400000*1.000000", found) == TRUE && found == &a);
+    CC_CHECK(map.Lookup("5.000000*1.000000", found) == TRUE && found == &b);
+    CC_CHECK(map.Lookup("9.000000*9.000000", found) == FALSE);  // miss: never set
+
+    // Overwrite an existing key.
+    int c = 3;
+    map.SetAt("0.400000*1.000000", &c);
+    CC_CHECK(map.Lookup("0.400000*1.000000", found) == TRUE && found == &c);
+
+    // POSITION iteration sees both surviving keys with their exact values.
+    int seen = 0;
+    bool sawFirst = false, sawSecond = false;
+    POSITION pos = map.GetStartPosition();
+    while (pos) {
+        CString key;
+        void* value;
+        map.GetNextAssoc(pos, key, value);
+        if (key == "0.400000*1.000000") { CC_CHECK(value == &c); sawFirst = true; }
+        else if (key == "5.000000*1.000000") { CC_CHECK(value == &b); sawSecond = true; }
+        else CC_CHECK(false);  // unexpected key
+        seen++;
+    }
+    CC_CHECK(seen == 2);
+    CC_CHECK(sawFirst && sawSecond);
+
+    CC_CHECK(map.RemoveKey("5.000000*1.000000") == TRUE);
+    CC_CHECK(map.Lookup("5.000000*1.000000", found) == FALSE);
+    CC_CHECK(map.RemoveKey("5.000000*1.000000") == FALSE);  // already removed
+
+    map.RemoveAll();
+    CC_CHECK(map.Lookup("0.400000*1.000000", found) == FALSE);
+    CC_CHECK(map.GetStartPosition() == nullptr);  // empty map has no iteration
+}
+
 // --- Plan 2 Task 4: pure-geometry lift (defines.h, spline, splinutl, traj) ---
 // (a) Builds a CTraj from 3 known points via two CLine segments, draws it
 //     through a recording-canvas-bound CDC, and asserts the exact logged
@@ -719,6 +774,15 @@ static void cc_selftest_canvas_truncated_cubic() {
 //     Casteljau bisection) -- picked because its arithmetic is simple enough
 //     to verify by hand and unambiguous (no MFC/rounding involved, it
 //     operates on DPOINT doubles throughout).
+// (c) Review fix round 1: CDC::PolyBezierTo, exercised through its one real
+//     call site, CSpline::Draw (spline.cpp:299): `dc->PolyBezierTo(bezpts+1,
+//     BezierCount()-1)`. Built the smallest possible concrete spline (a
+//     CCardinal with exactly 2 control points, unclosed) so bezpts has only
+//     4 entries and Draw emits exactly one PolyBezierTo call with 3 points
+//     (one C triple) -- and hand-computed those bezpts from the real
+//     CCardinal matrix math below. This exercises the actual production
+//     code path rather than driving PolyBezierTo standalone, which is a
+//     strictly stronger test for the same effort.
 
 static void cc_selftest_geometry() {
     // (a) CTraj of 2 CLine segs over 3 known points: P0=(0,0), P1=(100,0),
@@ -791,6 +855,83 @@ static void cc_selftest_geometry() {
         // left/right share the split point (De Casteljau: T0 == S3).
         CC_CHECK(left.p3.x == right.p0.x && left.p3.y == right.p0.y);
     }
+
+    // (c) CDC::PolyBezierTo, exercised via CSpline::Draw. CCardinal ctor
+    // requires n >= 2 control points (CSpline ctor's ASSERT); with exactly
+    // 2 -- P0=(0,0), P1=(100,50) -- and unclosed:
+    //   GetDups() = 2 (CCardinal), so KnotCount() = nCps + 2 = 4,
+    //   BezierCount() = 3*KnotCount() - 8 = 4 -- the minimum possible, i.e.
+    //   exactly one bezier segment (bezpts[0..3]).
+    // GetKnot(index) for the unclosed case (dups=2, nCps=2):
+    //   index 0: 0 < dups(2)              -> cps[0] = (0,0)
+    //   index 1: 1 < dups(2)              -> cps[0] = (0,0)
+    //   index 2: nCps+dups-2 = 2, 2 >= 2  -> cps[nCps-1] = cps[1] = (100,50)
+    //   index 3: 3 >= 2                   -> cps[1] = (100,50)
+    // So the 4 knots fed to ComputeBezpts are k0=k1=(0,0), k2=k3=(100,50).
+    //
+    // CCardinal::SetMatrix(tension=defaultTension=0.4) builds (per
+    // spline.cpp's own assignments, (*matrix)[row][col]):
+    //   row0 = [-0.4,  1.6, -1.6,  0.4]
+    //   row1 = [ 0.8, -2.6,  2.2, -0.4]
+    //   row2 = [-0.4,  0.0,  0.4,  0.0]
+    //   row3 = [ 0.0,  1.0,  0.0,  0.0]
+    // CvertsToCubic computes c3=row0.k, c2=row1.k, c1=row2.k, c0=row3.k
+    // (each component ROUND()ed independently), against k0=(0,0), k1=(0,0),
+    // k2=(100,50), k3=(100,50):
+    //   c3.x = ROUND(-1.6*100 + 0.4*100) = ROUND(-120)      = -120
+    //   c3.y = ROUND(-1.6*50  + 0.4*50)  = ROUND(-60)       = -60
+    //   c2.x = ROUND( 2.2*100 - 0.4*100) = ROUND(180)       = 180
+    //   c2.y = ROUND( 2.2*50  - 0.4*50)  = ROUND(90)        = 90
+    //   c1.x = ROUND( 0.4*100 + 0.0*100) = ROUND(40)        = 40
+    //   c1.y = ROUND( 0.4*50  + 0.0*50)  = ROUND(20)        = 20
+    //   c0.x = ROUND( 1.0*0)             = 0
+    //   c0.y = ROUND( 1.0*0)             = 0
+    // so c0=(0,0), c1=(40,20), c2=(180,90), c3=(-120,-60).
+    // CubicToBezier:
+    //   b0 = c0                                              = (0,0)
+    //   b1.x = c0.x + ROUND(c1.x/3) = 0 + ROUND(13.33)       = 13
+    //   b1.y = c0.y + ROUND(c1.y/3) = 0 + ROUND(6.67)        = 7
+    //   b2.x = b1.x + ROUND((c1.x+c2.x)/3) = 13+ROUND(73.33) = 86
+    //   b2.y = b1.y + ROUND((c1.y+c2.y)/3) = 7+ROUND(36.67)  = 44
+    //   b3 = c0+c1+c2+c3 (componentwise sum)                 = (100,50)
+    // so bezpts = [(0,0), (13,7), (86,44), (100,50)].
+    // CSpline::Draw does: dc->PolyBezierTo(bezpts+1, BezierCount()-1), i.e.
+    // PolyBezierTo([(13,7),(86,44),(100,50)], 3) -- one C triple, no
+    // BeginPath/EndPath/MoveTo of its own (the caller is expected to bracket
+    // it, exactly like balloon.cpp's real usage bracket CSpline::Draw calls).
+    {
+        CCRecordingCanvas rec;
+        CDC dc(rec.handle());
+
+        POINT p0{0, 0}, p1{100, 50};
+        POINT cpArray[2] = {p0, p1};
+        CCardinal cardinal(cpArray, 2, FALSE);
+        CC_CHECK(cardinal.KnotCount() == 4);
+        CC_CHECK(cardinal.BezierCount() == 4);
+        CC_CHECK(cardinal.bezpts[0].x == 0 && cardinal.bezpts[0].y == 0);
+        CC_CHECK(cardinal.bezpts[1].x == 13 && cardinal.bezpts[1].y == 7);
+        CC_CHECK(cardinal.bezpts[2].x == 86 && cardinal.bezpts[2].y == 44);
+        CC_CHECK(cardinal.bezpts[3].x == 100 && cardinal.bezpts[3].y == 50);
+
+        CPen pen;
+        pen.CreatePen(PS_SOLID, 5, RGB(0, 0xFF, 0));    // green stroke
+        dc.SelectObject(&pen);
+        CBrush brush;
+        brush.CreateSolidBrush(RGB(0xFF, 0xFF, 0));     // yellow fill (unused: stroke only)
+        dc.SelectObject(&brush);
+
+        dc.BeginPath();
+        dc.MoveTo(cardinal.SegLo());  // bezpts[0] = (0,0)
+        cardinal.Draw(&dc);           // dc->PolyBezierTo(bezpts+1, 3)
+        dc.EndPath();
+        dc.StrokePath();
+
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == 1);
+        CC_CHECK(log[0] ==
+            "path n=4 fill=0 fillc=FFFF00 stroke=1 strokec=00FF00 w=5 dashed=0 "
+            "[M 0,0 C 13,7 86,44 100,50]");
+    }
 }
 
 extern "C" int32_t cc_run_selftests(void) {
@@ -812,6 +953,7 @@ extern "C" int32_t cc_run_selftests(void) {
     testShimStringApis2();
     testMapWordToPtr();
     testMapWordToPtrRemoveDuringIteration();
+    testMapStringToPtr();
     cc_selftest_loglevel();
     cc_selftest_canvas();
     cc_selftest_canvas_truncated_cubic();
