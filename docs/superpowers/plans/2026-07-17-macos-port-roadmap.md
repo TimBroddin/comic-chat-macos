@@ -22,9 +22,18 @@
 ## Plan 2 — Comic layout engine + Canvas
 
 **Lift list:** `balloon.cpp/.h`, `spline.cpp/.h`, `splinutl.cpp`, `traj.cpp/.h`,
-`bodycam.cpp/.h`, `semantic.cpp`, `panel.cpp/.h`, plus reactivating the
-`CC_NO_RENDER` bodies stubbed in Plan 1 (`dib.cpp` Draw overloads, `avatar.cpp`
-body/pose drawing, `backdrop.cpp`).
+`bodycam.cpp/.h`, `semantic.cpp`, `panel.cpp/.h`, `wmini.cpp` (holds some
+`CBody*`/`CPanelElement` virtual definitions — discovered during Plan 1 Task 4),
+plus reactivating the `CC_NO_RENDER` bodies stubbed in Plan 1 (`dib.cpp` Draw
+overloads, `avatar.cpp` body/pose drawing, `backdrop.cpp`).
+
+**Debt handed over by Plan 1 (delete as the owning files are lifted):**
+- `engine/cc_link_stubs.cpp` — trap stubs for virtuals owned by
+  `bodycam.cpp`/`panel.cpp`/`wmini.cpp`/`balloon.cpp` (Edit Rule R12b).
+- `engine/lifted_singles.cpp` — verbatim single-function lifts the load path
+  needed early (R12a); fold back into their owning files when those are lifted.
+- `CC_NO_PROTOCOL` define in Package.swift — removed by Plan 3
+  (`EmotionToBytes`/`BytesToEmotion` in `avatario.cpp` re-enable then).
 
 **Dependency map (from include analysis, 2026-07-17):**
 - `balloon.cpp` includes `panel.h`, `script.h`, `pageview.h`, `format.h`,
