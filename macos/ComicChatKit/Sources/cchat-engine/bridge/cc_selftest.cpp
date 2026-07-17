@@ -430,9 +430,35 @@ static void cc_selftest_canvas() {
     CC_CHECK(i < log.size() && log[i++] == "rect 0,0,2400,-2400 fill=FFFFFF");
     CC_CHECK(i < log.size() && log[i++] == "image 0,0,1200,-1600 src=0,0,60,80");
     CC_CHECK(i < log.size() && log[i++] ==
-        "path n=5 fill=1 stroke=1 w=20 dashed=0 [M 0,0 L 10,0 C 20,0 30,10 40,10]");
+        "path n=5 fill=1 fillc=0000FF stroke=1 strokec=FF0000 w=20 dashed=0 [M 0,0 L 10,0 C 20,0 30,10 40,10]");
     CC_CHECK(i < log.size() && log[i++] == "clip+ 0,0,2400,-2400");
     CC_CHECK(i < log.size() && log[i++] == "clip-");
+}
+
+static void cc_selftest_canvas_truncated_cubic() {
+    // Test that a path with a truncated cubic run (incomplete triple) logs
+    // the verbs before the truncation and stops safely without reading past
+    // the pts array bounds.
+    CCRecordingCanvas rec;
+    CCanvas canvas(rec.handle());
+
+    // Create a path: MOVE, LINE, then single CUBIC (incomplete triple).
+    cc_path_pt pts[3];
+    pts[0] = { CC_PATH_MOVE, 0, 0 };
+    pts[1] = { CC_PATH_LINE, 10, 0 };
+    pts[2] = { CC_PATH_CUBIC, 20, 0 };  // Incomplete triple: need pts[3] and pts[4]
+    canvas.path(pts, 3, 1, 0x00FFFFFF, 0, 0x00000000, 1, 0);
+
+    const std::vector<std::string>& log = rec.log();
+    CC_CHECK(log.size() == 1);
+    // The path should contain the MOVE and LINE, but stop before the
+    // truncated cubic. Truncation logs an error via ccLog, which doesn't
+    // fail the path — it just stops parsing. The log line should end at
+    // the last complete verb (L 10,0), with no C triple following.
+    CC_CHECK(log[0].find("M 0,0") != std::string::npos);
+    CC_CHECK(log[0].find("L 10,0") != std::string::npos);
+    // Verify that the cubic triple did NOT make it into the output.
+    CC_CHECK(log[0].find("C ") == std::string::npos);
 }
 
 extern "C" int32_t cc_run_selftests(void) {
@@ -456,5 +482,6 @@ extern "C" int32_t cc_run_selftests(void) {
     testMapWordToPtrRemoveDuringIteration();
     cc_selftest_loglevel();
     cc_selftest_canvas();
+    cc_selftest_canvas_truncated_cubic();
     return g_failures;
 }

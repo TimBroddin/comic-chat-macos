@@ -17,7 +17,7 @@
 //   text  "text x,y color=RRGGBB \"bytes\""
 //   rect  "rect l,t,r,b fill=RRGGBB"
 //   image "image dl,dt,dr,db src=sl,st,sr,sb"
-//   path  "path n=N fill=F stroke=S w=WIDTH dashed=D [entries]"
+//   path  "path n=N fill=F fillc=RRGGBB stroke=S strokec=RRGGBB w=WIDTH dashed=D [entries]"
 //         where entries are space-separated, one of:
 //           "M x,y"                     (CC_PATH_MOVE)
 //           "L x,y"                     (CC_PATH_LINE)

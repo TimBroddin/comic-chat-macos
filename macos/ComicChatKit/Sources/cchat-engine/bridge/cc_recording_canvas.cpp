@@ -97,8 +97,6 @@ void CCRecordingCanvas::path(void* ctx, const cc_path_pt* pts, int32_t n,
                               int32_t do_stroke, uint32_t stroke_color,
                               int32_t stroke_width, int32_t dashed) {
     CCRecordingCanvas* self = CCRecordingCanvas::self(ctx);
-    (void)fill_color;
-    (void)stroke_color;
 
     std::string entries;
     int32_t i = 0;
@@ -115,6 +113,12 @@ void CCRecordingCanvas::path(void* ctx, const cc_path_pt* pts, int32_t n,
                 break;
             case CC_PATH_CUBIC:
                 // Three consecutive CC_PATH_CUBIC entries render as one C triple.
+                // Before consuming, check that pts[i+1] and pts[i+2] exist.
+                if (i + 2 >= n) {
+                    ccLog("path: truncated cubic run at index %d (need %d, have %d)",
+                          i, i + 3, n);
+                    break;
+                }
                 entries += "C " + formatXY(pts[i].x, pts[i].y) + " " +
                            formatXY(pts[i + 1].x, pts[i + 1].y) + " " +
                            formatXY(pts[i + 2].x, pts[i + 2].y);
@@ -125,14 +129,17 @@ void CCRecordingCanvas::path(void* ctx, const cc_path_pt* pts, int32_t n,
                 i++;
                 break;
             default:
+                ccLog("path: unknown verb %d at index %d", pts[i].verb, i);
                 i++;
                 break;
         }
     }
 
-    char head[80];
-    std::snprintf(head, sizeof(head), "path n=%d fill=%d stroke=%d w=%d dashed=%d ",
-                  n, do_fill, do_stroke, stroke_width, dashed);
+    char head[96];
+    std::snprintf(head, sizeof(head), "path n=%d fill=%d fillc=%s stroke=%d strokec=%s w=%d dashed=%d ",
+                  n, do_fill, formatColor(fill_color).c_str(),
+                  do_stroke, formatColor(stroke_color).c_str(),
+                  stroke_width, dashed);
     self->log_.push_back(std::string(head) + "[" + entries + "]");
 }
 
