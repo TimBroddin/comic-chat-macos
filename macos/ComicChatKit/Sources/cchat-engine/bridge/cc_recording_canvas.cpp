@@ -117,6 +117,8 @@ void CCRecordingCanvas::path(void* ctx, const cc_path_pt* pts, int32_t n,
                 if (i + 2 >= n) {
                     ccLog("path: truncated cubic run at index %d (need %d, have %d)",
                           i, i + 3, n);
+                    i = n;  // stop parsing: switch-break only exits the switch,
+                            // so advance i past the end to also exit the while.
                     break;
                 }
                 entries += "C " + formatXY(pts[i].x, pts[i].y) + " " +
