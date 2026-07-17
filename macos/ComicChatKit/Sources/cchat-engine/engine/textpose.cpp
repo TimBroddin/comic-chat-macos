@@ -301,6 +301,7 @@ void GetEmotionsFromString(CString &str, CEmotionOpts &emOpts) {
 	const char *bptr = buff;
 	while (isspace(*bptr)) bptr++;					  // prune off leading white space
 	while (bptr && *bptr) {
+		// preserved verbatim: lptr is computed but never used -- the sentence-start compare below uses `lower` (string start) every iteration. Likely original bug; kept bug-for-bug for interop (Task 9 report).
 		char *lptr = lower + (bptr - buff);
 		pos = sentenceRules.GetHeadPosition();
 		while (pos) {
