@@ -29,6 +29,7 @@
 #include "avatar.h"
 #include "avatario.h"
 #include "backdrop.h"
+#include "bridge_art.h"
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -109,12 +110,16 @@ inline int readIndexedPixel(const uint8_t* row, int x, int bitCount) {
     }
 }
 
-// Decodes an indexed CAvatarDIB into freshly malloc'd top-down RGBA8. Runs
+// Decodes an indexed CDIB into freshly malloc'd top-down RGBA8. Runs
 // ConvertToNonRLE() first (a no-op if already BI_RGB). `maskDib`, if
 // non-NULL, must have the same width/height; its bit (1bpp, same row
 // layout) supplies the alpha channel per the transparency rule documented
 // above. Returns false (leaving *outRgba untouched) on any decode failure.
-bool decodeDibToRgba(CAvatarDIB* dib, CAvatarDIB* maskDib,
+// Takes CDIB* (not CAvatarDIB*) so callers with a plain in-memory DIB (no
+// avatar file backing it -- e.g. the CDC::StretchDIBits adapter, Plan 2
+// Task 3) can reuse this without a CAvatarDIB. CAvatarDIB IS-A CDIB, so
+// every existing call site below still passes unchanged.
+bool decodeDibToRgba(CDIB* dib, CDIB* maskDib,
                       int32_t* outWidth, int32_t* outHeight, uint8_t** outRgba) {
     if (dib == nullptr) return false;
 
@@ -196,6 +201,23 @@ bool decodeDibToRgba(CAvatarDIB* dib, CAvatarDIB* maskDib,
 }
 
 } // namespace
+
+// Callable entry point for code outside this translation unit (the CDC
+// adapter's StretchDIBits, Plan 2 Task 3): decodes a raw palettized DIB
+// (BITMAPINFO* + bits, exactly what Win32's StretchDIBits itself takes) into
+// freshly malloc'd top-down RGBA8, with no mask (StretchDIBits callers pass
+// exactly one DIB -- no separate mask plane in that API). Builds a transient
+// CDIB wrapping the caller's memory (CDIB::Create does not take ownership of
+// pBits -- see dib.cpp) and reuses decodeDibToRgba() above. Returns false
+// (leaving outputs untouched) on failure.
+bool bridge_decode_dib_to_rgba(BITMAPINFO* bmi, void* bits,
+                                int32_t* outWidth, int32_t* outHeight,
+                                uint8_t** outRgba) {
+    if (bmi == nullptr || bits == nullptr) return false;
+    CDIB dib;
+    if (!dib.Create(bmi, (BYTE*)bits)) return false;
+    return decodeDibToRgba(&dib, nullptr, outWidth, outHeight, outRgba);
+}
 
 extern "C" void cc_image_free(cc_image* img) {
     if (img == nullptr) return;

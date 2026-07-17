@@ -16,6 +16,7 @@ let package = Package(
             cxxSettings: [
                 .headerSearchPath("shim"),
                 .headerSearchPath("engine"),
+                .headerSearchPath("bridge"),
                 .define("CC_NO_RENDER"),
                 .define("CC_NO_DIRSCAN"),
                 .define("CC_NO_UI"),

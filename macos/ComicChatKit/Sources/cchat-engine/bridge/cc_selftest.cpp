@@ -435,6 +435,253 @@ static void cc_selftest_canvas() {
     CC_CHECK(i < log.size() && log[i++] == "clip-");
 }
 
+// --- Plan 2 Task 3: CDC adapter over cc_canvas -------------------------------
+// Drives a concrete CDC bound to a CCRecordingCanvas through every Produces
+// member, asserting the exact log lines the recording canvas's documented
+// grammar (cc_recording_canvas.h) says each op must produce. Cases (a)-(i)
+// per the task brief; kept as one function per that brief's Step 1.
+
+static void cc_selftest_dc() {
+    CCRecordingCanvas rec;
+    CDC dc(rec.handle());
+
+    // (a) font select + GetTextExtent("hello",5) == 600x240;
+    //     GetTextMetrics height 240/ascent 190.
+    LOGFONT lf;
+    memset(&lf, 0, sizeof(lf));
+    strcpy(lf.lfFaceName, "Comic Sans MS");
+    lf.lfHeight = -240;
+    lf.lfWeight = 400;
+    CFont font;
+    font.CreateFontIndirect(&lf);
+    CFont* pOldFont = dc.SelectObject(&font);
+    CC_CHECK(pOldFont == nullptr);  // nothing selected before
+
+    CSize extent = dc.GetTextExtent("hello", 5);
+    CC_CHECK(extent.cx == 600 && extent.cy == 240);
+
+    TEXTMETRIC tm;
+    memset(&tm, 0, sizeof(tm));
+    dc.GetTextMetrics(&tm);
+    CC_CHECK(tm.tmHeight == 240);
+    CC_CHECK(tm.tmAscent == 190);
+
+    // (b) TextOut log line carries color/bk state (observable part: color).
+    dc.SetTextColor(RGB(1, 2, 3));
+    dc.SetBkMode(OPAQUE);
+    dc.SetBkColor(RGB(4, 5, 6));
+    dc.TextOut(0, 0, "hi", 2);
+    {
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(!log.empty());
+        CC_CHECK(log.back() == "text 0,0 color=010203 \"hi\"");
+    }
+
+    // (c) origin: after SetWindowOrg(100,50), TextOut(100,50,...) logs
+    //     "text 0,0" (emitted coord = input - org).
+    dc.SetWindowOrg(100, 50);
+    dc.TextOut(100, 50, "x", 1);
+    CC_CHECK(rec.log().back() == "text 0,0 color=010203 \"x\"");
+    // OffsetWindowOrg accumulates.
+    dc.OffsetWindowOrg(10, 10);  // org now (110, 60)
+    dc.TextOut(110, 60, "y", 1);
+    CC_CHECK(rec.log().back() == "text 0,0 color=010203 \"y\"");
+    dc.OffsetWindowOrg(-10, -10);
+    dc.SetWindowOrg(0, 0);  // reset for subsequent cases
+
+    // (d) clip push/intersect/reset sequence logs clip+/clip- correctly.
+    {
+        size_t before = rec.log().size();
+        CRect oldClip;
+        dc.GetClipBox(&oldClip);
+        // Base clip is the +/-2^28 sentinel.
+        CC_CHECK(oldClip.left == -(1 << 28) && oldClip.top == (1 << 28));
+        CC_CHECK(oldClip.right == (1 << 28) && oldClip.bottom == -(1 << 28));
+
+        CRect r1(0, 0, 2400, -2400);
+        dc.IntersectClipRect(&r1);
+        CRect afterFirst;
+        dc.GetClipBox(&afterFirst);
+        CC_CHECK(afterFirst.left == 0 && afterFirst.top == 0);
+        CC_CHECK(afterFirst.right == 2400 && afterFirst.bottom == -2400);
+
+        CRect r2(100, -100, 2000, -2000);
+        dc.IntersectClipRect(&r2);
+        CRect afterSecond;
+        dc.GetClipBox(&afterSecond);
+        // intersection of (0,0,2400,-2400) and (100,-100,2000,-2000)
+        CC_CHECK(afterSecond.left == 100 && afterSecond.top == -100);
+        CC_CHECK(afterSecond.right == 2000 && afterSecond.bottom == -2000);
+
+        dc.SelectClipRgn(NULL, RGN_COPY);
+        CRect afterReset;
+        dc.GetClipBox(&afterReset);
+        CC_CHECK(afterReset.left == -(1 << 28) && afterReset.top == (1 << 28));
+        CC_CHECK(afterReset.right == (1 << 28) && afterReset.bottom == -(1 << 28));
+
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == before + 3);
+        CC_CHECK(log[before] == "clip+ 0,0,2400,-2400");
+        CC_CHECK(log[before + 1] == "clip+ 100,-100,2000,-2000");
+        CC_CHECK(log[before + 2] == "clip-");
+    }
+
+    // (d, continued) clip rects are logical coordinates: window origin
+    // applies to IntersectClipRect's input and GetClipBox's output, exactly
+    // like every other coordinate this adapter emits. A clip set under one
+    // origin does not retroactively move when the origin later changes
+    // (real GDI semantics -- the region is fixed in device/canvas space).
+    {
+        size_t before = rec.log().size();
+        dc.SetWindowOrg(100, 50);
+        CRect r(100, 50, 500, -50);  // logical (100,50)-(500,-50) under this origin
+        dc.IntersectClipRect(&r);    // canvas space: (0,0)-(400,-100)
+        CC_CHECK(rec.log().back() == "clip+ 0,0,400,-100");
+
+        CRect box;
+        dc.GetClipBox(&box);  // read back under the SAME origin -> same rect
+        CC_CHECK(box.left == 100 && box.top == 50 && box.right == 500 && box.bottom == -50);
+
+        dc.SetWindowOrg(0, 0);  // origin changes; clip stays fixed in canvas space
+        CRect boxAfterOriginChange;
+        dc.GetClipBox(&boxAfterOriginChange);
+        CC_CHECK(boxAfterOriginChange.left == 0 && boxAfterOriginChange.top == 0);
+        CC_CHECK(boxAfterOriginChange.right == 400 && boxAfterOriginChange.bottom == -100);
+
+        dc.SelectClipRgn(NULL, RGN_COPY);  // reset for subsequent cases
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == before + 2);
+        CC_CHECK(log[before + 1] == "clip-");
+    }
+
+    // Set up pen/brush for path cases.
+    CPen pen;
+    pen.CreatePen(PS_SOLID, 20, RGB(0xFF, 0, 0));
+    CPen* pOldPen = dc.SelectObject(&pen);
+    (void)pOldPen;
+    CBrush brush;
+    brush.CreateSolidBrush(RGB(0, 0, 0xFF));
+    CBrush* pOldBrush = dc.SelectObject(&brush);
+    (void)pOldBrush;
+
+    // (e) BeginPath..MoveTo(0,0),LineTo(10,0),CloseFigure,EndPath,StrokePath
+    //     logs one path with M/L/Z.
+    {
+        size_t before = rec.log().size();
+        dc.BeginPath();
+        dc.MoveTo(0, 0);
+        dc.LineTo(10, 0);
+        dc.CloseFigure();
+        dc.EndPath();
+        dc.StrokePath();
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == before + 1);
+        CC_CHECK(log[before] ==
+            "path n=3 fill=0 fillc=0000FF stroke=1 strokec=FF0000 w=20 dashed=0 [M 0,0 L 10,0 Z]");
+    }
+
+    // (f) bare MoveTo/LineTo (outside BeginPath/EndPath) logs an immediate
+    //     2-pt path.
+    {
+        size_t before = rec.log().size();
+        dc.MoveTo(5, 5);
+        dc.LineTo(15, 5);
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == before + 1);
+        CC_CHECK(log[before] ==
+            "path n=2 fill=0 fillc=0000FF stroke=1 strokec=FF0000 w=20 dashed=0 [M 5,5 L 15,5]");
+    }
+
+    // (g) Ellipse(0,0,100,-100) logs a 12-entry cubic path (4x3).
+    {
+        size_t before = rec.log().size();
+        dc.Ellipse(0, 0, 100, -100);
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == before + 1);
+        const std::string& line = log[before];
+        CC_CHECK(line.substr(0, 6) == "path n");
+        CC_CHECK(line.find("n=12 ") != std::string::npos);
+        CC_CHECK(line.find("fill=1") != std::string::npos);
+        CC_CHECK(line.find("stroke=1") != std::string::npos);
+        // 4 cubic triples, no M/L/Z entries.
+        CC_CHECK(line.find("M ") == std::string::npos);
+        CC_CHECK(line.find("L ") == std::string::npos);
+        CC_CHECK(line.find("Z") == std::string::npos);
+        size_t cCount = 0;
+        size_t pos = 0;
+        while ((pos = line.find("C ", pos)) != std::string::npos) { cCount++; pos += 2; }
+        CC_CHECK(cCount == 4);
+    }
+
+    // (g, continued) Ellipse's rect is logical coordinates too -- window
+    // origin shifts every emitted point by the same (dx,dy), same as every
+    // other coordinate this adapter emits.
+    {
+        dc.SetWindowOrg(10, 20);
+        size_t before = rec.log().size();
+        dc.Ellipse(10, 20, 110, -80);  // same shape as the (g) case, offset by the org
+        dc.SetWindowOrg(0, 0);
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == before + 1);
+        CC_CHECK(log[before] == log[before - 1]);  // identical to the un-offset (g) line
+    }
+
+    // (h) FillSolidRect logs rect.
+    {
+        size_t before = rec.log().size();
+        CRect r(0, 0, 500, -500);
+        dc.FillSolidRect(&r, RGB(9, 9, 9));
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == before + 1);
+        CC_CHECK(log[before] == "rect 0,0,500,-500 fill=090909");
+    }
+    {
+        size_t before = rec.log().size();
+        dc.FillSolidRect(0, 0, 500, -500, RGB(9, 9, 9));
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == before + 1);
+        CC_CHECK(log[before] == "rect 0,0,500,-500 fill=090909");
+    }
+
+    // (i) GetDeviceCaps(LOGPIXELSY) == 1440.
+    CC_CHECK(dc.GetDeviceCaps(LOGPIXELSY) == 1440);
+    CC_CHECK(dc.GetDeviceCaps(LOGPIXELSX) == 1440);
+
+    // Misc adapter members: m_bPrinting, IsPrinting, GetSafeHdc,
+    // GetCurrentFont, palette/stretch-mode no-ops.
+    CC_CHECK(dc.m_bPrinting == FALSE);
+    CC_CHECK(dc.IsPrinting() == FALSE);
+    CC_CHECK(dc.GetSafeHdc() != nullptr);
+    CC_CHECK(dc.GetCurrentFont() == &font);
+
+    CPalette* pal = GetCurrentPalette(&dc);
+    CC_CHECK(pal == nullptr);
+    SelectPalette(&dc, nullptr, TRUE);
+    RealizePalette(&dc);
+    SetStretchBltMode(&dc, 0);
+    POINT brushOrg;
+    GetBrushOrgEx(&dc, &brushOrg);
+    SetBrushOrgEx(&dc, 0, 0, &brushOrg);
+
+    // CClientDC binds to ccContext().metricsCanvas by default.
+    cc_set_metrics_canvas(rec.handle());
+    CClientDC clientDc;
+    CC_CHECK(clientDc.GetDeviceCaps(LOGPIXELSY) == 1440);
+
+    // ccContext().metricsDC(): lazily-constructed CDC bound to
+    // metricsCanvas, same instance on every call (R17).
+    CDC* mdc1 = ccContext().metricsDC();
+    CC_CHECK(mdc1 != nullptr);
+    CDC* mdc2 = ccContext().metricsDC();
+    CC_CHECK(mdc1 == mdc2);
+    CC_CHECK(mdc1->GetDeviceCaps(LOGPIXELSY) == 1440);
+
+    // restore selections
+    dc.SelectObject(pOldPen);
+    dc.SelectObject(pOldBrush);
+    dc.SelectObject(pOldFont);
+}
+
 static void cc_selftest_canvas_truncated_cubic() {
     // Test that a path with a truncated cubic run (incomplete triple) logs
     // the verbs before the truncation and stops safely without reading past
@@ -483,5 +730,6 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_loglevel();
     cc_selftest_canvas();
     cc_selftest_canvas_truncated_cubic();
+    cc_selftest_dc();
     return g_failures;
 }

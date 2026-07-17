@@ -1,6 +1,17 @@
 #include "mfc_compat.h"
 #include "comicchat.h"
+#include "engine_context.h"
 #include <sys/stat.h>
+
+// CClientDC (Plan 2 Task 3): a CDC auto-bound to the registered metrics
+// canvas. Defined here (not inline in the header) because it needs
+// engine_context.h's full CCEngineContext definition, and mfc_compat.h
+// cannot #include engine_context.h without a circular include (engine_
+// context.h itself #includes mfc_compat.h for CString) -- see the
+// ccContext() forward declaration in mfc_compat.h for the full rationale.
+CClientDC::CClientDC() : CDC(ccContext().metricsCanvas) {
+    ASSERT(ccContext().metricsCanvas != nullptr);
+}
 
 // Plan 2 Task 1: ccLog level gate. -1 = not yet initialized; lazily seeded
 // from CC_LOG_LEVEL on first use (default 2 if unset/unparsed). 0=silent,
