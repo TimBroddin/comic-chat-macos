@@ -441,3 +441,4 @@ FodyWeavers.xsd
 *.msm
 *.msp
 .gstack/
+.superpowers/
