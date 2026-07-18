@@ -119,6 +119,22 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// `config.backdropName` reads, which run on the engine queue via
     /// `start()`/`reflowLocked()`).
     private var config: ChatConfig
+    /// The character `config.characterName` held at `init` time — set ONCE
+    /// and never mutated afterward (Plan 4b Task 5 fix round 1, transcript-
+    /// doctrine finding). `setUpStripLocked` uses THIS (not the possibly-
+    /// since-changed `config.characterName`) to seed the self participant
+    /// during a REFLOW: `reflowLocked` re-`apply`s the WHOLE `_transcript` in
+    /// order, which (as of this fix) now contains a `.appearsAs` entry at the
+    /// exact position any `changeCharacter` call happened — seeding with the
+    /// CURRENT (post-switch) character instead would render every pre-switch
+    /// panel with the wrong avatar (the panel is built before replay ever
+    /// reaches the `.appearsAs` entry that's supposed to introduce it), which
+    /// is the bug this fix closes. A fresh (never-reflowed) session has no
+    /// `.appearsAs` self-switch in its transcript yet, so seeding with
+    /// `initialCharacterName` there is simply seeding with the same value
+    /// `config.characterName` already holds — behaviorally identical to
+    /// before this fix.
+    private let initialCharacterName: String
     private let engineQueue = DispatchQueue(label: "com.comicchat.engine")
     private let session: ProtocolSession
 
@@ -249,6 +265,7 @@ public final class ChatSessionModel: @unchecked Sendable {
 
     public init(config: ChatConfig) {
         self.config = config
+        self.initialCharacterName = config.characterName
         self.currentOwnNick = config.nick
         self.session = ProtocolSession(host: config.host, port: config.port, nick: config.nick,
                                        encoding: config.encoding, engineQueue: engineQueue,
@@ -299,7 +316,7 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// fire-and-forget rather than blocking its caller.
     public func start() async throws {
         try engineQueue.sync {
-            try self.setUpStripLocked()
+            try self.setUpStripLocked(isReflow: false)
         }
         startEventConsumer()
         try await session.connect()
@@ -312,7 +329,24 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// arrives via `setViewport`), creates the strip + bridge, sets the
     /// title (so panel 0 exists even before any chat line), sets the
     /// backdrop, and adds+registers the self participant.
-    private func setUpStripLocked() throws {
+    ///
+    /// - Parameter isReflow: `false` for the one `start()` call site (a fresh
+    ///   session — no transcript exists yet, so there is nothing to replay
+    ///   forward from); `true` for `reflowLocked`'s call site. Selects which
+    ///   character seeds the self participant: a fresh session seeds
+    ///   `config.characterName` (the character it was actually started with —
+    ///   equivalent to `initialCharacterName` at this point, since nothing has
+    ///   changed it yet); a reflow seeds `initialCharacterName` UNCONDITIONALLY,
+    ///   even if `changeCharacter` has since moved `config.characterName`
+    ///   forward, because `reflowLocked` immediately re-`apply`s the whole
+    ///   `_transcript` afterward — which (Plan 4b Task 5 fix round 1) now
+    ///   contains a `.appearsAs` entry at the exact position any character
+    ///   switch happened. Seeding with the POST-switch character here would
+    ///   have every pre-switch panel painted with the wrong avatar before
+    ///   replay ever reaches the entry that's supposed to introduce it —
+    ///   exactly the transcript-doctrine violation this fix closes. See
+    ///   `initialCharacterName`'s own doc comment.
+    private func setUpStripLocked(isReflow: Bool) throws {
         // Reuse an already-installed metrics canvas across a reflow
         // (`reflowLocked` clears `strip`/`bridge` but does NOT clear
         // `metricsCanvas`/`metricsCanvasBox`): the metrics canvas is a
@@ -344,7 +378,8 @@ public final class ChatSessionModel: @unchecked Sendable {
         let newBridge = try ProtocolStripBridge(strip: newStrip, resolver: resolver, encoding: config.encoding)
         try newBridge.setBackdrop(config.artDir + "/" + config.backdropName + ".bgb")
 
-        let avbPath = config.artDir + "/" + config.characterName + ".avb"
+        let seedCharacterName = isReflow ? initialCharacterName : config.characterName
+        let avbPath = config.artDir + "/" + seedCharacterName + ".avb"
         let selfID = try newStrip.addParticipant(nick: config.nick, avbPath: avbPath)
         try newStrip.setSelf(selfID)
 
@@ -453,7 +488,22 @@ public final class ChatSessionModel: @unchecked Sendable {
             recomposeLocked()
 
         case .appearsAs(let nick, _, _):
-            if !announcedBackTo.contains(nick) {
+            // Plan 4b Task 5 fix round 1 (transcript-doctrine finding): a
+            // character switch is now synthesized as a `.appearsAs` for OUR
+            // OWN nick (see `changeCharacter`'s doc comment) and routed
+            // through this SAME handler so `bridge.apply` re-avatars the self
+            // participant and the switch lands in `_transcript` at its
+            // correct reflow position. The reply-announce below exists to
+            // greet a PEER whose avatar we're seeing for the first time — it
+            // must NEVER fire for our own synthetic (`!fromServer`) or for a
+            // server-echoed announce of our OWN nick (some servers echo a
+            // client's own PRIVMSG-shaped announce back, same class of hazard
+            // as `send`'s own-say echo dedup), or we'd send ourselves a
+            // private "# Appears as" reply. The bridge.apply/recompose below
+            // are unconditional either way — those are what actually make the
+            // avatar switch visible, self or peer.
+            let isOwnAnnounce = !fromServer || nick.caseInsensitiveCompare(currentOwnNick) == .orderedSame
+            if !isOwnAnnounce, !announcedBackTo.contains(nick) {
                 announcedBackTo.insert(nick)
                 let name = config.characterName.capitalized
                 Task { [session, config] in
@@ -641,39 +691,90 @@ public final class ChatSessionModel: @unchecked Sendable {
 
     /// Switches the SELF participant's avatar to `name` (a bare comicart name,
     /// no directory/extension — same convention as `ChatConfig.characterName`).
-    /// FUTURE-PANELS-ONLY semantics, original-faithful:
-    /// `Strip.setParticipantAvatar` only affects panels rendered AFTER this
-    /// call (histent.cpp:368-413's documented behavior) — existing panels
-    /// keep the OLD avatar, exactly like a peer's `.appearsAs` avatar switch
-    /// (`ProtocolStripBridge.apply`'s `.appearsAs` case, same contract).
     ///
-    /// Also (per SetMyAvatar's own sequence, avatar.cpp:585-599):
-    ///   1. resets `selfAvatarFile` to `nil` so `emitSelfPoseLocked` lazily
+    /// Plan 4b Task 5 fix round 1 (reviewer-confirmed transcript-doctrine
+    /// finding): a character change IS wire-visible, as a channel-wide
+    /// `"# Appears as <name>"` announce — and that shape already has a full
+    /// existing handler, `.appearsAs`, which BOTH re-avatars the target
+    /// participant (`ProtocolStripBridge.apply`'s `.appearsAs` case ->
+    /// `Strip.setParticipantAvatar`, Task 4a-6) AND lands in `_transcript`.
+    /// So rather than calling `strip.setParticipantAvatar` directly (the
+    /// pre-fix shape, which mutated the strip live but recorded NOTHING in
+    /// the event log — invisible to `reflowLocked`'s transcript replay, so a
+    /// viewport resize after a switch silently rewrote every PRE-switch panel
+    /// with the post-switch avatar), this now SYNTHESIZES a `.appearsAs` for
+    /// our own nick and routes it through the exact same `handleLocked` path
+    /// a peer's avatar announcement takes:
+    ///   1. update `config.characterName` FIRST (before constructing/handling
+    ///      the synthetic event) — `handleLocked`'s `.appearsAs` case reads
+    ///      `config.characterName` for the reply-announce name (irrelevant
+    ///      here, guarded off below) but ALSO, critically, this ordering is
+    ///      what makes `emitSelfPoseLocked` (called after) rebuild
+    ///      `selfAvatarFile` against the NEW character rather than the old
+    ///      one — see that property's reset below;
+    ///   2. reset `selfAvatarFile` to `nil` so `emitSelfPoseLocked` lazily
     ///      reopens it against the NEW character (Task 3's named obligation —
     ///      that property's own doc comment explicitly deferred this reset
     ///      to "Task 5's problem"; skipping it ships a stale wheel-preview
     ///      bug: the preview would keep rendering poses from the OLD avatar
     ///      file);
-    ///   2. calls `emitSelfPoseLocked()` so the wheel's live preview updates
+    ///   3. synthesize `.appearsAs(nick: currentOwnNick, avatarName:
+    ///      name.capitalized, url: "")` and hand it to `handleLocked` DIRECTLY
+    ///      (not `enqueueHandle`, which would re-hop `engineQueue.async` —
+    ///      unnecessary and slower, since `changeCharacter` is ALREADY running
+    ///      on the engine queue here, same "already on-queue" posture
+    ///      `sendWhisper`'s trailing `engineQueue.async` block documents for
+    ///      the opposite case). `handleLocked`'s `.appearsAs` case appends to
+    ///      `_transcript` (recording the switch at its correct reflow
+    ///      position) and calls `bridge.apply(ev)`, which resolves
+    ///      `avatarName` through the SAME `AvatarResolver` a peer's switch
+    ///      uses and calls `Strip.setParticipantAvatar` — so the actual
+    ///      engine-side effect is identical to the pre-fix direct call,
+    ///      FUTURE-PANELS-ONLY semantics, original-faithful (existing panels
+    ///      keep the OLD avatar exactly like a peer's `.appearsAs` switch —
+    ///      histent.cpp:368-413's documented behavior);
+    ///   4. calls `emitSelfPoseLocked()` so the wheel's live preview updates
     ///      immediately to the new character's current pose;
-    ///   3. updates the model's OWN notion of `config.characterName` (so a
-    ///      later `reflowLocked()` re-adds the self participant with the
-    ///      NEW character, not the one `start()` was originally called
-    ///      with);
-    ///   4. fires `session.announceAvatar` fire-and-forget (a detached
+    ///   5. fires `session.announceAvatar` fire-and-forget (a detached
     ///      `Task`, same shape as `.selfJoined`'s own announce in
-    ///      `handleLocked` — SetMyAvatar's announce-on-change).
+    ///      `handleLocked` — SetMyAvatar's announce-on-change, avatar.cpp:
+    ///      585-599) — the REAL wire announce, unchanged from before this fix.
+    ///
+    /// `fromServer: false` on the synthetic (mirrors `send(_:)`'s own
+    /// synthetic self-say) — this, together with the nick equaling
+    /// `currentOwnNick`, is exactly what `handleLocked`'s `.appearsAs` case
+    /// now checks to SKIP the private reply-announce branch (that branch
+    /// exists to greet a PEER appearing for the first time; our own
+    /// synthetic must never trigger a reply-announce to ourselves — see that
+    /// case's own doc comment).
+    ///
+    /// KNOWN DEVIATION from the pre-fix shape: the OLD code guarded
+    /// `config.characterName`/`selfAvatarFile`'s mutation behind
+    /// `strip.setParticipantAvatar`'s own throw (a bad/missing `.avb` path
+    /// left every bit of state untouched). Routing through `handleLocked` ->
+    /// `bridge?.apply(ev)` (which swallows the throw via `try?`, matching
+    /// every other case in that switch) drops that guard: `config`/
+    /// `selfAvatarFile` are now mutated, and the wire announce still fires,
+    /// even if the underlying avatar file fails to resolve/load. Accepted:
+    /// every real caller (`CharacterPickerView.select`, the one production
+    /// call site) only ever passes a name from `buildCatalog(artDir:)`'s
+    /// curated, filesystem-verified catalog, so this path is unreachable in
+    /// practice — and the alternative (duplicating a pre-check here before
+    /// synthesizing the event, just to preserve a guard no real caller can
+    /// trigger) would reintroduce the two-code-paths-for-one-avatar-switch
+    /// split this fix exists to collapse.
     ///
     /// Fire-and-forget: hops onto the engine queue and returns immediately,
     /// same posture as `setEmotion`/`previewTyping`/`setViewport`.
     public func changeCharacter(_ name: String) {
         engineQueue.async { [weak self] in
-            guard let self, !self.isShutDown, let strip = self.strip,
-                  let selfParticipantID = self.selfParticipantID else { return }
-            let avbPath = self.config.artDir + "/" + name + ".avb"
-            guard (try? strip.setParticipantAvatar(selfParticipantID, avbPath: avbPath)) != nil else { return }
+            guard let self, !self.isShutDown, self.strip != nil,
+                  self.selfParticipantID != nil else { return }
             self.config.characterName = name
             self.selfAvatarFile = nil
+            let synthetic = ProtocolEvent.appearsAs(nick: self.currentOwnNick,
+                                                    avatarName: name.capitalized, url: "")
+            self.handleLocked(synthetic, fromServer: false)
             self.emitSelfPoseLocked()
             let session = self.session
             let channel = self.config.room
@@ -692,6 +793,29 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// Also updates `config.backdropName` (so a later `reflowLocked()`
     /// re-applies the NEW backdrop, matching `changeCharacter`'s same
     /// `config` update). Fire-and-forget, same posture as `changeCharacter`.
+    ///
+    /// KNOWN DEVIATION (documented, not fixed — Plan 4b Task 5 fix round 1
+    /// coordinator ruling): unlike `changeCharacter` (fixed this round to
+    /// record the switch as a transcript `.appearsAs` entry, replayed at its
+    /// correct position on reflow), a mid-session backdrop change is NOT
+    /// recorded in `_transcript` at all — `reflowLocked` seeds the WHOLE
+    /// reflowed strip from `config.backdropName` (the CURRENT backdrop,
+    /// mutated above) via `setUpStripLocked`'s `bridge.setBackdrop` call,
+    /// which means every panel — including ones authored before this switch
+    /// — gets rebuilt with the CURRENT backdrop after a reflow. The original
+    /// tracked this positionally too (`ChangeBackDropEntry`, replayed on
+    /// `HM_RELOAD`, histent.cpp:557-577 in this repo's copy of the source) —
+    /// so this IS the same class of doctrine gap `changeCharacter` had. It is
+    /// deliberately NOT fixed here: unlike an avatar switch, there is no
+    /// existing wire-visible `ProtocolEvent` case a backdrop change could
+    /// piggyback on the way `changeCharacter` piggybacks on `.appearsAs` —
+    /// the live wire form is IRCX `PROP <chan> bk <name>[.<url>]`
+    /// (comicchat.h's own `set_backdrop` grammar note), which this port has
+    /// not yet pinned a `ProtocolEvent` case for. Fixing this properly needs
+    /// that event added first, which needs the IRCX PROP `bk` grammar pinned
+    /// against a real capture — deferred to Plan 4b §8 (live acceptance),
+    /// where a real server's backdrop-change wire form can be captured and
+    /// verified rather than guessed at here.
     public func changeBackdrop(_ name: String) {
         engineQueue.async { [weak self] in
             guard let self, !self.isShutDown, let bridge = self.bridge else { return }
@@ -922,7 +1046,7 @@ public final class ChatSessionModel: @unchecked Sendable {
         selfParticipantID = nil
         announcedBackTo.removeAll()
 
-        guard (try? setUpStripLocked()) != nil else { return }
+        guard (try? setUpStripLocked(isReflow: true)) != nil else { return }
         guard let bridge else { return }
         for ev in _transcript {
             try? bridge.apply(ev)

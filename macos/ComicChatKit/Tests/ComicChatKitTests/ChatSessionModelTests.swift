@@ -374,7 +374,192 @@ extension EngineGlobalStateSelfTests {
             model.shutdown()
             server.stop()
         }
+
+        /// THE DOCTRINE TEST (Plan 4b Task 5 fix round 1, reviewer-confirmed
+        /// Important finding): "anything not derivable from the event log is
+        /// lost on reflow" (D2 §2.3) — `changeCharacter` must be replayable
+        /// from `_transcript`, not just applied live to the strip. Pre-fix,
+        /// `changeCharacter` called `strip.setParticipantAvatar` directly and
+        /// recorded NOTHING in `_transcript`; `reflowLocked` always seeds the
+        /// self participant from `config.characterName` (the CURRENT/
+        /// post-switch character) — so a reflow after a switch silently
+        /// rewrote every PRE-switch panel with the post-switch avatar.
+        ///
+        /// Proof shape (the brief's "simplest robust approach"): capture the
+        /// composed strip image at a fixed geometry G (line 1 -> switch
+        /// character -> line 2), force an actual reflow via a DIFFERENT
+        /// geometry, then return to G and capture again. If the switch is
+        /// correctly positional (this fix), returning to the SAME geometry
+        /// reproduces BYTE-IDENTICAL pixels, because reflow replays
+        /// `_transcript` -- which now records the switch at its correct
+        /// position -- from the ORIGINAL character forward. Pre-fix, the
+        /// reflow instead seeds the self participant with the POST-switch
+        /// character from the start, so the pre-switch panel (line 1) comes
+        /// back wearing the wrong avatar -- different pixels.
+        ///
+        /// Geometry choice (computed offline against `PanelFit`'s actual
+        /// math, not guessed): G = 600pt -> 12000 twips -> 3 columns / 3904
+        /// unit twips. The differing reflow-forcing geometry is 400pt ->
+        /// 8000 twips -> 2 columns / 3928 unit twips (both columns AND unit
+        /// differ from G, so `setViewport`'s `didSetViewport && columns ==
+        /// currentColumns && unit == currentUnitTwips` gate -- the "same
+        /// geometry, recompose only, no reflow" fast path -- is guaranteed to
+        /// MISS and fall through to a real `reflowLocked()` both times
+        /// (400 -> forces the first reflow away from G; 600 again -> forces
+        /// the second reflow BACK to G, since the model's `currentColumns`/
+        /// `currentUnitTwips` are now the 400pt values, not G's).
+        ///
+        /// SETTLING: each mutating call (`setViewport`/`changeCharacter`/
+        /// `send`) is followed by `settleEngineQueue`'s sentinel-hop (proven
+        /// pattern, `PersonaSettingsTests.changeCharacterMidSessionSwitchesAvatarAndAnnounces`)
+        /// to guarantee the ENGINE-QUEUE side of that call (including a full
+        /// `reflowLocked()`, which runs entirely on the engine queue) has
+        /// finished before the next call fires -- deliberately NOT counting
+        /// `onStripImage` callback arrivals via an `AsyncStream`: `.selfJoined`
+        /// AND `setViewport`'s OWN first-call-always-reflows path both fire an
+        /// early recompose before this test's first explicit `setViewport`
+        /// call even runs, so a naive "one `next()` per mutating call" count
+        /// is off by one against actual `onStripImage` firings -- settling
+        /// via the engine queue itself sidesteps that miscount entirely
+        /// (proven during this fix's own debugging: an earlier
+        /// stream-counting version of this test produced a genuinely
+        /// reordered/duplicated-looking reflow sequence purely from that
+        /// miscount, not from any production bug). After settling the engine
+        /// queue, a short fixed wait covers `recomposeLocked`'s trailing
+        /// `DispatchQueue.main.async` hop (the ONLY part of a recompose that
+        /// runs off the engine queue) so `latestImage` is guaranteed current
+        /// by the time it's read.
+        @Test(.timeLimit(.minutes(1)))
+        func characterSwitchSurvivesReflowAtOriginalGeometry() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            model.onStripImage = { image, _ in latestImage.set(image) }
+
+            func settle() async throws {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    model.settleEngineQueue { cont.resume() }
+                }
+                // Covers recomposeLocked's trailing DispatchQueue.main.async
+                // hop -- the engine-queue settle above only guarantees the
+                // engine-side work (including the reflow itself) is done.
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            // Settle at geometry G (600pt -- see doc comment for the computed
+            // columns/unit). This is itself a reflow away from `start()`'s
+            // 3-column/minUnitPanelWidth default, which is fine -- it's not
+            // part of what's being compared.
+            model.setViewport(widthPoints: 600, scale: 2.0)
+            try await settle()
+
+            // line 1 (pre-switch)
+            try await model.send("first line")
+            _ = try await waitForReceivedLine(server, containing: "first line")
+            try await settle()
+
+            // the switch itself
+            model.changeCharacter("armando")
+            try await settle()
+
+            // line 2 (post-switch) -- forces a NEW panel per the switch's
+            // future-panels-only semantics.
+            try await model.send("second line")
+            _ = try await waitForReceivedLine(server, containing: "second line")
+            try await settle()
+
+            guard let imageA = latestImage.get() else {
+                Issue.record("no strip image captured before reflow")
+                return
+            }
+            let bytesA = try pixelBytes(imageA)
+
+            // Force an actual reflow away from G (400pt -- different columns
+            // AND unit, guaranteed to miss setViewport's same-geometry fast
+            // path), then back to G.
+            model.setViewport(widthPoints: 400, scale: 2.0)
+            try await settle()
+            model.setViewport(widthPoints: 600, scale: 2.0)
+            try await settle()
+
+            guard let imageB = latestImage.get() else {
+                Issue.record("no strip image captured after reflow")
+                return
+            }
+            let bytesB = try pixelBytes(imageB)
+
+            // Compared as a precomputed Bool (NOT `#expect(bytesA == bytesB)`
+            // directly) -- deliberate, and load-bearing: Swift Testing's
+            // `#expect(a == b)` macro, on a FAILING comparison between two
+            // large `Collection`s, computes an edit-distance diff
+            // (`BidirectionalCollection.difference(from:)`, Myers' algorithm)
+            // to build a detailed failure message. For two ~1-2 MB `Data`
+            // blobs that are extensively different (exactly the pre-fix
+            // regression shape -- a wrong avatar changes most of a panel's
+            // pixels), that diff computation is catastrophically slow -- this
+            // was empirically confirmed via `lldb -p <pid> -o "bt all"` on a
+            // "hung" pre-fix run: the process was NOT deadlocked, it was
+            // sitting in `LinearMyers.backwardSearch`/`findDifferences`,
+            // still running minutes later. Comparing a precomputed `Bool`
+            // instead gives `#expect` nothing to diff -- the RED failure
+            // message is less detailed (just the two byte COUNTS/equality),
+            // but the test fails in milliseconds instead of hanging.
+            let identical = bytesA == bytesB
+            #expect(identical,
+                    "expected the reflowed strip at the ORIGINAL geometry to be byte-identical to the pre-reflow capture (proves the pre-switch panel kept its ORIGINAL avatar through reflow) -- a mismatch means the character switch was NOT correctly replayed positionally (transcript-doctrine regression). bytesA.count=\(bytesA.count) bytesB.count=\(bytesB.count)")
+
+            model.shutdown()
+            server.stop()
+        }
     }
+}
+
+/// Thread-safe single-slot box for the MOST RECENT `CGImage` `onStripImage`
+/// delivered -- `characterSwitchSurvivesReflowAtOriginalGeometry` needs the
+/// actual image (not just its size, which `ImagesBox` already tracks) to do
+/// its byte-identical pixel comparison. Same lock-guarded shape as
+/// `ImagesBox`/`MembersBox` above (`onStripImage` is `@Sendable`, called on
+/// the main thread, read concurrently from the test's own task).
+private final class LatestImageBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var image: CGImage?
+
+    func set(_ image: CGImage) {
+        lock.lock(); defer { lock.unlock() }
+        self.image = image
+    }
+
+    func get() -> CGImage? {
+        lock.lock(); defer { lock.unlock() }
+        return image
+    }
+}
+
+private let latestImage = LatestImageBox()
+
+/// Reads back EVERY pixel of `image` into a `Data` buffer for byte-identical
+/// comparison -- same `CGContext` readback technique as
+/// `CGCanvasMirrorTests.pixel(_:x:y:)`, generalized to the WHOLE image rather
+/// than one pixel, since `characterSwitchSurvivesReflowAtOriginalGeometry`
+/// needs to prove TWO FULL COMPOSITED STRIPS are pixel-for-pixel identical,
+/// not just one probe point (a positional avatar regression could plausibly
+/// only move a handful of pixels within one panel).
+private func pixelBytes(_ image: CGImage) throws -> Data {
+    let width = image.width, height = image.height
+    var buffer = [UInt8](repeating: 0, count: width * height * 4)
+    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    guard let ctx = CGContext(
+        data: &buffer, width: width, height: height,
+        bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+        throw Strip.StripError(message: "pixelBytes readback context failed")
+    }
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return Data(buffer)
 }
 
 /// Test-only helper composing the Task-2 scenario-1 login lines
