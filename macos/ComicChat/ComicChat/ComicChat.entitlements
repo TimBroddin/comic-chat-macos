@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Decision (Plan 4a Task 10): this app is NOT sandboxed.
+
+	Rationale: personal project distributed outside the Mac App Store; running
+	unsandboxed simplifies Plan 4b's sound-effect playback and save/export
+	paths (no security-scoped bookmarks, no entitlement plumbing for
+	arbitrary file access) at essentially zero cost given there is no App
+	Store submission planned. Revisit only if MAS distribution becomes a goal.
+
+	Because the app is not sandboxed, App Sandbox entitlements
+	(com.apple.security.app-sandbox, .network.client, etc.) are intentionally
+	omitted — an unsandboxed process already has the network/file access it
+	needs. This file is kept (rather than deleted) as the recorded decision
+	and as a ready slot if sandboxing is revisited later.
+	-->
+</dict>
+</plist>
