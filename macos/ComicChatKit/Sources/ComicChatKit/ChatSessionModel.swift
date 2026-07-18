@@ -30,12 +30,18 @@ public struct ChatConfig: Sendable {
     /// (Task 4) from a real setting. `true` by default, matching that seam's
     /// existing hard-coded default.
     public var acceptWhispers: Bool
+    /// Plan 4b Task 6: gates the `.appearsAs`-triggered avatar auto-download
+    /// (an unknown name arriving WITH a URL). `true` by default (D4 §4's
+    /// documented default; matches `SettingsStore.autoDownloadAvatars`'s own
+    /// "never set" default).
+    public var autoDownloadAvatars: Bool
 
     public init(host: String, port: UInt16, nick: String, room: String,
                 encoding: WireEncoding = .cp1252, characterName: String = "anna",
                 backdropName: String = "field", artDir: String,
                 userName: String? = nil, realName: String? = nil,
-                sendComicsData: Bool = true, acceptWhispers: Bool = true) {
+                sendComicsData: Bool = true, acceptWhispers: Bool = true,
+                autoDownloadAvatars: Bool = true) {
         self.host = host
         self.port = port
         self.nick = nick
@@ -48,6 +54,7 @@ public struct ChatConfig: Sendable {
         self.realName = realName
         self.sendComicsData = sendComicsData
         self.acceptWhispers = acceptWhispers
+        self.autoDownloadAvatars = autoDownloadAvatars
     }
 }
 
@@ -278,6 +285,20 @@ public final class ChatSessionModel: @unchecked Sendable {
         self._acceptWhispers = config.acceptWhispers
     }
 
+    /// Plan 4b Task 6: where downloaded custom avatars land —
+    /// `~/Library/Application Support/Comic Chat/Characters`. Created on
+    /// first use (idempotent — `withIntermediateDirectories: true`); a
+    /// `computed` property (not cached) since it's cheap path arithmetic and
+    /// callers (the resolver's `extraDirs`, `downloadAvatarIfNeededLocked`)
+    /// each want the directory to exist by the time they use it.
+    static var userCharactersDir: String {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
+        let dir = base.appendingPathComponent("Comic Chat").appendingPathComponent("Characters")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.path
+    }
+
     /// Thread-safe snapshot of the event log so far (see `_transcript`'s doc
     /// comment for why the engine-queue-owned storage is private).
     public var transcript: [ProtocolEvent] {
@@ -374,7 +395,14 @@ public final class ChatSessionModel: @unchecked Sendable {
         // `FixtureReplayServerTests` exercises (a fixture with a login/join
         // sequence but no chat message at all).
         try newStrip.setTitle(config.room)
-        let resolver = ProtocolStripBridge.AvatarResolver(comicartDir: config.artDir)
+        // extraDirs (Plan 4b Task 6): the user characters dir is searched
+        // BEFORE comicartDir (D1 §4.3) — a downloaded avatar shadows a
+        // same-named bundled one, and (the reflow-coherence payoff) a
+        // reflow's transcript replay re-resolves the announced name against
+        // the downloaded file naturally, with no special-casing needed here.
+        let resolver = ProtocolStripBridge.AvatarResolver(
+            comicartDir: config.artDir,
+            extraDirs: [Self.userCharactersDir])
         let newBridge = try ProtocolStripBridge(strip: newStrip, resolver: resolver, encoding: config.encoding)
         try newBridge.setBackdrop(config.artDir + "/" + config.backdropName + ".bgb")
 
@@ -487,7 +515,7 @@ public final class ChatSessionModel: @unchecked Sendable {
             }
             recomposeLocked()
 
-        case .appearsAs(let nick, _, _):
+        case .appearsAs(let nick, let avatarName, let url):
             // Plan 4b Task 5 fix round 1 (transcript-doctrine finding): a
             // character switch is now synthesized as a `.appearsAs` for OUR
             // OWN nick (see `changeCharacter`'s doc comment) and routed
@@ -512,6 +540,13 @@ public final class ChatSessionModel: @unchecked Sendable {
             }
             try? bridge?.apply(ev)
             recomposeLocked()
+            // Plan 4b Task 6 (D4 §4): a PEER's announce (never our own
+            // synthetic — `isOwnAnnounce` guards that below, same reasoning
+            // as the reply-announce above) naming art we don't have locally
+            // AND carrying a fetchable URL enters the auto-download path.
+            if !isOwnAnnounce {
+                downloadAvatarIfNeededLocked(nick: nick, avatarName: avatarName, url: url)
+            }
 
         case .text(let nick, _, let target, let text, _, let annotations):
             // Plan 4b Task 4 fix (§8 Topology A / plain-IRC interop finding):
@@ -606,6 +641,66 @@ public final class ChatSessionModel: @unchecked Sendable {
             DispatchQueue.main.async { cb?(nick, line) }
         } else {
             emitStatus("Whisper from \(nick) blocked (whispers disabled)")
+        }
+    }
+
+    /// ENGINE QUEUE ONLY. Plan 4b Task 6 (D4 §4): kicks off a peer avatar
+    /// auto-download when ALL of these hold:
+    ///   - `config.autoDownloadAvatars` is on;
+    ///   - `avatarName` did not resolve to real local art (`bridge.resolvesName`
+    ///     — "did this name resolve to real art vs a cycled default", NOT
+    ///     just "is the name non-empty": a name that already resolves has
+    ///     nothing to fetch, whether that's because it's genuinely known art
+    ///     or a bare name `resolve(avatarName:)` would cycle a default for
+    ///     either way, downloading would be pointless or wrong);
+    ///   - `url` is a well-formed http/https URL (the wire carries `"?"` for
+    ///     a DEFERRED url and `""` for none — see `URL`'s parse below; a
+    ///     scheme check on TOP of parse success is required because
+    ///     `URL(string:)` happily parses `"?"` as a query-only relative
+    ///     reference with no scheme).
+    ///
+    /// Fetch runs in a DETACHED `Task`, deliberately OFF the engine queue
+    /// (`URLSession` is async; the brief's threading note: "never block the
+    /// engine queue on network"). On success, the apply hops BACK onto the
+    /// engine queue (`engineQueue.async`) to re-avatar the nick's existing
+    /// participant — `bridge.participantIDs[nick]` -> `strip.setParticipantAvatar`
+    /// -> `recomposeLocked()` — guarded by `isShutDown` and the participant
+    /// still existing (a peer may have parted while the download was in
+    /// flight). Failure is a SILENT status-line note, matching the original's
+    /// auto (non-interactive) download path (chat.cpp:2242-2244 — the
+    /// interactive path pops a dialog via `AvatarTransferError`, but the
+    /// auto-on-appearsAs path this task mirrors never does).
+    private func downloadAvatarIfNeededLocked(nick: String, avatarName: String, url: String) {
+        guard config.autoDownloadAvatars else { return }
+        guard let bridge, !bridge.resolvesName(avatarName) else { return }
+        guard let parsed = URL(string: url),
+              let scheme = parsed.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            return
+        }
+
+        let downloader = AvatarDownloader()
+        let dir = URL(fileURLWithPath: Self.userCharactersDir)
+        Task.detached { [weak self] in
+            guard let self else { return }
+            do {
+                let downloadedPath = try await downloader.fetch(name: avatarName, url: parsed, into: dir)
+                self.engineQueue.async { [weak self] in
+                    guard let self, !self.isShutDown else { return }
+                    guard let bridge = self.bridge, let strip = self.strip,
+                          let id = bridge.participantIDs[nick] else { return }
+                    // 4a-carryover comment (per task brief): the engine's
+                    // `s->avatars` vector accumulates old+new `CAvatarX*`
+                    // per participant on switch (avatario.cpp/panel.cpp's
+                    // ChangeAvatar path) -- bookkeeping-only today (no
+                    // per-session cap on switches), a guard owed if avatar
+                    // switches become frequent (e.g. repeated re-downloads
+                    // of the same nick's avatar across a long session).
+                    guard (try? strip.setParticipantAvatar(id, avbPath: downloadedPath.path)) != nil else { return }
+                    self.recomposeLocked()
+                }
+            } catch {
+                self.emitStatus("Avatar download for \(nick) failed: \(error)")
+            }
         }
     }
 

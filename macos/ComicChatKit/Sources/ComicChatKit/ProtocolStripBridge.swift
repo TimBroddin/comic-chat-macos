@@ -59,11 +59,19 @@ public final class ProtocolStripBridge {
         /// used as-is (caller's CWD-relative resolution, matching
         /// `StripScript`'s own convention when `comicartDir` is omitted).
         public var comicartDir: String?
+        /// Additional directories searched BEFORE `comicartDir` (Plan 4b
+        /// Task 6, D1 §4.3's search order) — user-downloaded/user-provided
+        /// characters shadow the bundled comicart set. Checked in order;
+        /// first directory containing the resolved bare filename wins. Empty
+        /// by default (pre-Task-6 behavior: `comicartDir` alone).
+        public var extraDirs: [String]
 
         public init(comicartDir: String? = nil,
-                    defaultOrder: [String] = ["anna.avb", "armando.avb"]) {
+                    defaultOrder: [String] = ["anna.avb", "armando.avb"],
+                    extraDirs: [String] = []) {
             self.comicartDir = comicartDir
             self.defaultOrder = defaultOrder
+            self.extraDirs = extraDirs
         }
 
         mutating func resolve(avatarName: String?) -> String {
@@ -80,8 +88,41 @@ public final class ProtocolStripBridge {
                 nextDefaultIndex += 1
             }
             if bare.hasPrefix("/") { return bare }
+            // extraDirs BEFORE comicartDir (D1 §4.3): a user-downloaded
+            // character with the same bare name as a bundled one shadows it.
+            for dir in extraDirs {
+                let candidate = (dir as NSString).appendingPathComponent(bare)
+                if FileManager.default.fileExists(atPath: candidate) {
+                    return candidate
+                }
+            }
             guard let dir = comicartDir else { return bare }
             return (dir as NSString).appendingPathComponent(bare)
+        }
+
+        /// Pure path-existence check over `extraDirs + [comicartDir]`,
+        /// mirroring `resolve(avatarName:)`'s own bare-name rule exactly
+        /// (append ".avb" unless `name` already ends in it, case-insensitive)
+        /// — Plan 4b Task 6's "did this name resolve to real art vs a cycled
+        /// default" answer. Unlike `resolve`, this is non-mutating (no
+        /// `defaultOrder` cycling — an unresolved name never consumes a
+        /// default-cycle slot just by being CHECKED) and never falls back to
+        /// a bundled default: a name that resolves to no real file on disk
+        /// answers `false`, full stop (the caller's cue to attempt a
+        /// download, not to accept a cycled placeholder as "known").
+        public func resolvesName(_ name: String) -> Bool {
+            guard !name.isEmpty else { return false }
+            let bare = name.lowercased().hasSuffix(".avb") ? name : "\(name).avb"
+            if bare.hasPrefix("/") {
+                return FileManager.default.fileExists(atPath: bare)
+            }
+            for dir in extraDirs {
+                let candidate = (dir as NSString).appendingPathComponent(bare)
+                if FileManager.default.fileExists(atPath: candidate) { return true }
+            }
+            guard let comicartDir else { return false }
+            let candidate = (comicartDir as NSString).appendingPathComponent(bare)
+            return FileManager.default.fileExists(atPath: candidate)
         }
 
         private var nextDefaultIndex = 0
@@ -127,6 +168,16 @@ public final class ProtocolStripBridge {
     /// `Strip.setBackdrop`'s own ordering requirement).
     public func setBackdrop(_ bgbPath: String) throws {
         try strip.setBackdrop(bgbPath)
+    }
+
+    /// Passthrough to the bridge's own `resolver.resolvesName` (Plan 4b
+    /// Task 6) — `resolver` itself is `private` (an implementation detail of
+    /// `apply`'s avatar resolution), so callers that need the "did this name
+    /// resolve to real art vs a cycled default" answer (`ChatSessionModel`'s
+    /// auto-download gate) go through this method rather than reaching past
+    /// the bridge's encapsulation.
+    public func resolvesName(_ name: String) -> Bool {
+        resolver.resolvesName(name)
     }
 
     /// Feed one decoded protocol event. Events that don't map to a strip

@@ -515,7 +515,125 @@ extension EngineGlobalStateSelfTests {
             model.shutdown()
             server.stop()
         }
+
+        /// Plan 4b Task 6 — model-wiring integration: a peer's `.appearsAs`
+        /// naming UNKNOWN art (not in `artDir`, not in the user characters
+        /// dir) WITH a well-formed http URL triggers the auto-download path
+        /// end to end. `StubHTTPProtocol` (below) intercepts the request
+        /// (registered on `URLSession.shared`, which `downloadAvatarIfNeededLocked`'s
+        /// `AvatarDownloader()` uses by default) and serves the armando.avb
+        /// fixture bytes — no real network. Proves: the file lands under
+        /// `ChatSessionModel.userCharactersDir` AND the peer's participant is
+        /// re-avatared (observable via a SECOND recompose after the one the
+        /// `.appearsAs` handling itself already triggers — `panelCount`
+        /// alone can't distinguish "re-avatared" from "not", so this polls
+        /// for the downloaded file's existence, the load-bearing assertion,
+        /// then confirms no crash/hang followed).
+        @Test(.timeLimit(.minutes(1)))
+        func unknownAvatarWithURLTriggersAutoDownload() async throws {
+            let downloadName = "cc-t6-wiring-\(UUID().uuidString)"
+            let stubURL = URL(string: "http://cc-t6-stub.invalid/\(downloadName).avb")!
+            let fixtureData = try Data(contentsOf: URL(fileURLWithPath: fixture("armando.avb")))
+            StubHTTPProtocol.register(url: stubURL, data: fixtureData)
+            defer { StubHTTPProtocol.unregister(url: stubURL) }
+
+            let userCharactersDir = ChatSessionModel.userCharactersDir
+            let expectedPath = (userCharactersDir as NSString).appendingPathComponent("\(downloadName.lowercased()).avb")
+            try? FileManager.default.removeItem(atPath: expectedPath)
+            defer { try? FileManager.default.removeItem(atPath: expectedPath) }
+
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art,
+                                                       autoDownloadAvatars: true))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            // A peer joins, then announces an avatar name this session has
+            // never seen anywhere (bundled art OR user characters dir),
+            // carrying the stubbed http URL -- the wire grammar is
+            // "# Appears as <name>.<url>" (cc_selftest.cpp:3899's verified
+            // shape).
+            try await server.send(":Win!u@h JOIN #p4")
+            try await server.send(":Win!u@h PRIVMSG #p4 :# Appears as \(downloadName).\(stubURL.absoluteString)")
+
+            var attempts = 0
+            while !FileManager.default.fileExists(atPath: expectedPath), attempts < 400 {
+                try await Task.sleep(nanoseconds: 25_000_000)
+                attempts += 1
+            }
+            #expect(FileManager.default.fileExists(atPath: expectedPath),
+                    "expected the downloaded avatar to land at \(expectedPath)")
+            // The downloaded file itself must be the valid fixture content,
+            // not a partial/corrupt write.
+            let landed = try Data(contentsOf: URL(fileURLWithPath: expectedPath))
+            #expect(landed == fixtureData)
+
+            model.shutdown()
+            server.stop()
+        }
     }
+}
+
+/// Minimal request-URL-keyed `URLProtocol` stub (Plan 4b Task 6): intercepts
+/// exactly the registered URL(s) and serves canned bytes with a 200 response,
+/// so `unknownAvatarWithURLTriggersAutoDownload` exercises the REAL
+/// `AvatarDownloader`/`URLSession.shared` path (matching what
+/// `downloadAvatarIfNeededLocked` actually constructs in production) without
+/// touching the real network. Registered process-wide via
+/// `URLProtocol.registerClass` (affects `.shared`'s default configuration,
+/// which consults registered protocol classes for any URL matching
+/// `canInit(with:)`) and unregistered per-URL by the test's `defer`.
+private final class StubHTTPProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var responses: [URL: Data] = [:]
+    nonisolated(unsafe) private static var registered = false
+
+    static func register(url: URL, data: Data) {
+        lock.lock()
+        responses[url] = data
+        if !registered {
+            URLProtocol.registerClass(StubHTTPProtocol.self)
+            registered = true
+        }
+        lock.unlock()
+    }
+
+    static func unregister(url: URL) {
+        lock.lock()
+        responses.removeValue(forKey: url)
+        lock.unlock()
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        guard let url = request.url else { return false }
+        lock.lock(); defer { lock.unlock() }
+        return responses[url] != nil
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        Self.lock.lock()
+        let data = Self.responses[url]
+        Self.lock.unlock()
+        guard let data else {
+            client?.urlProtocol(self, didFailWithError: URLError(.fileDoesNotExist))
+            return
+        }
+        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                                       headerFields: ["Content-Length": "\(data.count)"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 /// Thread-safe single-slot box for the MOST RECENT `CGImage` `onStripImage`

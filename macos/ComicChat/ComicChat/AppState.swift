@@ -112,7 +112,10 @@ public final class AppState {
                              // before this task).
                              realName: settings.realName.isEmpty ? nil : settings.realName,
                              sendComicsData: settings.sendComicsData,
-                             acceptWhispers: settings.acceptWhispers)
+                             acceptWhispers: settings.acceptWhispers,
+                             // Plan 4b Task 6: gates the .appearsAs-triggered
+                             // avatar auto-download.
+                             autoDownloadAvatars: settings.autoDownloadAvatars)
 
         // Offline demo hook (Task 12): `--replay-fixture <path>` starts a
         // FixtureReplayServer over the given capture-shaped .jsonl and
