@@ -12,6 +12,9 @@ public final class AppState {
     public var members: [String] = []
     public var stripImage: CGImage?
     public var stripSizePoints: CGSize = .zero
+    /// The self avatar's live pose preview (Plan 4b Task 3) — updated after
+    /// every emotion-wheel drag or typing-preview via `ChatSessionModel.onSelfPose`.
+    public var selfPoseImage: CGImage?
 
     /// Kept alive for the process's whole replay session — `FixtureReplayServer`
     /// services exactly one connection, and its `NWListener`/`NWConnection`
@@ -68,6 +71,7 @@ public final class AppState {
             Task { @MainActor in self?.stripImage = img; self?.stripSizePoints = size } }
         m.onMembers = { [weak self] nicks in Task { @MainActor in self?.members = nicks } }
         m.onStatus = { [weak self] s in Task { @MainActor in self?.statusLine = s } }
+        m.onSelfPose = { [weak self] img in Task { @MainActor in self?.selfPoseImage = img } }
         model = m
         do { try await m.start(); showConnectSheet = false }
         catch { statusLine = "Connect failed: \(error)" }
@@ -95,6 +99,7 @@ public final class AppState {
         members = []
         stripImage = nil
         stripSizePoints = .zero
+        selfPoseImage = nil
         replayServer?.stop()
         replayServer = nil
     }

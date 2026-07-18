@@ -25,19 +25,22 @@ struct ChatWindow: View {
                                 sizePoints: appState.stripSizePoints,
                                 model: appState.model)
                 Divider()
-                HStack {
-                    TextField("Say something…", text: $composeText)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { sendSay() }
-                    Button("Say", action: sendSay).keyboardShortcut(.defaultAction)
-                }.padding(8)
+                ComposeBar(composeText: $composeText, model: appState.model)
                 Text(appState.statusLine)
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 8).padding(.bottom, 4)
             }
-            List(appState.members, id: \.self) { nick in Text(nick) }
-                .frame(minWidth: 140, maxWidth: 220)
+            // Original layout (chatview.cpp:333-378): members over bodycam.
+            VStack(spacing: 0) {
+                List(appState.members, id: \.self) { nick in Text(nick) }
+                Divider()
+                BodyCamView(poseImage: appState.selfPoseImage,
+                            onEmotion: { angle, intensity in
+                    appState.model?.setEmotion(angle: angle, intensity: intensity)
+                })
+            }
+            .frame(minWidth: 140, maxWidth: 220)
         }
         .frame(minWidth: 640, minHeight: 480)
         .sheet(isPresented: $state.showConnectSheet) { ConnectSheet() }
@@ -51,12 +54,5 @@ struct ChatWindow: View {
                 await appState.connect()
             }
         }
-    }
-
-    private func sendSay() {
-        let text = composeText.trimmingCharacters(in: .whitespaces)
-        guard !text.isEmpty, let model = appState.model else { return }
-        composeText = ""
-        Task { try? await model.send(text) }
     }
 }

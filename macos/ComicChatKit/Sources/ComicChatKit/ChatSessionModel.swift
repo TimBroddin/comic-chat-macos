@@ -60,6 +60,12 @@ public final class ChatSessionModel: @unchecked Sendable {
     public var onStripImage: (@Sendable (CGImage, CGSize) -> Void)?
     public var onMembers: (@Sendable ([String]) -> Void)?
     public var onStatus: (@Sendable (String) -> Void)?
+    /// Fired after every emotion-wheel drag (`setEmotion`), typing preview
+    /// (`previewTyping`), or (implicitly, via those two) character change,
+    /// with the freshly rendered self-pose image (`nil` if the pose image
+    /// couldn't be loaded/rendered). Called on the MAIN thread, matching
+    /// `onStripImage`/`onMembers`/`onStatus`'s posture.
+    public var onSelfPose: (@Sendable (CGImage?) -> Void)?
 
     private let config: ChatConfig
     private let engineQueue = DispatchQueue(label: "com.comicchat.engine")
@@ -96,6 +102,14 @@ public final class ChatSessionModel: @unchecked Sendable {
     private var strip: Strip?
     private var bridge: ProtocolStripBridge?
     private var selfParticipantID: Int32?
+    /// Standalone handle (independent of `strip`'s own participant registry)
+    /// on the SELF character's `.avb`, used only to render `emitSelfPoseLocked`'s
+    /// preview image via `poseImage(_:)`. Lazily created on first use;
+    /// survives a `reflowLocked()` reflow (it has nothing to do with the
+    /// strip's own participant table) but is NOT reset by reflow -- Task 5's
+    /// character-change flow is what would need to reset this when the
+    /// self-character actually changes (out of this task's scope).
+    private var selfAvatarFile: AvatarFile?
     /// nicks this model has already sent a private reply-announce to (Task
     /// 8's `toNick:` announce) — guards the "first `.appearsAs` from an
     /// unseen nick" rule so a nick's later avatar changes don't re-announce.
@@ -435,25 +449,111 @@ public final class ChatSessionModel: @unchecked Sendable {
         }
     }
 
+    // MARK: - emotion wheel / send-mode preview (Plan 4b Task 3)
+
+    /// The wheel drag: sets the SELF participant's emotion (`angle` in
+    /// radians, `intensity` in `[0, 1]` — the caller's job to apply the 0.2
+    /// center detente, `Strip.setSelfEmotion`'s doc comment) and re-emits the
+    /// freshly rendered self-pose image via `onSelfPose`. Fire-and-forget:
+    /// hops onto the engine queue and returns immediately, matching every
+    /// other engine-touching entry point on this type that isn't already
+    /// `async` (`setViewport`).
+    public func setEmotion(angle: Double, intensity: Double) {
+        engineQueue.async { [weak self] in
+            guard let self, !self.isShutDown, let strip = self.strip else { return }
+            try? strip.setSelfEmotion(angle: angle, intensity: intensity)
+            self.emitSelfPoseLocked()
+        }
+    }
+
+    /// The typing preview: runs the engine's text->emotion inference against
+    /// the SELF participant's avatar (`Strip.previewSelfText`) so the wheel's
+    /// live pose preview reflects what `text` WOULD infer, without adding a
+    /// line to the strip. Fire-and-forget, same posture as `setEmotion`.
+    public func previewTyping(_ text: String) {
+        engineQueue.async { [weak self] in
+            guard let self, !self.isShutDown, let strip = self.strip else { return }
+            try? strip.previewSelfText(text)
+            self.emitSelfPoseLocked()
+        }
+    }
+
+    /// ENGINE QUEUE ONLY. Renders the SELF participant's CURRENT pose
+    /// (`strip.selfPoseIndex()`) via a standalone `AvatarFile` handle on the
+    /// self character (`selfAvatarFile`, lazily created here) and hands the
+    /// image to `onSelfPose` on the main thread.
+    ///
+    /// INDEX SPACE (critical, comicchat.h): `selfPoseIndex()` returns the
+    /// engine's poseID, which is ONE-BASED — `AvatarFile.poseImage(_:)`'s
+    /// index space is zero-based over the SAME pose array, so the poseID is
+    /// converted via `Int(idx) - 1` before the lookup. This is a DIFFERENT
+    /// index space again from `selfAnnotations()`'s pose fields (GetIndices
+    /// record indices) — never mix the three. For complex (two-part)
+    /// avatars, `selfPoseIndex()` reports the TORSO poseID only, which is an
+    /// accepted approximation for this preview.
+    private func emitSelfPoseLocked() {
+        guard let strip else { return }
+        if selfAvatarFile == nil {
+            selfAvatarFile = try? AvatarFile(path: config.artDir + "/" + config.characterName + ".avb")
+        }
+        var image: CGImage? = nil
+        if let idx = try? strip.selfPoseIndex(), idx >= 1, let av = selfAvatarFile,
+           let art = try? av.poseImage(Int(idx) - 1) {
+            image = art.cgImage()
+        }
+        DispatchQueue.main.async { [onSelfPose] in onSelfPose?(image) }
+    }
+
+    /// `Strip.Mode` (the `CC_MODE_*` bitmask) -> the raw SM_* ordinal a
+    /// cooked `Annotations.mode` field carries on the wire (Task 2's
+    /// verified finding, `defines.h:57-61`): SM_SAY=1, SM_WHISPER=2,
+    /// SM_THINK=3, SM_ACTION=5 (SM_SHOUT=4 is never emitted by the
+    /// original's BM2SM and has no `Strip.Mode` counterpart here). This is
+    /// the INVERSE direction of `ProtocolStripBridge.stripModes(kind:annotations:)`
+    /// (SM_* -> CC_MODE_*, for INBOUND annotations) — kept as its own table
+    /// rather than reusing that one, since the two ARE inverses but live on
+    /// different types for different purposes (outbound send vs. inbound
+    /// routing).
+    static func smMode(for mode: Strip.Mode) -> Int32 {
+        switch mode {
+        case .whisper: return 2   // SM_WHISPER
+        case .think:   return 3   // SM_THINK
+        case .action:  return 5   // SM_ACTION
+        default:       return 1   // SM_SAY (.say, and any unrecognized combination)
+        }
+    }
+
     // MARK: - send
 
-    /// Sends `text` as an unannotated say (`annotations: nil` — the Task 9
-    /// brief's deliberate MVP scope decision: receiving 1998 clients run
-    /// their own text->pose inference on unannotated text, chatdoc.cpp:451's
-    /// gate, so peers still see a posed comic; cooked outbound poses arrive
-    /// with the emotion wheel in Plan 4b).
+    /// Sends `text` under `mode` (default `.say`), with COOKED outbound pose
+    /// annotations built from the CURRENT wheel/preview state (the original
+    /// grabs the bodycam state at send time too — Task 9's `annotations: nil`
+    /// MVP scope decision is superseded by this task). `sendComicsData`
+    /// (Task 5) will let a user opt out of annotating at all; until that
+    /// lands, every send is annotated.
     ///
-    /// OWN-SAY RENDERING (brief's Step 3 "No" answer): the original renders
-    /// own says immediately by adding a local history entry at send time
-    /// (`bChatSendText` -> local `AddAndExecute`), not by waiting for a
+    /// OWN-SAY RENDERING (Task 9's "No" answer, still honored): the original
+    /// renders own says immediately by adding a local history entry at send
+    /// time (`bChatSendText` -> local `AddAndExecute`), not by waiting for a
     /// server echo — our loopback/most real IRCds don't echo PRIVMSG back to
-    /// the sender at all. This synthesizes a `.text` event locally (kind 0,
-    /// no annotations — matching what an unannotated outbound say IS) and
-    /// feeds it through the SAME transcript-append + enqueue path a
-    /// server-originated `.text` would take, so the own line appears without
-    /// depending on any echo.
-    public func send(_ text: String) async throws {
-        try await session.say(config.room, text: text, annotations: nil)
+    /// the sender at all. This synthesizes a `.text` event locally carrying
+    /// the SAME cooked annotations that went out over the wire, and feeds it
+    /// through the SAME transcript-append + enqueue path a server-originated
+    /// `.text` would take, so the own line appears (posed) without depending
+    /// on any echo.
+    public func send(_ text: String, mode: Strip.Mode = .say) async throws {
+        // `performOnEngineQueue` traps if called while already ON the engine
+        // queue (its own doc comment) — `send` is invoked from the UI/main
+        // context (ChatWindow's Task { try? await model.send(...) }), never
+        // from inside `handleLocked`/the event consumer, so this is legal,
+        // same posture as the pre-existing `session.say` call below.
+        let ann: Annotations? = session.performOnEngineQueue { [self] in
+            guard var a = try? strip?.selfAnnotations() else { return nil }
+            a.mode = Self.smMode(for: mode)
+            return a
+        }
+        try await session.say(config.room, text: text, annotations: ann,
+                              modes: UInt16(mode.rawValue))
         // Registered BEFORE the synthetic event is enqueued (4a carryover:
         // own-say echo dedup, `handleLocked`'s doc comment) so a server echo
         // of this same text — which can only arrive after `session.say`
@@ -462,8 +562,21 @@ public final class ChatSessionModel: @unchecked Sendable {
         engineQueue.async { [weak self] in self?.pendingLocalEchoes.append(text) }
         let ownNick = session.ownNick
         let synthetic = ProtocolEvent.text(nick: ownNick, ident: "", target: config.room,
-                                          text: text, kind: 0, annotations: nil)
+                                          text: text, kind: 0, annotations: ann)
         enqueueHandle(synthetic, fromServer: false)
+    }
+
+    /// TEST-ONLY (internal, reachable via `@testable import`): hops onto the
+    /// engine queue and back, guaranteeing any work already
+    /// `engineQueue.async`-scheduled before this call (`setEmotion`/
+    /// `previewTyping`'s fire-and-forget dispatch) has completed by the time
+    /// `onSettled` runs — the "sentinel enqueueEngineWork hop" settle
+    /// technique used throughout this test target (`ChatSessionModelTests`'
+    /// polling helpers solve the same problem for server-driven events;
+    /// there is no server round-trip to poll for here, since `setEmotion`/
+    /// `previewTyping` never touch the wire).
+    func settleEngineQueue(_ onSettled: @escaping @Sendable () -> Void) {
+        engineQueue.async { onSettled() }
     }
 
     // MARK: - setViewport (reflow)

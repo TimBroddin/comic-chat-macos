@@ -100,8 +100,11 @@ extension EngineGlobalStateSelfTests {
             // wait for the "hi win" line specifically -- the earlier
             // self-join announce ALSO starts with "PRIVMSG #p4 :", so a
             // wait keyed on just that prefix would return too early (before
-            // this say has actually reached the wire).
-            let sent = try await waitForReceivedLine(server, containing: "PRIVMSG #p4 :hi win")
+            // this say has actually reached the wire). Plan 4b Task 3: every
+            // send is now cooked/annotated (until Task 5's `sendComicsData`
+            // opt-out), so the wire line is "PRIVMSG #p4 :(#G...) hi win",
+            // not a bare "PRIVMSG #p4 :hi win" -- match on "hi win" alone.
+            let sent = try await waitForReceivedLine(server, containing: "hi win")
             #expect(sent.contains { $0.hasPrefix("PRIVMSG #p4 :") && $0.contains("hi win") })
             // the self-join announce (Task 8) went out
             #expect(sent.contains { $0.contains("# Appears as Anna") || $0.contains("# Appears as anna") })
@@ -188,7 +191,10 @@ extension EngineGlobalStateSelfTests {
             // "echoes" it back — otherwise the echo could arrive and be
             // processed before the synthetic local event, which would still
             // dedupe correctly but wouldn't exercise the intended ordering.
-            _ = try await waitForReceivedLine(server, containing: "PRIVMSG #p4 :hello once")
+            // Plan 4b Task 3: every send is now cooked/annotated, so the wire
+            // line is "PRIVMSG #p4 :(#G...) hello once", not a bare
+            // "PRIVMSG #p4 :hello once" -- match on "hello once" alone.
+            _ = try await waitForReceivedLine(server, containing: "hello once")
             try await server.send(":Mac!mac@h PRIVMSG #p4 :hello once")
 
             func matchCount() -> Int {
