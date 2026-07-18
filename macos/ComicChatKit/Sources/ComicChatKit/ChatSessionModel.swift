@@ -345,12 +345,20 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///   .selfJoined            -> announceAvatar(channel:, name:), recompose
     ///   .appearsAs (unseen nick) -> private reply-announce (toNick:), then
     ///                               bridge.apply + recompose
-    ///   .text/.action (strip-relevant) -> bridge.apply + recompose
-    ///        (.text only: own-say echo dedup first, see below)
+    ///   .text (strip-relevant)  -> own-say echo dedup first (see below),
+    ///                              THEN (Plan 4b Task 4 fix, §8 Topology A
+    ///                              plain-IRC interop finding) if the PRIVMSG
+    ///                              targets our own nick or carries cooked
+    ///                              SM_WHISPER-mode annotations, ALSO route
+    ///                              to `whisperBoxRoutingLocked` -- a plain
+    ///                              IRC whisper classifies `CC_EV_TEXT`, not
+    ///                              `CC_EV_WHISPER` (that helper's doc
+    ///                              comment). THEN (unconditionally)
+    ///                              bridge.apply + recompose.
+    ///   .action (strip-relevant) -> bridge.apply + recompose
     ///   .whisper                -> Plan 4b Task 4: route to
-    ///                              `_whisperHistories`/`onWhisper` (unless
-    ///                              `_acceptWhispers == false`, in which case
-    ///                              `onStatus` instead), THEN (unconditionally)
+    ///                              `whisperBoxRoutingLocked` (the IRCX
+    ///                              WHISPER verb path), THEN (unconditionally)
     ///                              bridge.apply + recompose -- the existing
     ///                              4a main-strip whisper-balloon rendering,
     ///                              kept as-is.
@@ -408,28 +416,35 @@ public final class ChatSessionModel: @unchecked Sendable {
             try? bridge?.apply(ev)
             recomposeLocked()
 
-        case .text, .action:
+        case .text(let nick, _, let target, let text, _, let annotations):
+            // Plan 4b Task 4 fix (§8 Topology A / plain-IRC interop finding):
+            // a private whisper on plain IRC arrives as a bare `PRIVMSG
+            // <ourNick> :text` -- the engine classifies this `CC_EV_TEXT`
+            // (never `CC_EV_WHISPER`; see `whisperBoxRoutingLocked`'s doc
+            // comment for the verified ircsock.cpp citations), so it must
+            // ALSO be routed to the whisper box here, alongside the existing
+            // main-strip rendering below. Detected either by the PRIVMSG's
+            // target being our own nick (not a channel) or by cooked
+            // SM_WHISPER-mode (mode == 2) annotations riding along on a
+            // `.text` event. This check runs AFTER the own-echo dedup guard
+            // above (which already `return`ed for a matching echo) -- so an
+            // own-whisper echo (target == the PEER, not our nick) never
+            // reaches here a second time via this path; see
+            // `WhisperRoutingTests.ownWhisperEchoIsDedupedNotDoubleCounted`.
+            if target.caseInsensitiveCompare(currentOwnNick) == .orderedSame || annotations?.mode == 2 {
+                whisperBoxRoutingLocked(nick: nick, text: text)
+            }
             try? bridge?.apply(ev)
             recomposeLocked()
 
         case .whisper(let nick, _, let text, _):
-            // Plan 4b Task 4: Task-5's acceptWhispers setting doesn't exist
-            // yet -- `_acceptWhispers` is a hard-coded-true internal seam
-            // until then. When false, the whisper is dropped from
-            // `_whisperHistories`/`onWhisper` entirely and surfaces only via
-            // `onStatus` (matching the brief's drop-path contract). The
-            // main-strip whisper-balloon rendering (`bridge.apply` +
+            // Plan 4b Task 4: the IRCX WHISPER verb path -- see
+            // `whisperBoxRoutingLocked`'s doc comment for both wire forms.
+            // The main-strip whisper-balloon rendering (`bridge.apply` +
             // `recomposeLocked`) is EXISTING 4a behavior for room-scoped
             // whispers and is unconditionally kept either way -- this task
             // only adds the tabbed-box routing alongside it.
-            if _acceptWhispers {
-                let line = WhisperLine(nick: nick, text: text, isOwn: false)
-                _whisperHistories[nick, default: []].append(line)
-                let cb = onWhisper
-                DispatchQueue.main.async { cb?(nick, line) }
-            } else {
-                emitStatus("Whisper from \(nick) blocked (whispers disabled)")
-            }
+            whisperBoxRoutingLocked(nick: nick, text: text)
             try? bridge?.apply(ev)
             recomposeLocked()
 
@@ -462,6 +477,34 @@ public final class ChatSessionModel: @unchecked Sendable {
 
         default:
             break
+        }
+    }
+
+    /// ENGINE QUEUE ONLY. Routes one inbound whisper line to the tabbed
+    /// whisper box: appends to `_whisperHistories[nick]` and fires `onWhisper`
+    /// (unless `_acceptWhispers == false`, in which case the line is dropped
+    /// from history entirely and surfaces only via `onStatus` instead).
+    /// Shared by BOTH wire forms an inbound whisper can arrive as
+    /// (`handleLocked`'s own doc comment table has the per-event-case
+    /// routing):
+    ///   - the IRCX `WHISPER <chan> <targetlist> :<text>` verb, which the
+    ///     engine classifies `CC_EV_WHISPER` -> `.whisper` (ircsock.cpp's
+    ///     `cmdidWhisper` handler, :1135-1176);
+    ///   - a plain-IRC `PRIVMSG <ourNick> :<text>` (no channel prefix), which
+    ///     the engine classifies `CC_EV_TEXT` -> `.text` -- `cmdidPrivMsg`
+    ///     (ircsock.cpp:907-954) never sets `MT_WHISPER` on the PRIVMSG path,
+    ///     so this is the wire form §8 Topology A's plain-IRC-only servers
+    ///     actually produce, and the ONLY reason this method takes the
+    ///     already-destructured `nick`/`text` rather than a `ProtocolEvent`
+    ///     itself (the two cases carry different case shapes).
+    private func whisperBoxRoutingLocked(nick: String, text: String) {
+        if _acceptWhispers {
+            let line = WhisperLine(nick: nick, text: text, isOwn: false)
+            _whisperHistories[nick, default: []].append(line)
+            let cb = onWhisper
+            DispatchQueue.main.async { cb?(nick, line) }
+        } else {
+            emitStatus("Whisper from \(nick) blocked (whispers disabled)")
         }
     }
 

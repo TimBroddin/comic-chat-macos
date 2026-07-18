@@ -69,6 +69,89 @@ extension EngineGlobalStateSelfTests {
             server.stop()
         }
 
+        /// §8 Topology A (plain IRC, no IRCX) reviewer finding: an inbound
+        /// whisper arriving as a plain `PRIVMSG <ourNick> :text` (no channel
+        /// prefix) is classified `CC_EV_TEXT` by the engine, NOT
+        /// `CC_EV_WHISPER` (this file's own top doc comment, verified against
+        /// `ircsock.cpp:907-954`) -- so it must still reach the whisper box
+        /// via the `.text` case's routing, not only via `.whisper`. Before the
+        /// fix, `handleLocked`'s `.text` case only did `bridge.apply +
+        /// recompose`, so this landed in the main strip but never in
+        /// `whisperHistories`/`onWhisper`.
+        @Test(.timeLimit(.minutes(1)))
+        func plainPrivmsgToSelfRoutesToWhisperBox() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            let receivedBox = WhisperReceivedBox()
+            model.onWhisper = { peer, line in receivedBox.append(peer: peer, line: line) }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            // The wire form §8 Topology A actually produces: a plain PRIVMSG
+            // targeted at our own nick, no channel prefix.
+            try await server.send(":Bob!u@h PRIVMSG Mac :psst")
+
+            while model.whisperHistories["Bob"] == nil {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(model.whisperHistories["Bob"] == [WhisperLine(nick: "Bob", text: "psst", isOwn: false)])
+            #expect(receivedBox.entries.contains { $0.peer == "Bob" && $0.line.text == "psst" && !$0.line.isOwn })
+
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Own-echo no-double-count: `sendWhisper`'s wire line is a plain
+        /// `PRIVMSG <peer> :...` (this file's own top doc comment) carrying
+        /// COOKED SM_WHISPER-mode (mode == 2) annotations
+        /// (`ChatSessionModel.sendWhisper`'s doc comment). If a server echoes
+        /// that SAME line back to us, its `target` is the PEER ("Bob"), not
+        /// our own nick -- so the new plain-IRC routing's `target ==
+        /// currentOwnNick` detection does NOT fire for it, but its cooked
+        /// mode-2 annotations WOULD match the `annotations?.mode == 2`
+        /// detection if the existing own-echo dedup (which drops it before
+        /// any routing runs) didn't get there first. This pins that the
+        /// dedup's early `return` in `handleLocked` is what saves us here --
+        /// the whisper history must contain the own line EXACTLY ONCE.
+        @Test(.timeLimit(.minutes(1)))
+        func ownWhisperEchoIsDedupedNotDoubleCounted() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            try await model.sendWhisper(to: "Bob", text: "back")
+
+            // Capture the REAL wire bytes the engine emitted (cooked
+            // annotations included) and echo that exact line back, exactly as
+            // a server that echoes a client's own PRIVMSG would.
+            let sentLines = try await waitForReceivedLine(server, containing: "back")
+            guard let wireLine = sentLines.first(where: { $0.hasPrefix("PRIVMSG Bob :") && $0.contains("back") }) else {
+                Issue.record("expected a captured PRIVMSG Bob wire line containing 'back'")
+                return
+            }
+            try await server.send(":Mac!mac@h \(wireLine)")
+
+            func matchCount() -> Int {
+                model.whisperHistories["Bob"]?.filter { $0.isOwn && $0.text == "back" }.count ?? 0
+            }
+            while matchCount() < 1 {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            // Settling window long enough for a double-append (pre-fix-style
+            // regression) to have landed, before asserting the final count.
+            try await Task.sleep(nanoseconds: 200_000_000)
+            #expect(matchCount() == 1, "expected exactly one own whisper line for 'back', got \(matchCount())")
+            #expect(model.whisperHistories["Bob"] == [WhisperLine(nick: "Mac", text: "back", isOwn: true)])
+
+            model.shutdown()
+            server.stop()
+        }
+
         @Test(.timeLimit(.minutes(1)))
         func sendWhisperSendsWireLineAndAppendsOwnHistory() async throws {
             let server = try LoopbackIRCServer()
