@@ -12,14 +12,38 @@ import cchat_engine
 /// (comicchat.h's single-thread contract covers every `cc_*` entry point).
 /// `ProtocolStripBridge` itself does not call any `cc_session_*` function and
 /// does not touch `ProtocolSession` at all — it only consumes already-decoded
-/// Swift `ProtocolEvent` values and drives `Strip`. This is a deliberate
-/// separation-of-phases design (see `cc-dumpart --replay`'s doc comment for
-/// the full "why"): a caller that also drives a live/replayed
-/// `ProtocolSession` at the same time MUST NOT interleave `cc_session_feed_bytes`
-/// calls with the calls this bridge makes into `Strip` — collect the full
-/// event stream first (drain the session to completion), THEN feed the
-/// collected events into `ProtocolStripBridge`, so no `cc_session_*` call and
-/// no `cc_strip_*` call are ever in flight at the same time.
+/// Swift `ProtocolEvent` values and drives `Strip`.
+///
+/// The invariant this contract enforces is "one serial queue for every `cc_*`
+/// call in the process", NOT phase separation. Plan 3 only ever exercised
+/// drain-then-render (collect the full event stream first, THEN feed it to
+/// this bridge — see `cc-dumpart --replay`), because that was the only
+/// pattern proven safe at the time. Plan 4a Task 1's `EngineInterleaveTests`
+/// proves the stronger, live-app-shaped pattern is ALSO safe: a caller may
+/// apply events to this bridge WHILE a `ProtocolSession` is still connected
+/// and mid-conversation, interleaved with that session's own
+/// `cc_session_feed_bytes`/outbound calls — PROVIDED every one of those calls
+/// (both the session's and this bridge's) is funneled through the SAME serial
+/// queue. `ProtocolSession.performOnEngineQueue`/`enqueueEngineWork` expose
+/// that queue (as "the engine queue") for exactly this purpose; a caller
+/// driving both a session and a bridge should construct the bridge and call
+/// `apply`/`compose` only via one of those two methods, never directly from
+/// an arbitrary thread or a second queue of its own (two independently
+/// serial queues each serialize their own calls but do nothing to prevent a
+/// `cc_strip_*` call on one from running concurrently with a `cc_session_*`
+/// call on the other — concurrency across the engine's shared statics is the
+/// actual hazard, not which "half" of the API is being called).
+///
+/// The one remaining hard rule: never call `apply`/`compose` synchronously
+/// from inside the `on_event` C-callback stack (i.e. from within
+/// `ProtocolSession`'s `handleEvent`/`emit`, or synchronously from a
+/// `session.events` consumer closure that is itself still on the engine
+/// queue's call stack) — that queue is already blocked running the
+/// `cc_session_*` call that triggered the event, so `performOnEngineQueue`'s
+/// `sync` would deadlock (its `dispatchPrecondition` traps rather than
+/// hanging). Event consumers must run on their own `Task` (reading
+/// `session.events`, an `AsyncStream`, off the engine queue) and hop onto the
+/// engine queue from there — the shape `EngineInterleaveTests` exercises.
 public final class ProtocolStripBridge {
     /// Resolves an `.appearsAs` avatar name (or an unknown/never-announced
     /// participant) to a concrete `.avb` path. Defaults to cycling through a

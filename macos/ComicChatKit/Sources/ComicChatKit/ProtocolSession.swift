@@ -90,7 +90,7 @@ public final class ProtocolSession: @unchecked Sendable {
 
     private var cSession: OpaquePointer?
     private var connection: NWConnection?
-    private let sessionQueue = DispatchQueue(label: "com.comicchat.ProtocolSession")
+    private let sessionQueue: DispatchQueue
 
     /// Own nick, updated ONLY on the server's NICK echo (the "echo-only
     /// update rule", state-and-codec.md §1.2: `ChatChangeNick`/the request
@@ -130,11 +130,25 @@ public final class ProtocolSession: @unchecked Sendable {
 
     // MARK: Init / lifecycle
 
-    public init(host: String, port: UInt16, nick: String, encoding: WireEncoding = .cp1252) {
+    /// - Parameter engineQueue: the serial queue every `cc_session_*` call is
+    ///   funneled through (see the type's top doc comment). Defaults to a
+    ///   private queue created here, matching every existing caller's
+    ///   behavior. Pass an explicit queue to SHARE it with other engine work
+    ///   that must serialize against this session's calls — e.g. a live app's
+    ///   `ProtocolStripBridge` work, which also touches the same
+    ///   process-global engine (comicchat.h's single-thread contract covers
+    ///   every `cc_*` entry point, not just `cc_session_*`) and therefore must
+    ///   run on this SAME queue rather than a queue of its own
+    ///   (`performOnEngineQueue`/`enqueueEngineWork`, below, are how callers
+    ///   reach it).
+    public init(host: String, port: UInt16, nick: String,
+                encoding: WireEncoding = .cp1252,
+                engineQueue: DispatchQueue? = nil) {
         self.host = host
         self.port = NWEndpoint.Port(rawValue: port) ?? 6667
         self.requestedNick = nick
         self.encoding = encoding
+        self.sessionQueue = engineQueue ?? DispatchQueue(label: "com.comicchat.ProtocolSession")
         var continuation: AsyncStream<ProtocolEvent>.Continuation!
         self.events = AsyncStream { cont in continuation = cont }
         self.eventContinuation = continuation
@@ -291,6 +305,54 @@ public final class ProtocolSession: @unchecked Sendable {
 
     public var currentConnectionStatus: ConnectionStatus {
         sessionQueue.sync { connectionStatus }
+    }
+
+    // MARK: Engine queue access (Plan 4a Task 1 — shared session/strip queue)
+    //
+    // The C engine is process-global and single-threaded: EVERY `cc_*` entry
+    // point (not just `cc_session_*`) shares one set of mutable statics
+    // (comicchat.h's threading contract). Plan 3 only ever drove
+    // `cc_strip_*`/`ProtocolStripBridge` work phase-separated from a session
+    // (drain the full event stream first, THEN feed it to the bridge — see
+    // `ProtocolStripBridge`'s doc comment). A live app cannot do that: it must
+    // apply events to a strip WHILE the session is still connected, i.e.
+    // interleaved with `cc_session_feed_bytes` and friends on the SAME
+    // process. These two accessors expose `sessionQueue` under the "engine
+    // queue" name so callers outside this type (a live app's
+    // `ProtocolStripBridge` driver) can serialize their own engine-touching
+    // work against this session's calls, rather than needing a second serial
+    // queue of their own (which would NOT be safe — two independent serial
+    // queues each individually serialize their own calls but do nothing to
+    // prevent a `cc_strip_*` call on one queue from running concurrently with
+    // a `cc_session_*` call on the other). `EngineInterleaveTests` proves this
+    // is safe via a byte-exact PNG comparison against the Plan 3
+    // drain-then-render reference.
+
+    /// Run engine-touching work (`cc_strip_*`, `ProtocolStripBridge`,
+    /// `Strip.compose`) synchronously, serialized with this session's
+    /// `cc_session_*` calls. Blocks the calling thread until `body` completes.
+    ///
+    /// MUST NOT be called from inside an event-handling closure that is
+    /// itself running on the engine queue (e.g. synchronously from within a
+    /// `session.events` consumer callback that the engine queue is currently
+    /// blocked waiting on) — `sessionQueue.sync` from a context already
+    /// running on `sessionQueue` deadlocks. Event consumers run on their own
+    /// `Task` (reading `session.events`, an `AsyncStream`, off the queue) and
+    /// hop here via a plain call, which is the supported shape and what
+    /// `EngineInterleaveTests` exercises.
+    public func performOnEngineQueue<T>(_ body: () throws -> T) rethrows -> T {
+        dispatchPrecondition(condition: .notOnQueue(sessionQueue))
+        return try sessionQueue.sync(execute: body)
+    }
+
+    /// Enqueue engine-touching work to run after any in-flight `cc_session_*`
+    /// call (and anything already queued) completes, without blocking the
+    /// caller. Safe to call from anywhere, including from inside an event
+    /// handler that is itself running on the engine queue (unlike
+    /// `performOnEngineQueue`, this never waits on the queue it schedules
+    /// onto).
+    public func enqueueEngineWork(_ body: @escaping @Sendable () -> Void) {
+        sessionQueue.async(execute: body)
     }
 
     // MARK: Outbound commands
