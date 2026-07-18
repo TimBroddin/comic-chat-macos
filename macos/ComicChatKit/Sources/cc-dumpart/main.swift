@@ -26,6 +26,13 @@ import ComicChatKit
 // events (ProtocolStripBridge) into a cc_strip, and PNG-exports the composed
 // page. See ReplayStrip.swift for the full driver + the session/strip
 // phase-separation contract.
+//
+// --fake-metrics (Plan 4a Task 4) — every strip-composing mode above
+// (--strip/--script/--replay) installs CTMetricsCanvas (real CoreText layout
+// metrics) by default; passing --fake-metrics anywhere on the command line
+// switches to the deterministic fake RecordingCanvas metrics table instead
+// (the pre-Task-4 layout), e.g. to compare against frozen fake-metrics
+// goldens by eye.
 
 let scriptUsage = """
 usage: cc-dumpart --script <conversation.json> <out.png>
@@ -52,7 +59,24 @@ JSON schema:
   extension is required -- it is never appended automatically.
 """
 
-let args = CommandLine.arguments
+// --fake-metrics (Plan 4a Task 4): every strip-composing mode (--strip,
+// --script, --replay) installs CTMetricsCanvas (real CoreText layout metrics)
+// as the layout-time metrics canvas by default -- production behavior. This
+// flag switches those same three install sites back to RecordingCanvas's
+// fake fixed-table metrics (len*120 x 240 / the 240,190,50,40,20,120,240
+// table), reproducing the pre-Task-4 layout on demand (e.g. to compare
+// against the frozen fake-metrics goldens by eye). It is recognized anywhere
+// in argv and stripped before the remaining positional args are parsed, so it
+// composes with every mode's existing usage line unchanged.
+let rawArgs = CommandLine.arguments
+let useFakeMetrics = rawArgs.contains("--fake-metrics")
+let args = rawArgs.filter { $0 != "--fake-metrics" }
+
+/// The metrics canvas a strip-composing mode should install: real CoreText
+/// metrics by default, or the fake RecordingCanvas table under `--fake-metrics`.
+func metricsCanvasForCLI() -> Canvas {
+    useFakeMetrics ? RecordingCanvas() : CTMetricsCanvas()
+}
 
 do {
     if args.count >= 2 && args[1] == "--png" {
@@ -72,29 +96,31 @@ do {
         try exportPNG(artImage: image, toPath: outPath)
     } else if args.count >= 2 && args[1] == "--strip" {
         guard args.count == 3 else {
-            FileHandle.standardError.write(Data("usage: cc-dumpart --strip <out.png>\n".utf8))
+            FileHandle.standardError.write(Data("usage: cc-dumpart --strip <out.png> [--fake-metrics]\n".utf8))
             exit(64) // EX_USAGE
         }
-        try renderDemoStrip(toPath: args[2])
+        try renderDemoStrip(toPath: args[2], metricsCanvas: metricsCanvasForCLI())
     } else if args.count >= 2 && args[1] == "--script" {
         guard args.count == 4 else {
             FileHandle.standardError.write(Data((scriptUsage + "\n").utf8))
             exit(64) // EX_USAGE
         }
-        try runScriptMode(jsonPath: args[2], outPath: args[3])
+        try runScriptMode(jsonPath: args[2], outPath: args[3], metricsCanvas: metricsCanvasForCLI())
     } else if args.count >= 2 && args[1] == "--replay" {
         guard args.count == 4 else {
-            FileHandle.standardError.write(Data("usage: cc-dumpart --replay <capture.jsonl> <out.png>\n".utf8))
+            FileHandle.standardError.write(Data("usage: cc-dumpart --replay <capture.jsonl> <out.png> [--fake-metrics]\n".utf8))
             exit(64) // EX_USAGE
         }
-        try runReplayMode(jsonlPath: args[2], outPath: args[3])
+        try runReplayMode(jsonlPath: args[2], outPath: args[3], metricsCanvas: metricsCanvasForCLI())
     } else {
         guard args.count > 1 else {
             FileHandle.standardError.write(Data("usage: cc-dumpart <art-dir>\n".utf8))
             FileHandle.standardError.write(Data("       cc-dumpart --png <file.avb> <poseIndex> <out.png>\n".utf8))
-            FileHandle.standardError.write(Data("       cc-dumpart --strip <out.png>\n".utf8))
-            FileHandle.standardError.write(Data("       cc-dumpart --script <conversation.json> <out.png>\n".utf8))
-            FileHandle.standardError.write(Data("       cc-dumpart --replay <capture.jsonl> <out.png>\n".utf8))
+            FileHandle.standardError.write(Data("       cc-dumpart --strip <out.png> [--fake-metrics]\n".utf8))
+            FileHandle.standardError.write(Data("       cc-dumpart --script <conversation.json> <out.png> [--fake-metrics]\n".utf8))
+            FileHandle.standardError.write(Data("       cc-dumpart --replay <capture.jsonl> <out.png> [--fake-metrics]\n".utf8))
+            FileHandle.standardError.write(Data("\n       --fake-metrics: use the deterministic fake RecordingCanvas layout metrics\n".utf8))
+            FileHandle.standardError.write(Data("                       instead of the default real CoreText metrics (CTMetricsCanvas).\n".utf8))
             exit(64) // EX_USAGE
         }
         let artDir = args[1]

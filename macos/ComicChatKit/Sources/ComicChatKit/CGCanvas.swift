@@ -33,9 +33,9 @@ public final class CGCanvas: Canvas {
     private let context: CGContext
     private let heightTwips: CGFloat
 
-    // CTFont cache keyed by the requested spec — creating CTFonts is not free
-    // and the engine measures/draws with a small set of specs repeatedly.
-    private var fontCache: [FontSpec: CTFont] = [:]
+    // Real-point-size CTFonts are cached in the shared `CoreTextMetrics.font(for:)`
+    // (Plan 4a Task 4) rather than a per-instance cache here — see `font(for:)`
+    // below.
     // A SEPARATE cache of the same fonts built at 20x point size, used only for
     // DRAWING (see `drawFont(for:)`/`drawText`'s doc comment for why: scaling
     // via CGContext.textMatrix instead, against this context's 1/20 CTM, was
@@ -117,15 +117,14 @@ public final class CGCanvas: Canvas {
 
     /// The real-point-size CTFont for `spec` (LOGFONT lfHeight/20 points),
     /// used for measurement (`measureText`/`fontMetrics`) where callers expect
-    /// true point-based metrics.
+    /// true point-based metrics. Delegates to `CoreTextMetrics.font(for:)`
+    /// (Plan 4a Task 4) -- the SAME cached CTFont the metrics canvas measures
+    /// with, so this canvas's own measurement calls (`measureText`, and
+    /// `fontMetrics` via `CoreTextMetrics.metrics(for:)`) and the layout-time
+    /// metrics canvas agree by construction, sharing one cache instead of
+    /// building the CTFont twice.
     private func font(for spec: FontSpec) -> CTFont {
-        if let cached = fontCache[spec] { return cached }
-        // LOGFONT lfHeight is in twips; negative means character height. Point
-        // size = |height| / 20 (twips per point).
-        let sizePt = abs(CGFloat(spec.height)) / 20.0
-        let ct = makeFont(spec: spec, sizePt: sizePt)
-        fontCache[spec] = ct
-        return ct
+        CoreTextMetrics.font(for: spec)
     }
 
     /// The DRAWING CTFont for `spec`, built at 20x the real point size.
@@ -203,18 +202,20 @@ public final class CGCanvas: Canvas {
     }
 
     public func fontMetrics(_ f: FontSpec) -> TextMetrics {
-        let ctFont = font(for: f)
-        let ascentPt = CTFontGetAscent(ctFont)
-        let descentPt = CTFontGetDescent(ctFont)
-        let leadingPt = CTFontGetLeading(ctFont)
-        let ascent = Int32((ascentPt * 20.0).rounded())
-        let descent = Int32((descentPt * 20.0).rounded())
-        let leading = Int32((leadingPt * 20.0).rounded())
-        let height = ascent + descent
-        let ave = Int32(((ascentPt + descentPt) * 0.5 * 20.0).rounded())
-        return TextMetrics(height: height, ascent: ascent, descent: descent,
-                           internalLeading: 0, externalLeading: leading,
-                           aveCharWidth: max(1, ave), maxCharWidth: max(1, ave * 2))
+        // Delegates to the shared CoreTextMetrics helper (Plan 4a Task 4):
+        // this is the same real-metrics computation the production metrics
+        // canvas (CTMetricsCanvas) uses for LAYOUT, so the canvas that draws
+        // the composed page and the canvas that measured for it agree by
+        // construction -- the fix for the "balloon text sits high" artifact
+        // (layout previously reserved fake-sized space via RecordingCanvas's
+        // fixed metrics table while this canvas drew with real CoreText
+        // metrics). The three fields this method used to synthesize as
+        // placeholders (internalLeading=0, aveCharWidth=(asc+desc)/2,
+        // maxCharWidth=2*ave) are retired: CoreTextMetrics computes all seven
+        // TEXTMETRIC fields from the real font (OS/2/hhea table reads for
+        // aveCharWidth/maxCharWidth, with a measured fallback -- see that
+        // type's doc comment).
+        CoreTextMetrics.metrics(for: f)
     }
 
     public func drawText(_ f: FontSpec, x: Int32, y: Int32, color: UInt32,

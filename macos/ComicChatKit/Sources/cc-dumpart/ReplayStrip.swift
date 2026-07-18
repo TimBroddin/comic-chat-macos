@@ -262,14 +262,16 @@ private func containsLoginWelcome(_ bytes: Data) -> Bool {
 
 /// Phase 2: bridge a fully-collected event stream (from `replayCaptureToEvents`,
 /// AFTER the session is done) into a `cc_strip` and PNG-export it. Installs
-/// the same deterministic recording metrics canvas every other Strip-driving
-/// path in this package uses (`--strip`/`--script`'s demo paths).
-func renderReplayedEvents(_ events: [ProtocolEvent], toPath outPath: String) throws {
+/// `metricsCanvas` as the layout-time metrics canvas: real CoreText metrics
+/// by default (Plan 4a Task 4), like every other Strip-driving path in this
+/// package (`--strip`/`--script`'s demo paths), or the deterministic fake
+/// RecordingCanvas table under `--fake-metrics`.
+func renderReplayedEvents(_ events: [ProtocolEvent], toPath outPath: String, metricsCanvas: Canvas = CTMetricsCanvas()) throws {
     let art = comicartDir()
     let anna = "\(art)/anna.avb"
     let armando = "\(art)/armando.avb"
 
-    let metricsBox = CanvasBox(RecordingCanvas())
+    let metricsBox = CanvasBox(metricsCanvas)
     cc_set_metrics_canvas(metricsBox.handle)
 
     try withExtendedLifetime(metricsBox) {
@@ -305,11 +307,11 @@ func renderReplayedEvents(_ events: [ProtocolEvent], toPath outPath: String) thr
     }
 }
 
-func runReplayMode(jsonlPath: String, outPath: String) throws {
+func runReplayMode(jsonlPath: String, outPath: String, metricsCanvas: Canvas = CTMetricsCanvas()) throws {
     let lines = try CaptureLine.parse(jsonlFile: URL(fileURLWithPath: jsonlPath))
     let events = try runAsync { try await replayCaptureToEvents(lines) }
     do {
-        try renderReplayedEvents(events, toPath: outPath)
+        try renderReplayedEvents(events, toPath: outPath, metricsCanvas: metricsCanvas)
     } catch ReplayError.emptyStrip {
         // Not a CLI failure -- report already printed above; exit 0 with an
         // informational message is more useful than an error exit for a

@@ -22,16 +22,18 @@ func comicartDir() -> String {
     return repoRoot.appendingPathComponent("v2.5-beta-1-modern/comicart").path
 }
 
-func renderDemoStrip(toPath outPath: String) throws {
+func renderDemoStrip(toPath outPath: String, metricsCanvas: Canvas = CTMetricsCanvas()) throws {
     let art = comicartDir()
     let anna = "\(art)/anna.avb"
     let armando = "\(art)/armando.avb"
     let backdrop = "\(art)/field.bgb"
 
-    // Layout-time text measurement routes through a deterministic recording
-    // metrics canvas (the same fake metrics the engine's frozen snapshots use).
-    // Held for the whole render so its cc_canvas outlives every engine call.
-    let metricsBox = CanvasBox(RecordingCanvas())
+    // Layout-time text measurement routes through `metricsCanvas`: real
+    // CoreText metrics (CTMetricsCanvas) by default (Plan 4a Task 4), or the
+    // deterministic fake RecordingCanvas table when the caller passes
+    // `--fake-metrics` (main.swift). Held for the whole render so its
+    // cc_canvas outlives every engine call.
+    let metricsBox = CanvasBox(metricsCanvas)
     cc_set_metrics_canvas(metricsBox.handle)
 
     try withExtendedLifetime(metricsBox) {

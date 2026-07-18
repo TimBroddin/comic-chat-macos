@@ -4,15 +4,19 @@ import ComicChatKit
 
 // `cc-dumpart --script <conversation.json> <out.png>`: thin CLI shell around
 // StripScript (ComicChatKit) -- decode/validate the JSON, install the same
-// deterministic metrics canvas the demo/tests use, render, and write the PNG.
+// metrics canvas the demo/tests use (real CoreText metrics by default, or
+// the deterministic fake RecordingCanvas table under --fake-metrics), render,
+// and write the PNG.
 
-func runScriptMode(jsonPath: String, outPath: String) throws {
+func runScriptMode(jsonPath: String, outPath: String, metricsCanvas: Canvas = CTMetricsCanvas()) throws {
     let art = comicartDir()
 
-    // Layout-time text measurement routes through a deterministic recording
-    // metrics canvas, exactly like --strip's demo path. Held for the whole
-    // render so its cc_canvas outlives every engine call.
-    let metricsBox = CanvasBox(RecordingCanvas())
+    // Layout-time text measurement routes through `metricsCanvas`, exactly
+    // like --strip's demo path: real CoreText metrics by default (Plan 4a
+    // Task 4), or the deterministic fake RecordingCanvas table under
+    // --fake-metrics. Held for the whole render so its cc_canvas outlives
+    // every engine call.
+    let metricsBox = CanvasBox(metricsCanvas)
     cc_set_metrics_canvas(metricsBox.handle)
 
     try withExtendedLifetime(metricsBox) {
