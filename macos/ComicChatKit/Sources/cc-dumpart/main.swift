@@ -14,6 +14,36 @@ import ComicChatKit
 // cc-dumpart --strip <out.png> — renders a built-in demo comic strip (two
 // comicart avatars, a 4-line conversation) through CGCanvas and writes it as a
 // PNG. The Plan 2 exit-milestone demo.
+//
+// cc-dumpart --script <conversation.json> <out.png> — renders a user-authored
+// JSON conversation to a comic-strip PNG. See StripScript.swift (ComicChatKit)
+// for the JSON schema (also printed by scriptUsage() below) and the
+// decode/validate/render pipeline; this file is a thin CLI shell around it.
+
+let scriptUsage = """
+usage: cc-dumpart --script <conversation.json> <out.png>
+
+JSON schema:
+{
+  "backdrop": "field.bgb",
+  "participants": [
+    {"nick": "Anna", "avatar": "anna.avb"},
+    {"nick": "Armando", "avatar": "armando.avb"}
+  ],
+  "lines": [
+    {"speaker": "Anna", "text": "Hello there!", "mode": "say", "to": ["Armando"]},
+    {"speaker": "Armando", "text": "Hmm, who is this?", "mode": "think"},
+    {"speaker": "Anna", "text": "psst... it's me", "mode": "whisper", "to": ["Armando"]}
+  ]
+}
+
+- "backdrop" is optional (omit for no backdrop).
+- "mode" is optional, default "say"; one of: say, think, whisper, action.
+- "to" is optional, default []; entries must be declared participant nicks.
+- "avatar"/"backdrop": an absolute path is used as-is; a bare name (e.g.
+  "anna.avb") is resolved against the bundled comicart directory. The file
+  extension is required -- it is never appended automatically.
+"""
 
 let args = CommandLine.arguments
 
@@ -39,11 +69,18 @@ do {
             exit(64) // EX_USAGE
         }
         try renderDemoStrip(toPath: args[2])
+    } else if args.count >= 2 && args[1] == "--script" {
+        guard args.count == 4 else {
+            FileHandle.standardError.write(Data((scriptUsage + "\n").utf8))
+            exit(64) // EX_USAGE
+        }
+        try runScriptMode(jsonPath: args[2], outPath: args[3])
     } else {
         guard args.count > 1 else {
             FileHandle.standardError.write(Data("usage: cc-dumpart <art-dir>\n".utf8))
             FileHandle.standardError.write(Data("       cc-dumpart --png <file.avb> <poseIndex> <out.png>\n".utf8))
             FileHandle.standardError.write(Data("       cc-dumpart --strip <out.png>\n".utf8))
+            FileHandle.standardError.write(Data("       cc-dumpart --script <conversation.json> <out.png>\n".utf8))
             exit(64) // EX_USAGE
         }
         let artDir = args[1]
@@ -55,6 +92,8 @@ do {
         FileHandle.standardOutput.write(Data("\n".utf8))
     }
 } catch {
+    // StripScript.ScriptError's CustomStringConvertible description (and
+    // every other thrown error here) prints as a friendly, specific message.
     FileHandle.standardError.write(Data("cc-dumpart: \(error)\n".utf8))
     exit(1)
 }
