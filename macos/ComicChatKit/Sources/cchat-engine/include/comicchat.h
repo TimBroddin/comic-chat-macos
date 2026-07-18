@@ -326,6 +326,17 @@ typedef struct cc_session_config {
     cc_resolve_user_fn  resolve_user;
     const char*         local_host;    /* value gethostname would have returned; may be NULL */
     int32_t             encoding;      /* 0 = CP-1252 (default), 1 = UTF-8 (per spec §4.5) */
+    /* Plan 4a Task 2: login identity fields for cc_session_login (the lifted
+     * HrIrcLogin's szUserName/szRealName -- ircsock.cpp:596-668, never ported
+     * as wire-emitting code; see cc_session_login's doc comment). Both
+     * nullable -- cc_session_login falls back to the own_nick resolver's
+     * value for either when NULL/empty, matching HrIrcLogin's own
+     * `if (szUserName == NULL) szUserName = GetMyUserName()`-style fallback
+     * (this port has no GetMyUserName/GetMyRealName equivalent, so the
+     * fallback is the nick itself, the same "at least send something valid"
+     * posture). Appended after encoding -- append-only, R9-style. */
+    const char*         own_user;      /* USER command's <user> field; NULL -> own_nick */
+    const char*         own_realname;  /* USER command's <realname> field; NULL -> own_nick */
 } cc_session_config;
 
 cc_session* cc_session_create(const cc_session_config* cfg);   /* NULL on bad cfg */
@@ -500,6 +511,28 @@ int32_t cc_session_list(cc_session* s, const char* query /*nullable, "LIST"/"LIS
  * happens first (HrModeIsIrcXFailure's original disambiguation, ircsock.cpp:
  * 560 -- Task 5b's job once the reply handlers exist). */
 int32_t cc_session_probe_ircx(cc_session* s);
+
+/* Plan 4a Task 2: the plain-IRC login (NICK/USER), Swift-driven equivalent of
+ * the lifted-but-never-wire-emitting HrIrcLogin (v2.5-beta-1-modern/
+ * ircsock.cpp:596-668; the port's ircsock.cpp kept HrModeIsIrcXFailure's
+ * *trigger* -- dequeue the probe cell, cancel the timer -- but explicitly
+ * deferred the PASS/NICK/USER emission itself to this task, see that
+ * function's header comment at ircsock.cpp:476-501). Sends "NICK <nick>\r\n"
+ * (via CIrcProto::ChatChangeNick, same builder cc_session_change_nick uses)
+ * then, if not already registered this connection, "USER <user> <host> . :
+ * <realname>\r\n" (cfg.own_user/own_realname, falling back to the own_nick
+ * resolver's value for either if NULL/empty -- HrIrcLogin's own fallback
+ * posture) -- byte-for-byte the original's sprintf grammar (verified against
+ * the real 1998 capture's client c2s line, smoke-2.jsonl: "USER Anonymous
+ * Tims-Mac . :Your Full Name\r\n"). No PASS support (cc_session_config has no
+ * password field; every login this port drives is anonymous/no-auth, R21).
+ * Callers: the probe's 451 fallback, the probe timeout, and the IRCX
+ * second-800 pivot (see ProtocolSession's sendLoginIfNeeded). Idempotent
+ * within one connection for the USER half (sock.m_bRegistered guards it,
+ * exactly like the original); NICK is resent every call (harmless -- a
+ * server-side no-op if unchanged, and this function is only ever called
+ * once per session by its Swift caller, guarded by a one-shot flag there). */
+int32_t cc_session_login(cc_session* s);
 
 #ifdef __cplusplus
 }

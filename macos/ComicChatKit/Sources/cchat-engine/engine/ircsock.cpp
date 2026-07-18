@@ -1814,11 +1814,36 @@ static void ccHandleResultCode(CCSession& sess, char *szLine, PIRCPARSE pParse)
 					// dropped; emit CC_EV_AUTH_UNSUPPORTED if the server does not
 					// allow anonymous (else Swift does plain NICK/USER). We emit
 					// the caps-confirmed marker via AUTH_UNSUPPORTED only when
-					// anon is not allowed; otherwise nothing (Swift logs in anon).
+					// anon is not allowed.
+					//
+					// Plan 4a Task 2 amendment (R18): when anon IS allowed this
+					// branch used to emit nothing at all ("Swift logs in anon"),
+					// but the original's HrIrcXLogin fell straight through to
+					// HrIrcLogin in the SAME call frame (ircsock.cpp:679-680,
+					// v2.5-beta-1-modern) -- this port's split engine/bridge
+					// architecture has no such frame to fall through on, so
+					// "nothing" left Swift with no observable signal that the
+					// second 800 had arrived (verified live-server sequence,
+					// docs/superpowers/plans/2026-07-18-plan4-discovery/
+					// live-interop.md: "IRCX -> second 800 * 1 ...; plain
+					// NICK/USER -> 001" -- the second 800 IS the login gate).
+					// Re-emitting CC_EV_SERVER_CAPS here (same R18 pattern as
+					// every other lifted-parse call site in this file) gives
+					// ProtocolSession a same-shaped, already-existing event to
+					// edge-trigger cc_session_login from -- no new event type,
+					// no comicchat.h union change. See ProtocolSession.swift's
+					// `.serverCaps` case (a second occurrence, after the first
+					// armed `sawServerCaps`, fires `sendLoginIfNeeded()`).
 					if (!sock.m_bAnonAllowed) {
 						cc_proto_event ev; memset(&ev, 0, sizeof(ev));
 						ev.type = CC_EV_AUTH_UNSUPPORTED;
 						ev.u.auth_unsupported.dummy = 1;
+						ccEmitProtoEvent(&ev);
+					} else {
+						cc_proto_event ev; memset(&ev, 0, sizeof(ev));
+						ev.type = CC_EV_SERVER_CAPS;
+						ev.u.server_caps.ircx = 1;
+						ev.u.server_caps.max_msg_len = sock.m_nMaxMsgLength;
 						ccEmitProtoEvent(&ev);
 					}
 				}

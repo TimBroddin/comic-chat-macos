@@ -318,10 +318,100 @@ int32_t cc_session_probe_ircx(cc_session* h) {
     if (!s) return 1;
     g_session = s;
     BOOL ok = s->proto.bExecuteQuery(qpIsIrcX, ctModeIsIrcX, dtMax, nullptr, "", "");
+    // Plan 4a Task 2 fix: the original's OnConnect (v2.5-beta-1-modern/
+    // ircsock.cpp:1049-1052) does THREE things when it sends the probe --
+    // bExecuteQuery(...), m_bJustSentModeIsIrcX = TRUE, and SetTimer -- but
+    // this port's OnConnect equivalent was never lifted (connection-
+    // establishment flow; this function stood in for its first and third
+    // side effects only, per this function's own comicchat.h doc comment).
+    // The middle one was missed: without it, ccModeIsIrcXFailure's own guard
+    // (`if (!sess.sock.m_bJustSentModeIsIrcX) return;`, ircsock.cpp:488) always
+    // early-returns, so the 451/ERROR-during-probe fallback never dequeues
+    // the probe query or cancels the timer -- silently defeating the whole
+    // point of the fast-path fallback (discovered via LoginSequencingTests'
+    // plainIrcFallback scenario: NICK/USER only arrived via the timer's own
+    // timeout, never via the immediate 451 reaction, until this fix).
+    if (ok) {
+        s->sock.m_bJustSentModeIsIrcX = TRUE;
+    }
     if (ok && s->cfg.set_timer) {
         s->cfg.set_timer(s->cfg.user_data, CC_TIMER_ISIRCX_PROBE, 50000);
     }
     g_session = nullptr;
+    return ok ? 0 : 1;
+}
+
+// --- cc_session_login: the plain-IRC login (NICK/USER) -- see comicchat.h's
+// doc comment for why this is a fresh implementation rather than a call into
+// a lifted HrIrcLogin (that function's wire-emitting body was never ported;
+// only its trigger, HrModeIsIrcXFailure/ccModeIsIrcXFailure, was). Mirrors
+// HrIrcLogin's exact sequence (v2.5-beta-1-modern/ircsock.cpp:596-668):
+// ChatChangeNick(nick) [sends "NICK <nick>\r\n", the same builder
+// cc_session_change_nick uses] then, once per connection
+// (sock.m_bRegistered guards it exactly like the original's own
+// `if (!m_bRegistered)`), "USER <user> <host> . :<realname>\r\n" sprintf'd
+// directly into sock.m_szOutput2 (the same scratch buffer every other
+// ircproto.cpp builder uses, sized to m_nMaxMsgLength+1 -- comfortably large
+// for nick/user/host/realname) and sent via ccSessionSendRaw (the one
+// outbound choke point, same as CIrcProto::SendMessageText). No PASS support
+// -- cc_session_config carries no password field; every login this port
+// drives is anonymous/no-auth (R21).
+//
+// Field-order/spacing verified byte-for-byte against the real 1998 capture's
+// client c2s line (Tests/ComicChatKitTests/Fixtures/captures/smoke-2.jsonl):
+// "USER Anonymous Tims-Mac . :Your Full Name\r\n" -- <user> <machinename> . :<realname>.
+//
+// Identity fallback: cfg.own_user/own_realname are nullable; when NULL or
+// empty, both fall back to the own_nick resolver's value (HrIrcLogin's own
+// `if (szUserName == NULL) szUserName = GetMyUserName()` fallback posture --
+// this port has no GetMyUserName/GetMyRealName equivalent, so "the nick
+// itself" is the honest substitute, matching cc_session_get_own_identity's
+// existing "best information currently available" precedent above). The
+// original's space-stripping loop (:611-626, DBCS-aware) is not reproduced:
+// this port's permanent single-byte CP-1252 posture (Plan 3 Task 2) means
+// every byte is already independently addressable, and Swift-side nicks are
+// expected to already be valid (no spaces) -- a caller that supplies a
+// space-containing own_user gets it sent verbatim rather than silently
+// mangled, which is easier to diagnose than a silent DBCS-shaped rewrite.
+//
+// REENTRANCY (the reason this function saves/restores g_session instead of
+// the usual set-on-entry/null-on-exit every other cc_session_* uses):
+// Task 2's Swift caller (ProtocolSession.sendLoginIfNeeded) fires this from
+// INSIDE the on_event callback for the IRCX second-800 pivot -- i.e. while
+// cc_session_feed_bytes's own g_session-active frame is still on the C call
+// stack (ccOnReceiveBytes -> ccHandleCommand -> ccEmitProtoEvent -> Swift's
+// on_event -> sendLoginIfNeeded -> cc_session_login, all synchronous, same
+// thread). Every other cc_session_* entry point is only ever called from
+// OUTSIDE any such frame (a fresh Swift call, or a selftest), so
+// unconditionally nulling g_session on exit was always safe for them; here
+// it would clear the STILL-ACTIVE outer frame's session pointer out from
+// under it, so the parser's next ccSession() call (back in ircsock.cpp,
+// after this function returns) would ASSERT(g_session) and crash -- caught
+// by cc_selftest_pv_ircx_caps-shaped exercise via LoginSequencingTests'
+// ircxPivot scenario. Saving/restoring the PREVIOUS value (nullptr in the
+// common non-reentrant case, `s` in the reentrant one) is correct for both.
+int32_t cc_session_login(cc_session* h) {
+    CCSession* s = reinterpret_cast<CCSession*>(h);
+    if (!s) return 1;
+    CCSession* prevSession = g_session;
+    g_session = s;
+
+    const char* nick = ccSessionOwnNick();
+    if (!nick || !*nick) { g_session = prevSession; return 1; }
+
+    BOOL ok = s->proto.ChatChangeNick(nick);
+
+    if (ok && !s->sock.m_bRegistered) {
+        const char* user = (s->cfg.own_user && *s->cfg.own_user) ? s->cfg.own_user : nick;
+        const char* realname = (s->cfg.own_realname && *s->cfg.own_realname) ? s->cfg.own_realname : nick;
+        const char* host = (s->cfg.local_host && *s->cfg.local_host) ? s->cfg.local_host : "localhost";
+        snprintf(s->sock.m_szOutput2, s->sock.m_nMaxMsgLength + 1,
+                 "USER %s %s . :%s\r\n", user, host, realname);
+        ccSessionSendRaw(s->sock.m_szOutput2, strlen(s->sock.m_szOutput2));
+        s->sock.m_bRegistered = TRUE;
+    }
+
+    g_session = prevSession;
     return ok ? 0 : 1;
 }
 

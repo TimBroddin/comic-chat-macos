@@ -86,6 +86,18 @@ public final class ProtocolSession: @unchecked Sendable {
     public let requestedNick: String
     public let encoding: WireEncoding
 
+    /// Upper bound (milliseconds) on the engine's requested ISIRCX-probe
+    /// timeout (Plan 4a Task 2). The engine always asks for the original's
+    /// 50s (`cc_session_probe_ircx`'s `cfg.set_timer(..., 50000)` call,
+    /// matching the 1998 client's `ID_ISIRCXTIMEOUT`) -- this property lets
+    /// Swift schedule a SHORTER wait instead (`min(requested, probeTimeoutMs)`
+    /// in `setTimer(id:ms:)` below), so a dead-air/non-responding server
+    /// doesn't hang a real session (or a test) for the full 50 seconds.
+    /// Default 5000ms; set before `connect()` to change it (read only from
+    /// `sessionQueue` internally, but safe to set from any thread before the
+    /// first `connect()` call since nothing reads it until then).
+    public var probeTimeoutMs: Int32 = 5000
+
     // MARK: Engine-owned state (mutated ONLY on sessionQueue)
 
     private var cSession: OpaquePointer?
@@ -106,6 +118,25 @@ public final class ProtocolSession: @unchecked Sendable {
     private var rooms: [String: RoomState] = [:]          // channel -> state
     private var roomTokenToChannel: [UInt32: String] = [:]
     private var connectionStatus: ConnectionStatus = .disconnected
+
+    // MARK: Login sequencing (Plan 4a Task 2 -- probe -> 451/800-pivot/timeout -> NICK/USER)
+
+    /// `true` from `onSocketReady()` (the probe was sent) until the plain
+    /// login fires; guards the `cCancelTimer` trampoline's login trigger so
+    /// it only fires the probe's own cancel (the 451 fallback), never an
+    /// unrelated future `cancel_timer` call the engine might make for some
+    /// other reason.
+    private var probing = false
+    /// One-shot guard: `sendLoginIfNeeded()` fires from up to three race-y
+    /// triggers (451-cancel, timer-fire fallback, IRCX second-800) and must
+    /// send NICK/USER exactly once.
+    private var loginSent = false
+    /// `true` once the FIRST `CC_EV_SERVER_CAPS` (the 800 pivot's state-0
+    /// reply) has been observed. A SECOND `.serverCaps` arriving after that
+    /// is the second-800 edge-trigger (see `sendLoginIfNeeded`'s doc comment,
+    /// trigger 3) -- distinguishes "first 800, switch to IRCX" from "second
+    /// 800, log in" without needing a new event type on the C side.
+    private var sawServerCaps = false
 
     /// Per-user handle table for the `resolve_user` C resolver (R19): a
     /// stable, session-lifetime-unique `cc_user_ref` per (nick) — the engine
@@ -234,6 +265,47 @@ public final class ProtocolSession: @unchecked Sendable {
 
         cSession = withUnsafePointer(to: cfg) { cc_session_create($0) }
         receiveLoop()
+
+        // Plan 4a Task 2: probe for IRCX before doing anything else -- every
+        // session now sends "MODE ISIRCX" as its first outbound line (D4 §2's
+        // hard prerequisite this task fixes: no code anywhere sent NICK/USER
+        // before this). `probing = true` arms the 451-fallback/timeout login
+        // triggers below; the engine itself requests the probe timer via
+        // cfg.set_timer (capped by probeTimeoutMs in setTimer(id:ms:)).
+        if let s = cSession {
+            probing = true
+            _ = cc_session_probe_ircx(s)
+        }
+    }
+
+    /// Sends the plain-IRC login (NICK/USER) exactly once, guarded by
+    /// `loginSent`. Called (on `sessionQueue`) from all three triggers the
+    /// engine can produce (Plan 4a Task 2 Step 1's findings):
+    ///   1. the 451 (ERR_NOTREGISTERED) fallback -- the engine's
+    ///      `ccModeIsIrcXFailure` cancels the probe timer via
+    ///      `cfg.cancel_timer`, observed in the `cCancelTimer` trampoline
+    ///      while `probing` is still true.
+    ///   2. the probe TIMEOUT -- `cc_session_fire_timer` runs
+    ///      `ccModeIsIrcXFailure` the same way if the server never answers.
+    ///   3. the IRCX PIVOT's second `800` reply -- Step 1 found the lifted
+    ///      800-handler's anon-allowed branch emits NOTHING today (a gap:
+    ///      the original's `HrIrcXLogin` fell straight through to
+    ///      `HrIrcLogin` in the same call frame, which this port's split
+    ///      engine/bridge architecture can't do without an explicit event).
+    ///      This task closes that gap the same way every other lifted-parse
+    ///      site does (R18): the second 800's anon-allowed branch now
+    ///      re-emits `CC_EV_SERVER_CAPS` (ircsock.cpp's RPL_IRCX handler,
+    ///      see that file's comment) purely as an edge-trigger -- so
+    ///      `.serverCaps` arriving a SECOND time (after `probing` was
+    ///      already cleared by the first one, below) is what fires login
+    ///      here instead of a distinct event type.
+    private func sendLoginIfNeeded() {
+        guard !loginSent, let s = cSession else { return }
+        loginSent = true
+        probing = false
+        timerSource?.cancel()
+        timerSource = nil
+        _ = cc_session_login(s)
     }
 
     private func receiveLoop() {
@@ -541,11 +613,27 @@ public final class ProtocolSession: @unchecked Sendable {
     /// `set_timer` call for the same id replaces any existing one.
     private func setTimer(id: Int32, ms: Int32) {
         timerSource?.cancel()
+        // Plan 4a Task 2: the ISIRCX probe requests the original's 50s
+        // (CC_TIMER_ISIRCX_PROBE, cc_session_probe_ircx); cap it at
+        // `probeTimeoutMs` so a non-responding server doesn't hang the
+        // login sequence (or a test) for the full 50 seconds. Any other
+        // future timer id is scheduled as requested, uncapped.
+        let effectiveMs = (id == CC_TIMER_ISIRCX_PROBE) ? min(ms, probeTimeoutMs) : ms
         let src = DispatchSource.makeTimerSource(queue: sessionQueue)
-        src.schedule(deadline: .now() + .milliseconds(Int(ms)))
+        src.schedule(deadline: .now() + .milliseconds(Int(effectiveMs)))
         src.setEventHandler { [weak self] in
             guard let self, let s = self.cSession else { return }
             cc_session_fire_timer(s, id)
+            // Plan 4a Task 2 trigger 2: the probe timeout. cc_session_fire_timer
+            // runs the engine's ccFireIsIrcXTimeout -> ccModeIsIrcXFailure,
+            // which (like the 451 path) cancels this very timer via
+            // cfg.cancel_timer -- see the cCancelTimer trampoline for trigger
+            // 1. Both paths converge on sendLoginIfNeeded's one-shot guard,
+            // so calling it again here (belt-and-suspenders, in case a
+            // future engine change stops cancelling on timeout) is harmless.
+            if id == CC_TIMER_ISIRCX_PROBE, self.probing {
+                self.sendLoginIfNeeded()
+            }
         }
         timerSource = src
         src.resume()
@@ -554,6 +642,14 @@ public final class ProtocolSession: @unchecked Sendable {
     private func cancelTimer(id: Int32) {
         timerSource?.cancel()
         timerSource = nil
+        // Plan 4a Task 2 trigger 1: the 451 (ERR_NOTREGISTERED) fallback.
+        // The engine's ccModeIsIrcXFailure cancels the probe timer the
+        // moment it decides plain-IRC login is needed (dequeuing the probe
+        // query first) -- `probing` distinguishes this from any unrelated
+        // future cancel_timer call.
+        if id == CC_TIMER_ISIRCX_PROBE, probing {
+            sendLoginIfNeeded()
+        }
     }
 
     // MARK: send (-> NWConnection)
@@ -644,6 +740,22 @@ public final class ProtocolSession: @unchecked Sendable {
             _ownNick = nick
             refillOwnNickBuffer()
             connectionStatus = .connected
+
+        case .serverCaps:
+            // Plan 4a Task 2 trigger 3 (the IRCX pivot): the FIRST
+            // CC_EV_SERVER_CAPS is the 800 state-0 reply -- the engine has
+            // already sent "IRCX" itself (ircsock.cpp's RPL_IRCX handler,
+            // unconditional on the parse side); no login yet. A SECOND
+            // occurrence is this task's edge-trigger for the 800 state-1
+            // reply (see `sendLoginIfNeeded`'s doc comment) -- anon-allowed
+            // login proceeds now, matching the verified real-server sequence
+            // (docs/superpowers/plans/2026-07-18-plan4-discovery/
+            // live-interop.md: "IRCX -> second 800 * 1 ...; plain NICK/USER").
+            if sawServerCaps {
+                sendLoginIfNeeded()
+            } else {
+                sawServerCaps = true
+            }
 
         case .nickChanged(let oldNick, let newNick, let isSelf):
             if isSelf {

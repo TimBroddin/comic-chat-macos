@@ -3394,6 +3394,36 @@ static int cc_selftest_outbound_join_say() {
     return 0;
 }
 
+// --- cc_session_login selftest (Plan 4a Task 2 Step 2): the plain-IRC login
+// (NICK/USER) that the lifted HrIrcLogin never got as wire-emitting code (see
+// cc_session_login's comicchat.h doc comment). Verifies the exact byte shape
+// against the real 1998 capture's client c2s line (Tests/ComicChatKitTests/
+// Fixtures/captures/smoke-2.jsonl: "NICK Anonymous\r\nUSER Anonymous Tims-Mac
+// . :Your Full Name\r\n"), substituting this test's own config values.
+static int cc_selftest_session_login() {
+    CCOutboundCap cap;
+    cc_session_config cfg = {};
+    cfg.user_data = &cap;
+    cfg.send = ccOutboundCapSend;
+    cfg.own_nick = ccOutboundOwnNick;   // "Anon" -- resolver ProtocolSession would provide
+    cfg.own_user = "Anonymous";
+    cfg.own_realname = "Anonymous";
+    cfg.local_host = "testhost";
+    cc_session* s = cc_session_create(&cfg);
+    CC_CHECK(s != nullptr);
+    if (!s) return g_failures;
+
+    CC_CHECK(cc_session_login(s) == 0);
+    CC_CHECK(cap.sent.find("NICK Anon\r\n") != std::string::npos);
+    CC_CHECK(cap.sent.find("USER Anonymous testhost . :Anonymous\r\n") != std::string::npos);
+    // NICK must precede USER (field order matches HrIrcLogin's own
+    // ChatChangeNick-then-USER-sprintf sequence, ircsock.cpp:644-654).
+    CC_CHECK(cap.sent.find("NICK Anon\r\n") < cap.sent.find("USER Anonymous testhost . :Anonymous\r\n"));
+
+    cc_session_destroy(s);
+    return 0;
+}
+
 // --- ISIRCX probe timer-request selftest (Plan 3 Task 4 brief: "the MODE
 // ISIRCX path requests the 50s timer via cfg.set_timer(CC_TIMER_ISIRCX_PROBE,
 // 50000)"). Verifies both the wire bytes AND that the timer request reaches
@@ -3422,6 +3452,48 @@ static int cc_selftest_outbound_ircx_probe_timer() {
     CC_CHECK(cap.timerCalls == 1);
     CC_CHECK(cap.timerId == CC_TIMER_ISIRCX_PROBE);
     CC_CHECK(cap.timerMs == 50000);
+
+    cc_session_destroy(s);
+    return 0;
+}
+
+// --- ISIRCX probe 451-fallback selftest (Plan 4a Task 2 fix): the original's
+// OnConnect (v2.5-beta-1-modern/ircsock.cpp:1049-1052) sets
+// m_bJustSentModeIsIrcX = TRUE right after sending the probe -- a THIRD side
+// effect this port's cc_session_probe_ircx initially missed (it only carried
+// the bExecuteQuery send + the set_timer request). Without it,
+// ccModeIsIrcXFailure's own guard (`if (!m_bJustSentModeIsIrcX) return;`)
+// always early-returned, so an ERR_NOTREGISTERED (451) reply -- the whole
+// point of probing -- never dequeued the probe query or cancelled the timer
+// (caught via LoginSequencingTests' plainIrcFallback scenario: NICK/USER only
+// ever arrived via the timer's OWN timeout, never via the immediate 451
+// reaction). This selftest locks in the fix at the C layer.
+static int cc_selftest_probe_451_cancels_timer() {
+    CCIrcxProbeCap cap;
+    cc_session_config cfg = {};
+    cfg.user_data = &cap;
+    cfg.send = [](void* ud, const uint8_t* d, size_t n) {
+        static_cast<CCIrcxProbeCap*>(ud)->sent.append((const char*)d, n);
+    };
+    cfg.set_timer = [](void* ud, int32_t id, int32_t ms) {
+        CCIrcxProbeCap* c = static_cast<CCIrcxProbeCap*>(ud);
+        c->timerId = id; c->timerMs = ms; c->timerCalls++;
+    };
+    static int s_cancelId; static int s_cancelCalls;
+    s_cancelId = -1; s_cancelCalls = 0;
+    cfg.cancel_timer = [](void*, int32_t id) { s_cancelId = id; s_cancelCalls++; };
+    cfg.own_nick = ccOutboundOwnNick;
+
+    cc_session* s = cc_session_create(&cfg);
+    CC_CHECK(s != nullptr);
+    if (!s) return g_failures;
+
+    CC_CHECK(cc_session_probe_ircx(s) == 0);
+    CC_CHECK(cap.timerCalls == 1);
+
+    const char* wire = ":srv 451 * :not registered\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    CC_CHECK(s_cancelCalls == 1 && s_cancelId == CC_TIMER_ISIRCX_PROBE);
 
     cc_session_destroy(s);
     return 0;
@@ -4237,6 +4309,49 @@ static int cc_selftest_pv_ircx_caps() {
     return 0;
 }
 
+// VECTOR 12b (Plan 4a Task 2 amendment): the SECOND 800 (state 1), anon
+// allowed -- the login gate this task added (see ircsock.cpp's RPL_IRCX
+// handler comment). Confirms a SECOND CC_EV_SERVER_CAPS is emitted (the
+// edge-trigger ProtocolSession.sendLoginIfNeeded relies on) and that the
+// anon-NOT-allowed sibling path (CC_EV_AUTH_UNSUPPORTED) is unaffected.
+static int cc_selftest_pv_ircx_second_800_anon_allowed() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    // The 800 handler only recognizes a reply if the ctModeIsIrcX/ctIrcX
+    // query is pending (FindQuery); the probe registers it (same setup
+    // cc_selftest_pv_ircx_caps uses for the first 800).
+    CC_CHECK(cc_session_probe_ircx(s) == 0);
+    cap.sent.clear();
+    const char* wire =
+        ":srv 800 * 0 0 ANON 512 *\r\n"
+        ":srv 800 * 1 0 ANON 512 *\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int first = pvFind(cap, CC_EV_SERVER_CAPS);
+    CC_CHECK(first >= 0);
+    int second = pvFind(cap, CC_EV_SERVER_CAPS, first + 1);
+    CC_CHECK(second >= 0 && cap.a[second] == "1" && cap.b[second] == "512");
+    CC_CHECK(pvFind(cap, CC_EV_AUTH_UNSUPPORTED) < 0);
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 12c: the SECOND 800, anon NOT allowed -- CC_EV_AUTH_UNSUPPORTED
+// (unchanged sibling path), NOT a second CC_EV_SERVER_CAPS.
+static int cc_selftest_pv_ircx_second_800_anon_disallowed() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    CC_CHECK(cc_session_probe_ircx(s) == 0);
+    cap.sent.clear();
+    const char* wire =
+        ":srv 800 * 0 0 NTLM 512 *\r\n"
+        ":srv 800 * 1 0 NTLM 512 *\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int first = pvFind(cap, CC_EV_SERVER_CAPS);
+    CC_CHECK(first >= 0);
+    CC_CHECK(pvFind(cap, CC_EV_SERVER_CAPS, first + 1) < 0);
+    CC_CHECK(pvFind(cap, CC_EV_AUTH_UNSUPPORTED) >= 0);
+    cc_session_destroy(s);
+    return 0;
+}
+
 // VECTOR 13: PART/QUIT membership (HandleCommand cmdidPart :1668, cmdidQuit
 // :1760). Bob parts (other -> CC_EV_USER_PARTED), Carl quits (-> CC_EV_USER_QUIT),
 // then we ourselves part (-> CC_EV_SELF_PARTED).
@@ -4504,7 +4619,9 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_keystring();                   // Plan 3 Task 3: PROP CLIENT key-string codec
     cc_selftest_query_correlation();            // Plan 3 Task 4: CCQuery/CQueryPtrList
     cc_selftest_outbound_join_say();            // Plan 3 Task 4: outbound byte-compare
+    cc_selftest_session_login();                // Plan 4a Task 2: NICK/USER (cc_session_login)
     cc_selftest_outbound_ircx_probe_timer();    // Plan 3 Task 4: MODE ISIRCX + timer request
+    cc_selftest_probe_451_cancels_timer();      // Plan 4a Task 2 fix: m_bJustSentModeIsIrcX side effect
     cc_selftest_outbound_say_chunking();        // Plan 3 Task 4: bChatSendToTarget multi-chunk path
     cc_selftest_event_union();                  // Plan 3 Task 5a: cc_proto_event union completeness
     cc_selftest_parse_join_privmsg();           // Plan 3 Task 5b: parse-vector event stream
@@ -4521,6 +4638,8 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_pv_nick_collision();            // 433 nick-rejected
     cc_selftest_pv_fatal_error();               // fatal ERROR -> disconnected-hint
     cc_selftest_pv_ircx_caps();                 // 800 IRCX caps + probe-timer cancel
+    cc_selftest_pv_ircx_second_800_anon_allowed();     // Plan 4a Task 2: second 800 -> 2nd CC_EV_SERVER_CAPS
+    cc_selftest_pv_ircx_second_800_anon_disallowed();  // Plan 4a Task 2: second 800, anon disallowed -> unaffected
     cc_selftest_pv_part_quit();                 // PART/QUIT/self-PART
     cc_selftest_pv_names();                     // 353/366 NAMES
     // Plan 3 Task 6: payload stage (ProcessSay/ProcessComment/CTCP dispatch)
