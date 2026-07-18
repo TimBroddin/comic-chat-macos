@@ -4037,26 +4037,48 @@ static int cc_selftest_pv_channel_mode_delta() {
 
 // VECTOR 5: IRCX DATA CCUDI1 out-of-band annotation (HandleCommand cmdidData,
 // ircsock.cpp:1275-1323) vs the inline plain-IRC form. Both carry the same
-// "#G295E193M1" block. Hand-trace:
-//   * DATA line -> CC_EV_DATA(nick=Bob, annotations.mode=1, gesture_pose=2...)
-//   * inline PRIVMSG "(#G295E193M1) hi" -> CC_EV_TEXT(text="hi", has_annotations=1)
-// This freezes the two-transport decode (state-and-codec §3.3): IndexToByte
-// packs value+'0', so '2'=index 2, '9'=index 9, '5'=index 5, etc.
+// "#G295E193M1" block.
+//
+// REVIEW FIX (Plan 3 Task 6, fix round 1): this test previously paired the
+// DATA line with a PRIVMSG that ALSO carried a redundant inline "(#...)"
+// block -- so the paired PRIVMSG's has_annotations came from the INLINE
+// block, not from any DATA-line pairing, which masked the fact that
+// engine-side DATA-to-PRIVMSG pairing does not happen at all. It does not:
+// OnTextMsg and OnDataMsg (protsupp.cpp) each construct their OWN fresh
+// stack-local `CUserInfo pui;` scratch object per call (never a shared,
+// persistent per-nick CUserInfo), so a DATA line's decoded m_udi can never
+// survive to be read by a later, separate PRIVMSG call -- there is no engine
+// state for it to survive IN. This is the CORRECT, intentional design (the
+// plan was amended so DATA->PRIVMSG re-pairing by nick is Task 7's (Swift's)
+// job, once it owns a real per-nick user table); this test now asserts that
+// real engine contract instead of accidentally hiding it:
+//   * DATA line -> CC_EV_DATA(nick=Bob, annotations decoded from the blob)
+//   * the FOLLOWING PLAIN PRIVMSG (no inline block) from the SAME nick ->
+//     CC_EV_TEXT(text="hi", has_annotations=0) -- the engine does NOT
+//     auto-attach the preceding DATA blob to it.
+// A separate, self-contained case below freezes the OTHER (unaffected)
+// contract: a plain-IRC INLINE "(#...)" PRIVMSG is self-describing per
+// message and DOES emit has_annotations=1 on its own -- that path never
+// depended on any cross-message state and is untouched by this fix.
+// IndexToByte packs value+'0', so '2'=index 2, '9'=index 9, '5'=index 5, etc.
 static int cc_selftest_pv_data_vs_inline() {
     PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
     // full-capture on_event to inspect annotation fields
-    struct DCap { cc_annotations dataAnn{}; int haveData=0; cc_annotations textAnn{}; int haveText=0; std::string textBody; } dc;
+    struct DCap { cc_annotations dataAnn{}; int haveData=0; cc_annotations textAnn{}; int haveText=0; int textHasAnn=-1; std::string textBody; } dc;
     cfg.user_data = &dc;
     cfg.on_event = [](void* ud, const cc_proto_event* ev){
         DCap* c = static_cast<DCap*>(ud);
         if (ev->type==CC_EV_DATA){ c->dataAnn = ev->u.data.annotations; c->haveData=1; }
-        if (ev->type==CC_EV_TEXT){ c->textAnn = ev->u.text.annotations; c->haveText = ev->u.text.has_annotations; c->textBody = ev->u.text.text; }
+        if (ev->type==CC_EV_TEXT){ c->textAnn = ev->u.text.annotations; c->haveText = 1; c->textHasAnn = ev->u.text.has_annotations; c->textBody = ev->u.text.text; }
     };
     cc_session_destroy(s);
     s = cc_session_create(&cfg);
+    // DATA line (out-of-band IRCX annotation blob), then a PLAIN PRIVMSG (NO
+    // inline "(#...)" block) from the same nick Bob -- freezes the engine's
+    // stateless contract: no in-engine DATA->PRIVMSG pairing.
     const char* wire =
         ":Bob!bob@h DATA #comicrig CCUDI1 :#G295E193M1\r\n"          // IRCX out-of-band
-        ":Bob!bob@h PRIVMSG #comicrig :(#G295E193M1) hi\r\n";        // plain-IRC inline
+        ":Bob!bob@h PRIVMSG #comicrig :hi\r\n";                       // plain, NO inline block
     cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
     // DATA decode: #G <2><9><5> E <1><9><3> M <1>. IndexToByte(v)=v+'0', so
     // ByteToIndex('2')=2, ('9')=9, ('5')=5, ('1')=1, ('3')=3.
@@ -4064,8 +4086,21 @@ static int cc_selftest_pv_data_vs_inline() {
     CC_CHECK(dc.dataAnn.gesture_pose == 2 && dc.dataAnn.gesture_emotion == 9 && dc.dataAnn.gesture_intensity == 5);
     CC_CHECK(dc.dataAnn.face_pose == 1 && dc.dataAnn.face_emotion == 9 && dc.dataAnn.face_intensity == 3);
     CC_CHECK(dc.dataAnn.mode == 1 && dc.dataAnn.cooked == 1);
-    // inline decode: same block, text after ") " is "hi".
+    // Plain PRIVMSG decode: engine does NOT pair the preceding DATA blob --
+    // has_annotations must be 0 (Task 7/Swift owns cross-message re-pairing
+    // by nick; this test freezes the engine boundary, not a weaker one).
     CC_CHECK(dc.haveText == 1 && dc.textBody == "hi");
+    CC_CHECK(dc.textHasAnn == 0);
+
+    // Separate case: plain-IRC INLINE "(#...)" PRIVMSG IS self-contained
+    // per-message and DOES emit has_annotations=1 -- unaffected by the fix
+    // above, frozen here so both contracts are covered by this vector.
+    dc = DCap{};
+    const char* wireInline =
+        ":Bob!bob@h PRIVMSG #comicrig :(#G295E193M1) hi\r\n";        // plain-IRC inline
+    cc_session_feed_bytes(s, (const uint8_t*)wireInline, strlen(wireInline));
+    CC_CHECK(dc.haveText == 1 && dc.textBody == "hi");
+    CC_CHECK(dc.textHasAnn == 1);
     CC_CHECK(dc.textAnn.gesture_pose == 2 && dc.textAnn.mode == 1);
     cc_session_destroy(s);
     return 0;

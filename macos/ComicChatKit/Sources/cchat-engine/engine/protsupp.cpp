@@ -923,7 +923,16 @@ static ccPayloadResult ccProcessComment(char *szMesg) {
         // exactly as the original.
         char *szVar = szMesg + g_nAppearsAsLen;
         char *szCharName = GetToken(szVar, &szVar);
-        if (!szCharName) { r.cls = ccPayloadHandledNoEvent; return r; }  // djk - BETA1 Fix (verbatim guard; original still `return TRUE`)
+        // djk - BETA1 Fix (verbatim guard). The original returns FALSE here
+        // (protsupp.cpp:861: `if (!szCharName) return FALSE;`), which sends
+        // the caller (OnTextMsg's `!ProcessComment(...)` check) on to
+        // ProcessSay -- the raw "# Appears as" text still renders as a say
+        // when the avatar name token is missing. R18/R20 control-flow
+        // correction (review fix): this port previously returned
+        // ccPayloadHandledNoEvent here (MATCHED, swallows the text with no
+        // event), which is the wrong return class -- ccPayloadSuppressed is
+        // this port's equivalent of the original's FALSE/fall-through-to-say.
+        if (!szCharName) { r.cls = ccPayloadSuppressed; return r; }
         char nameBuf[128];
         strncpy(nameBuf, szCharName, sizeof(nameBuf) - 1);
         nameBuf[sizeof(nameBuf) - 1] = '\0';
@@ -1109,9 +1118,26 @@ static ccPayloadResult ccProcessSay(const char* szNickname, CUserInfo* pui, char
             pui->m_udi.m_uModes |= BM_WHISPER;
         }
     }
-    // else: pui->m_bbValidUDI was set by a preceding OnDataMsg call on this
-    // same scratch pui (out-of-band IRCX DATA arrived just before this
-    // PRIVMSG) -- pui->m_udi already holds the right block, verbatim :1613.
+    // else: the original's comment here read "pui->m_bbValidUDI was set by a
+    // preceding OnDataMsg call on this same scratch pui" -- that is
+    // COUNTERFACTUAL for this port and has been corrected (review fix). Both
+    // OnTextMsg and OnDataMsg (below) each construct their OWN fresh
+    // stack-local `CUserInfo pui;` per call (CUserInfo's ctor zero-inits
+    // m_bbValidUDI, lifted_singles.cpp:161) -- there is no shared, persistent
+    // CUserInfo a preceding DATA line could have marked. So pui->m_bbValidUDI
+    // is ALWAYS 0 by the time ccProcessSay reaches this branch, the `else if
+    // (!pui->m_bbValidUDI)` reset above ALWAYS fires (for every plain PRIVMSG
+    // with no inline "(#...)" block), and this `else` branch is dead code in
+    // this port -- which is the CORRECT stateless contract, not a bug: the
+    // original's IRCX DATA-then-PRIVMSG annotation pairing (stash on the
+    // sender's persistent CUserInfo, consume on their next plain PRIVMSG) is
+    // NOT reproduced in-engine. That pairing is Task 7's (Swift's)
+    // responsibility -- Swift owns the real per-nick user table and re-pairs
+    // a DATA CCUDI1 blob with the next plain PRIVMSG from the same nick by
+    // nick lookup, once both have crossed the C boundary as separate
+    // CC_EV_DATA / CC_EV_TEXT(has_annotations=0) events (plan amendment,
+    // recorded against this task's review). No code-logic change here: the
+    // always-reset behavior below is unchanged and correct.
 
     pui->m_bbValidUDI = 0;  // pui->m_udi no more valid for next incoming text (:1624)
 
