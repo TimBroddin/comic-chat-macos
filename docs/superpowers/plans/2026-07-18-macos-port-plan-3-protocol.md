@@ -531,21 +531,20 @@ git commit -m "macos: Plan 3 Task 4 - outbound builders (ircproto) + CCQuery lis
 
 ---
 
-### Task 5: Design the inbound event vocabulary + lift the parser (`ircsock.cpp`)
+### Task 5a: Design the complete inbound event vocabulary (`cc_proto_event`)
 
-The core of the plan. Define `cc_proto_event` fresh (discovery: no inbound interface exists), then lift the parse dispatch, replacing each direct app-callee with an event emission (R18).
+Define `cc_proto_event` fresh (discovery: no inbound interface exists) as a standalone, reviewable deliverable — **the full union, one struct per enum type, no placeholders** — before any parser lift. This task adds no parsing; it defines the C type + a Swift-side round-trip smoke test that constructs and reads back one event of each variant, proving the union is complete and consumable.
 
 **Files:**
-- Modify: `Sources/cchat-engine/include/comicchat.h` — the full `cc_proto_event` union + `cc_proto_event_type` enum
-- Create: `Sources/cchat-engine/engine/ircsock.cpp` + `ircsock.h` (lift the parser; SSPI block R21-dropped; AfxMessageBox → error events R20)
-- Modify: `Sources/cchat-engine/bridge/cc_session.cpp`/`.h` — feed_bytes runs the lifted framer+dispatch; `ccEmitProtoEvent` filled; `fire_timer` → `HrModeIsIrcXFailure`
-- Modify: `Sources/cchat-engine/bridge/cc_selftest.cpp` — parse-vector event assertions
+- Modify: `Sources/cchat-engine/include/comicchat.h` — the full `cc_proto_event` union + `cc_proto_event_type` enum (every variant spelled out)
+- Modify: `Sources/cchat-engine/bridge/cc_session.cpp` — remove the Task-1 placeholder `struct cc_proto_event`
+- Modify: `Sources/cchat-engine/bridge/cc_selftest.cpp` — a `cc_selftest_event_union()` that fills + reads back one of each variant through `ccEmitProtoEvent`
 
 **Interfaces:**
-- Consumes: all prior tasks (codec for text/data events, outbound for reply-triggered emits like PONG, `ccSession()`/`ccEmitProtoEvent`).
-- Produces: the complete inbound event surface; `cc_session_feed_bytes` fully functional; `cc_session_fire_timer(CC_TIMER_ISIRCX_PROBE)` → plain-IRC fallback.
+- Consumes: Task 1 (`ccEmitProtoEvent`, the placeholder to remove), Task 3 (`cc_annotations`, embedded in text/data/whisper variants).
+- Produces: the complete `cc_proto_event_type` enum and `cc_proto_event` union — **every enum value has a matching union struct**; later tasks (5b, 6) fill these at parse sites and Swift (Task 7) mirrors them 1:1.
 
-- [ ] **Step 1: Define `cc_proto_event` in `comicchat.h`** — one variant per feature-level event, derived from the callee inventory in `ircproto-map.md` §3 and the command surface in `command-surface.md` §3. The enum (grouped):
+- [ ] **Step 1: Define the full `cc_proto_event` in `comicchat.h`** — one variant per feature-level event, derived from the callee inventory in `ircproto-map.md` §3 and the command surface in `command-surface.md` §3. **Spell out a struct for EVERY enum value below** (the "representative variants" note is removed — completeness is this task's deliverable; where a struct is shown below, use it verbatim; where the enum lists a type with no struct shown, define one from the cited discovery event, following the same field conventions — CP-1252 `const char*` valid only for the callback duration, embedded `cc_annotations` + `has_annotations` for message-bearing events). The enum (grouped):
 
 ```c
 typedef enum cc_proto_event_type {
@@ -578,35 +577,99 @@ typedef enum cc_proto_event_type {
     CC_EV_STATUS_LINE,        /* catch-all status text (permissive: unknown numerics) */
 } cc_proto_event_type;
 ```
-And the union (representative variants shown — every type gets a struct; text/data carry an embedded `cc_annotations` + a `has_annotations` flag; nicks/targets/text are CP-1252 byte pointers valid only for the callback duration):
+And the **complete** union — one member per enum value; text/data/whisper/action carry an embedded `cc_annotations` + a `has_annotations` flag; all `const char*` are CP-1252 bytes valid only for the callback duration:
 
 ```c
 typedef struct cc_proto_event {
     cc_proto_event_type type;
     uint32_t room_token;          /* 0 if not room-scoped */
     union {
-        struct { const char* nick; } logged_in;
-        struct { int32_t ircx; int32_t max_msg_len; } server_caps;
-        struct { const char* nick; const char* ident; } user_joined;
-        struct { const char* old_nick; const char* new_nick; int32_t is_self; } nick_changed;
+        /* connection lifecycle */
+        struct { const char* nick; } logged_in;                        /* CC_EV_LOGGED_IN */
+        struct { int32_t ircx; int32_t max_msg_len; } server_caps;     /* CC_EV_SERVER_CAPS */
+        struct { const char* text; } disconnected_hint;                /* CC_EV_DISCONNECTED_HINT */
+        /* membership */
+        struct { const char* channel; } self_joined;                   /* CC_EV_SELF_JOINED */
+        struct { const char* channel; } self_parted;                   /* CC_EV_SELF_PARTED */
+        struct { const char* nick; const char* ident; } user_joined;   /* CC_EV_USER_JOINED */
+        struct { const char* nick; const char* reason; } user_parted;  /* CC_EV_USER_PARTED */
+        struct { const char* nick; const char* reason; } user_quit;    /* CC_EV_USER_QUIT */
+        struct { const char* channel; const char* nicks; } names;      /* CC_EV_NAMES (space-joined) */
+        struct { const char* channel; } end_of_names;                  /* CC_EV_END_OF_NAMES */
+        struct { const char* old_nick; const char* new_nick;
+                 int32_t is_self; } nick_changed;                      /* CC_EV_NICK_CHANGED */
+        /* messages (the core comic events) */
         struct { const char* nick; const char* ident; const char* target;
                  const char* text; int32_t kind;      /* MT_* */
-                 int32_t has_annotations; cc_annotations annotations; } text;
-        struct { const char* nick; cc_annotations annotations; } data;
-        struct { const char* channel; const char* topic; } topic_changed;
-        struct { const char* channel; const char* nicks; } names;   /* space-joined */
-        struct { const char* key; const char* value; } room_prop;
-        struct { const char* name; int32_t users; const char* topic; } room_list_item;
-        struct { int32_t code; const char* text; } error;
-        struct { int32_t kind; const char* bad_nick; } nick_rejected;
-        struct { const char* text; } status_line;
-        /* … one struct per remaining type … */
+                 int32_t has_annotations; cc_annotations annotations; } text;   /* CC_EV_TEXT */
+        struct { const char* nick; cc_annotations annotations; } data; /* CC_EV_DATA */
+        struct { const char* nick; const char* ident; const char* text;
+                 int32_t has_annotations; cc_annotations annotations; } whisper; /* CC_EV_WHISPER */
+        struct { const char* nick; const char* text;
+                 int32_t has_annotations; cc_annotations annotations; } action;  /* CC_EV_ACTION */
+        struct { const char* nick; const char* file; const char* text; } sound;  /* CC_EV_SOUND */
+        struct { const char* nick; const char* message; } away_peer;   /* CC_EV_AWAY_PEER */
+        struct { const char* nick; const char* avatar_name;
+                 const char* url; } appears_as;                        /* CC_EV_APPEARS_AS (url may be "" or "?") */
+        /* room state */
+        struct { const char* channel; const char* topic; } topic_changed;   /* CC_EV_TOPIC_CHANGED */
+        struct { const char* channel; const char* modes;
+                 const char* arg; } channel_mode;                      /* CC_EV_CHANNEL_MODE (delta) */
+        struct { const char* nick; const char* modes; } user_mode;     /* CC_EV_USER_MODE */
+        struct { const char* key; const char* value; } room_prop;      /* CC_EV_ROOM_PROP */
+        struct { int32_t truncated; } room_list_begin;                 /* CC_EV_ROOM_LIST_BEGIN */
+        struct { const char* name; int32_t users;
+                 const char* topic; } room_list_item;                  /* CC_EV_ROOM_LIST_ITEM */
+        struct { int32_t truncated; } room_list_end;                   /* CC_EV_ROOM_LIST_END */
+        struct { const char* nick; const char* user; const char* host;
+                 const char* real; int32_t purpose; } whois_result;    /* CC_EV_WHOIS_RESULT */
+        struct { const char* nick; const char* user; const char* host;
+                 const char* channel; int32_t purpose; } who_result;   /* CC_EV_WHO_RESULT */
+        struct { const char* luser; const char* motd; } motd;          /* CC_EV_MOTD */
+        /* errors & prompts (Swift owns retry/prompt) */
+        struct { int32_t code; const char* text; } error;              /* CC_EV_ERROR */
+        struct { int32_t kind; const char* bad_nick; } nick_rejected;  /* CC_EV_NICK_REJECTED */
+        struct { int32_t dummy; } auth_unsupported;                    /* CC_EV_AUTH_UNSUPPORTED */
+        struct { const char* text; } status_line;                      /* CC_EV_STATUS_LINE */
     } u;
 } cc_proto_event;
 ```
-Remove the Task-1 placeholder `struct cc_proto_event`.
 
-- [ ] **Step 2: Write the failing parse-vector selftest** — feed a captured registration + JOIN + PRIVMSG-with-annotations byte sequence; assert the emitted event sequence. Use bytes from a real capture (Task-9 rig) or hand-authored to the grammar:
+- [ ] **Step 2: Remove the Task-1 placeholder** `struct cc_proto_event { int32_t type; };` from `cc_session.cpp` (it was guarded `#ifndef CC_PROTO_EVENT_DEFINED`); the real definition in `comicchat.h` now governs.
+
+- [ ] **Step 3: Write the failing union round-trip selftest** — `cc_selftest_event_union()`: for each enum value, fill a `cc_proto_event` of that variant, pass it through `ccEmitProtoEvent` to a capturing `on_event`, and read the fields back; assert the `type` and one representative field per variant survive. This proves every enum value has a usable struct (the completeness guarantee) and that the union round-trips through the C boundary.
+
+- [ ] **Step 4: Run to verify it fails** — `swift test 2>&1 | grep -i event_union`. Expected: compile failure (variants not yet defined / placeholder still present).
+
+- [ ] **Step 5: Implement** — replace the placeholder, add the full enum + union to `comicchat.h`, implement the selftest, register it in `cc_run_selftests`.
+
+- [ ] **Step 6: Run to verify it passes** — `swift test 2>&1 | grep -i event_union`. Expected: PASS; full suite green (no parser change yet, so nothing else moves).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add macos/ComicChatKit/Sources/cchat-engine/include/comicchat.h \
+        macos/ComicChatKit/Sources/cchat-engine/bridge/cc_session.cpp \
+        macos/ComicChatKit/Sources/cchat-engine/bridge/cc_selftest.cpp
+git commit -m "macos: Plan 3 Task 5a - complete inbound event vocabulary (cc_proto_event union)"
+```
+
+---
+
+### Task 5b: Lift the parser (`ircsock.cpp`) — emit events at every dispatch site
+
+Lift the parse dispatch, replacing each direct app-callee with an emission of the Task-5a event (R18).
+
+**Files:**
+- Create: `Sources/cchat-engine/engine/ircsock.cpp` + `ircsock.h` (lift the parser; SSPI block R21-dropped; AfxMessageBox → error events R20)
+- Modify: `Sources/cchat-engine/bridge/cc_session.cpp`/`.h` — feed_bytes runs the lifted framer+dispatch; `fire_timer` → `HrModeIsIrcXFailure`
+- Modify: `Sources/cchat-engine/bridge/cc_selftest.cpp` — parse-vector event assertions
+
+**Interfaces:**
+- Consumes: Task 5a (the event union), all prior tasks (codec for text/data events, outbound for reply-triggered emits like PONG, `ccSession()`/`ccEmitProtoEvent`).
+- Produces: `cc_session_feed_bytes` fully functional; `cc_session_fire_timer(CC_TIMER_ISIRCX_PROBE)` → plain-IRC fallback; every parse handler emits the matching event.
+
+- [ ] **Step 1: Write the failing parse-vector selftest** — feed a captured registration + JOIN + PRIVMSG-with-annotations byte sequence; assert the emitted event sequence. Use bytes from a real capture (Task-9 rig) or hand-authored to the grammar:
 
 ```cpp
 static int cc_selftest_parse_join_privmsg() {
@@ -634,9 +697,9 @@ static int cc_selftest_parse_join_privmsg() {
 }
 ```
 
-- [ ] **Step 3: Run to verify it fails** — `swift test 2>&1 | grep -i parse_join`. Expected: fail (feed_bytes still just buffers).
+- [ ] **Step 2: Run to verify it fails** — `swift test 2>&1 | grep -i parse_join`. Expected: fail (feed_bytes still just buffers).
 
-- [ ] **Step 4: Lift `ircsock.cpp`/`ircsock.h`** — the big one. Apply, per `ircproto-map.md` §2–§3:
+- [ ] **Step 3: Lift `ircsock.cpp`/`ircsock.h`** — the big one. Apply, per `ircproto-map.md` §2–§3:
   - `OnReceive` framing (:1000-1032) — the line-splitter body moves into `cc_session_feed_bytes`: append to `inbuf`, loop on `\n`, hand each line to `ProcessMessage`. The `CAsyncSocket` inheritance is dropped (R21).
   - `ParseIt`/`NGetCmd`/`ParseChannelMode` (:137-400) — lift verbatim (pure parse).
   - `ProcessMessage`/`HandleCommand`/`HandleResultCode`/`HandleErrorCode` (:1115-3496) — lift; **each direct app-callee → `ccEmitProtoEvent` (R18)**, individually listed. Mapping (from §3 tables): `OnTextMsg`→`CC_EV_TEXT`, `OnDataMsg`→`CC_EV_DATA`, `AddAndExecute(JoinEntry)`→`CC_EV_USER_JOINED`, `(PartEntry)`→`CC_EV_USER_PARTED`, `(NickEntry)`→`CC_EV_NICK_CHANGED`, `OnKick`→(kick event), `OnInvite`→(invite event), `AddToStatus`→`CC_EV_STATUS_LINE`, `bProcessAddChannel`→`CC_EV_SELF_JOINED`, `ShowMOTD`→`CC_EV_MOTD`, room-list feeders→`CC_EV_ROOM_LIST_*`, `bMatchAndApplyRules`→**dropped** (rules/notifs are app-layer, R20 — the event is emitted; Swift may run rules).
@@ -647,13 +710,13 @@ static int cc_selftest_parse_join_privmsg() {
   - Preserve the RFC2812 `JOIN #chan` modernization (:1364-1369) — the captured-bytes tests against ngircd depend on it.
   - Direct room-property writes (`ParseChannelMode`→`m_dwModes` etc.) — these write the lifted `CIrcProto`'s `CRoomInfo` base, which the engine still holds transiently; ALSO emit `CC_EV_CHANNEL_MODE`/`CC_EV_TOPIC_CHANGED` so Swift tracks the canonical copy. (The engine's copy is scratch; Swift's is canonical per `state-and-codec.md` §1.4.)
 
-- [ ] **Step 5: Wire `feed_bytes` + `fire_timer`** — `cc_session_feed_bytes` now runs framer→`ProcessMessage`; `cc_session_fire_timer(CC_TIMER_ISIRCX_PROBE)` → `sock.HrModeIsIrcXFailure()` (plain-IRC fallback).
+- [ ] **Step 4: Wire `feed_bytes` + `fire_timer`** — `cc_session_feed_bytes` now runs framer→`ProcessMessage`; `cc_session_fire_timer(CC_TIMER_ISIRCX_PROBE)` → `sock.HrModeIsIrcXFailure()` (plain-IRC fallback).
 
-- [ ] **Step 6: Run to verify it passes** — `swift test 2>&1 | grep -i parse_join` PASS; full suite green.
+- [ ] **Step 5: Run to verify it passes** — `swift test 2>&1 | grep -i parse_join` PASS; full suite green.
 
-- [ ] **Step 7: Add coverage vectors** — one selftest per event family with hand-verified expected streams: self-join+MODE+WHO auto-queries, NICK across users, TOPIC set, channel MODE delta, IRCX `DATA CCUDI1` out-of-band annotation (vs the inline plain-IRC form from Task 3), WHISPER inbound, `# Appears as` avatar announce, room LIST, MOTD, a 433 nick-collision, a fatal ERROR. Each documents which handler + line it exercises.
+- [ ] **Step 6: Add coverage vectors** — one selftest per event family with hand-verified expected streams: self-join+MODE+WHO auto-queries, NICK across users, TOPIC set, channel MODE delta, IRCX `DATA CCUDI1` out-of-band annotation (vs the inline plain-IRC form from Task 3), WHISPER inbound, `# Appears as` avatar announce, room LIST, MOTD, a 433 nick-collision, a fatal ERROR. Each documents which handler + line it exercises.
 
-- [ ] **Step 8: Fidelity diff + commit** — diff `ircsock.cpp`/`ircsock.h` vs original; every R18 emit-replacement, R20 wrap, R21 drop individually listed; confirm the parse tables (`g_rgIrcCmd`, numerics) are verbatim.
+- [ ] **Step 7: Fidelity diff + commit** — diff `ircsock.cpp`/`ircsock.h` vs original; every R18 emit-replacement, R20 wrap, R21 drop individually listed; confirm the parse tables (`g_rgIrcCmd`, numerics) are verbatim.
 
 ```bash
 git add macos/ComicChatKit/Sources/cchat-engine/engine/ircsock.cpp \
@@ -662,14 +725,14 @@ git add macos/ComicChatKit/Sources/cchat-engine/engine/ircsock.cpp \
         macos/ComicChatKit/Sources/cchat-engine/bridge/cc_session.cpp \
         macos/ComicChatKit/Sources/cchat-engine/bridge/cc_session.h \
         macos/ComicChatKit/Sources/cchat-engine/bridge/cc_selftest.cpp
-git commit -m "macos: Plan 3 Task 5 - inbound event vocabulary + parser lift (ircsock); SSPI dropped (R21), app-callees -> events (R18)"
+git commit -m "macos: Plan 3 Task 5b - parser lift (ircsock); SSPI dropped (R21), app-callees -> events (R18)"
 ```
 
 ---
 
 ### Task 6: Lift the payload second stage (`ProcessSay`/`ProcessComment`) + finish `protsupp`
 
-Task 3 lifted the codec; Task 5 emits raw text/data events. This task lifts the payload interpreter that sits between them — CTCP dispatch, `#`-comment grammar, the inline-annotation parse block — extracting it from the UI/policy it's tangled with (R20), and wires the R19 resolver so talk-to decode works end-to-end.
+Task 3 lifted the codec; Task 5b emits raw text/data events. This task lifts the payload interpreter that sits between them — CTCP dispatch, `#`-comment grammar, the inline-annotation parse block — extracting it from the UI/policy it's tangled with (R20), and wires the R19 resolver so talk-to decode works end-to-end.
 
 **Files:**
 - Modify: `Sources/cchat-engine/engine/protsupp.cpp`/`.h` — add `ProcessSay`, `ProcessComment`, `OnTextMsg`, `OnDataMsg`, CTCP `Reply*`/`Show*` pairs; extract the inline-annotation parse block; wire `LookupPui`→`ccSessionResolveUser` (R19)
@@ -853,9 +916,9 @@ A real captured MS Chat / IRC session, replayed through the lifted parser, emits
 
 ## Self-review (against the spec + discovery)
 
-- **Spec §4.4 (bytes in, events out, Swift timers):** Tasks 1/5/7 — `feed_bytes`, `cc_proto_events`, `set_timer`/`fire_timer`, `send` callback ✓.
+- **Spec §4.4 (bytes in, events out, Swift timers):** Tasks 1/5a/5b/7 — `feed_bytes`, `cc_proto_events`, `set_timer`/`fire_timer`, `send` callback ✓.
 - **Spec §4.5 (CP-1252 default, UTF-8 opt-in, no JIS):** Task 2 (CP-1252 posture permanent), Task 7 (`WireCodec`, `encoding` config), JIS not ported ✓.
-- **Spec §7 (permissive):** unknown verbs/numerics keep TRACE/status behavior (Task 5); tolerant unquoting reproduced (Task 2) ✓.
+- **Spec §7 (permissive):** unknown verbs/numerics keep TRACE/status behavior (Task 5b); tolerant unquoting reproduced (Task 2) ✓.
 - **Spec §8.2 (record real sessions, replay, byte-compare annotations):** Tasks 8/9 + the Wine rig ✓; annotated-capture gap flagged with the hand-authored-vector fallback, not silently skipped.
 - **Spec §9 (format.cpp/protsupp untangling risk):** de-risked by discovery; codec lift is Tasks 3/6, low-to-moderate ✓.
 - **Roadmap Plan-3 debt:** `intl.c` posture decided (Task 2), `GetMyNickName` stub removed (Task 6), Capitalize restored (Task 2), talkTos-never-serialized confirmed (discovery; the codec uses nick strings + resolver — Tasks 3/6), `CharNext` shim live+selftested (Task 2), `format.cpp` codec half confirmed already-lifted (Task 3), `CC_NO_PROTOCOL` removed (Task 3) ✓.
