@@ -56,6 +56,7 @@ int  SetBackDropAux(const char *backname, const char *pszRealName);  // backdrop
 void InitializeBackDrops();               // backdrop.cpp:168
 void DestroyBackDropArt();                // backdrop.cpp:318
 void BytesToEmotion(CEmotion &em, BYTE emIndex, BYTE inIndex);  // avatario.cpp:88
+void EmotionToBytes(CEmotion &em, BYTE &emotion, BYTE &intensity);  // avatario.cpp:74
 
 // ============================================================================
 // cc_strip
@@ -643,5 +644,144 @@ extern "C" int32_t cc_strip_set_self(cc_strip* s, int32_t participant) {
     if (!sess.lookupUser((UINT)participant)) return -1;   // unknown participant id
     sess.selfParticipant = (UINT)participant;
     if (sess.comicsTitle[0] != '\0') s->page->UpdateTitle();
+    return 0;
+}
+
+// ============================================================================
+// Plan 4b Task 2: emotion-wheel engine surface. All four resolve the SELF
+// avatar the same way: ccContext().session.selfParticipant (R17, set by
+// cc_strip_set_self above) -> GetAvatar(id). A strip with no self set yet
+// (selfParticipant == 0, the CCSessionSettings default) or a self id that no
+// longer resolves to a registered avatar rejects every one of these with -1,
+// matching cc_strip_set_self's own error-code convention.
+
+// cc_strip_set_self_emotion: the wheel drag -- the original CBodyCam::
+// UpdateEmotion chain (bodycam.cpp:436) minus the HWND cursor-drawing/status-
+// bar side effects (m_mouseDown/m_cursorPos/DrawCursor -- all BodyCam-view
+// state this headless engine has no window to back): GetBodyFromEmotion(emo)
+// then UpdateBody(that body) directly on the self avatar.
+//
+// DEVIATION (Step 1 finding, recorded in the task report): the brief's Step 3
+// sketch wrote `CEmotion emo((float)angle, (float)intensity01)`, but
+// CEmotion's real constructor is `CEmotion(double intensity, double emotion)`
+// (avatar.h:62) -- intensity FIRST, angle/emotion SECOND, the OPPOSITE order
+// the sketch used. This implementation uses the real (intensity, emotion)
+// order; using the sketch's order would silently swap the two fields (an
+// intensity of 0.0..2*PI radians and an "emotion" of 0.0..1.0) with no
+// compiler error, since both parameters are `double`.
+extern "C" int32_t cc_strip_set_self_emotion(cc_strip* s, double angle_radians, double intensity01) {
+    if (!s) return -1;
+    UINT self = ccContext().session.selfParticipant;   // R17
+    if (self == 0) return -1;
+    CAvatarX* av = GetAvatar((USHORT)self);
+    if (!av) return -1;
+    if (intensity01 < 0.0) intensity01 = 0.0;
+    if (intensity01 > 1.0) intensity01 = 1.0;
+    CEmotion emo(intensity01, angle_radians);   // avatar.h:62: (intensity, emotion) order
+    av->UpdateBody(av->GetBodyFromEmotion(emo));  // bodycam.cpp:436's exact chain, minus drawing
+    return 0;
+}
+
+// cc_strip_preview_self_text: the typing preview. Builds a CString shim from
+// text_bytes and runs ChatPreSendText(str, self) (textpose.cpp:120, already
+// forward-declared above for cc_strip_add_line's use) so the self avatar's
+// pose reflects what the text WOULD infer -- without adding a line (no
+// AddLine/page mutation at all, matching the original's per-edit preview,
+// saywnd.cpp:975, which calls the same function on every keystroke, not just
+// on send). ChatPreSendText itself already guards on !ccContext().session.
+// comicView and !av/frozen (textpose.cpp:123-126); those are silent no-ops in
+// the original too, not errors, so this wrapper does not duplicate them as
+// failure returns -- only "no self set" is an error here.
+extern "C" int32_t cc_strip_preview_self_text(cc_strip* s, const char* text_bytes) {
+    if (!s || !text_bytes) return -1;
+    UINT self = ccContext().session.selfParticipant;   // R17
+    if (self == 0) return -1;
+    if (!GetAvatar((USHORT)self)) return -1;
+    CString text(text_bytes);
+    ChatPreSendText(text, (int)self);
+    return 0;
+}
+
+// cc_strip_self_pose: the self avatar's CURRENT pose id, for driving the
+// wheel's live preview via cc_avatar_pose_image on a standalone cc_avatar
+// handle of the same .avb (see comicchat.h's doc comment for the exact index-
+// space caveat -- this is a poseID, 1-based into m_arrPoses, NOT the same
+// numbering as cc_avatar_pose_image's compacted/icon-skipping `idx`).
+//
+// Step 1(d) finding: CBody::GetPoseID() is NOT a virtual on the CBody base
+// class (avatar.h:83-98) -- it exists ONLY on CBodySingle/CBodyUnary
+// (avatar.h:166,177). CBodyDouble (CAvatarComplex's body, face+torso) has no
+// GetPoseID() at all. So `m_body->GetPoseID()` cannot be called generically
+// through the CBody* the avatar stores -- it would fail to compile (no such
+// virtual on the base) if written naively, and there is no safe generic
+// dispatch for it. GetClass() (avatar.h:93, pure virtual, safe on the base
+// pointer) reliably discriminates BC_BODYSINGLE from BC_BODYDOUBLE; this
+// function downcasts on that discriminant, mirroring the SAME pattern
+// bInsertAnnotations/GetIndices/GetEmotions already use for the two avatar
+// shapes. For BC_BODYDOUBLE the TORSO pose id is reported (m_torsoRec->
+// poseID) -- consistent with cc_strip_self_annotations below, which also
+// treats the torso/gesture group as the "G" (gesture) half of the pair, and
+// with GetIndices' own torso-first convention.
+extern "C" int32_t cc_strip_self_pose(cc_strip* s, int32_t* out_pose_index) {
+    if (out_pose_index) *out_pose_index = -1;
+    if (!s) return -1;
+    UINT self = ccContext().session.selfParticipant;   // R17
+    if (self == 0) return -1;
+    CAvatarX* av = GetAvatar((USHORT)self);
+    if (!av || !av->m_body) return -1;
+
+    short poseID;
+    if (av->m_body->GetClass() == BC_BODYSINGLE) {
+        poseID = ((CBodySingle*)av->m_body)->GetPoseID();
+    } else {
+        // BC_BODYDOUBLE: report the torso pose id (see doc comment above).
+        poseID = ((CBodyDouble*)av->m_body)->m_torsoRec->poseID;
+    }
+    if (out_pose_index) *out_pose_index = (int32_t)poseID;
+    return 0;
+}
+
+// cc_strip_self_annotations: fills `out` with the outbound annotation block
+// for the CURRENT self pose/emotion state, reading the same fields
+// bInsertAnnotations reads (protsupp.cpp:364-370) -- GetIndices for the face/
+// torso RECORD indices (a DIFFERENT index space from cc_strip_self_pose's
+// poseID above -- see comicchat.h's doc comment; this mirrors
+// bInsertAnnotations's own field, which is exactly this record index, not a
+// poseID) + GetEmotions for the (angle, intensity) pair per group, each
+// packed through EmotionToBytes (avatario.cpp:74) exactly like
+// bInsertAnnotations's own two calls. cooked=1 always (both intensities are
+// always populated by this path, matching cc_annotations' own "cooked"
+// contract -- both intensity fields written). mode/addressees are left at
+// their zeroed defaults -- caller's job (Task 3), per the brief.
+extern "C" int32_t cc_strip_self_annotations(cc_strip* s, cc_annotations* out) {
+    if (!s || !out) return -1;
+    UINT self = ccContext().session.selfParticipant;   // R17
+    if (self == 0) return -1;
+    CAvatarX* av = GetAvatar((USHORT)self);
+    if (!av || !av->m_body) return -1;
+
+    memset(out, 0, sizeof(*out));
+
+    CHAR faceIndex, torsoIndex;
+    BYTE bbRequested;
+    av->GetIndices(faceIndex, torsoIndex, bbRequested);   // protsupp.cpp:364
+
+    CEmotion face, torso;
+    av->GetEmotions(face, torso);                          // protsupp.cpp:365
+
+    BYTE faceEmotion, faceIntensity, torsoEmotion, torsoIntensity;
+    EmotionToBytes(face, faceEmotion, faceIntensity);       // protsupp.cpp:369
+    EmotionToBytes(torso, torsoEmotion, torsoIntensity);    // protsupp.cpp:370
+
+    out->gesture_pose = torsoIndex;
+    out->gesture_emotion = torsoEmotion;
+    out->gesture_intensity = torsoIntensity;
+    out->face_pose = faceIndex;
+    out->face_emotion = faceEmotion;
+    out->face_intensity = faceIntensity;
+    out->requested = bbRequested ? 1 : 0;
+    out->mode = 0;              // caller's job (Task 3)
+    out->addressee_count = 0;   // caller's job (Task 3)
+    out->cooked = 1;            // both intensities always populated by this path
     return 0;
 }

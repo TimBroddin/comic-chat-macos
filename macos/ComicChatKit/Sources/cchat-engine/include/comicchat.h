@@ -68,6 +68,14 @@ int32_t cc_run_avatar_api_selftest(const char* avatar_path, const char* other_av
  * Kept out of cc_run_selftests because it needs two fixture paths. */
 int32_t cc_run_strip_title_starring_selftest(const char* avatar_path, const char* other_avatar_path);
 
+/* Plan 4b Task 2: emotion-wheel engine surface selftest. Opens avatar_path as
+ * one participant, calls set_self, and exercises cc_strip_self_pose /
+ * cc_strip_set_self_emotion / cc_strip_self_annotations / cc_strip_preview_self_text
+ * against it (plus the "no self set" rejection case on a fresh strip with no
+ * set_self call). Returns 0 on success (failure count otherwise). Kept out of
+ * cc_run_selftests because it needs the fixture path. */
+int32_t cc_run_self_emotion_selftest(const char* avatar_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env
@@ -398,6 +406,62 @@ int32_t   cc_strip_compose(cc_strip* s, cc_canvas* canvas); /* 0 ok */
  * contract Task 11 relies on. */
 int32_t   cc_strip_set_title(cc_strip* s, const char* title_bytes); /* 0 ok */
 int32_t   cc_strip_set_self(cc_strip* s, int32_t participant); /* 0 ok; starring order: self first */
+
+/* Plan 4b Task 2: emotion-wheel engine surface. All four operate on the SELF
+ * participant (cc_strip_set_self must have been called first; nonzero return
+ * otherwise, matching this file's existing error-code convention where 0 is
+ * the only success value and every failure is a nonzero code -- these use -1
+ * uniformly, mirroring cc_strip_set_self's own -1-on-error style rather than
+ * the brief sketch's `return 1`, which does not match the file's real
+ * convention; see cc_compose.cpp for the exact per-branch codes).
+ *
+ * cc_strip_set_self_emotion: the wheel drag. Builds a CEmotion from
+ * (angle_radians, intensity01) and runs the original CBodyCam::UpdateEmotion
+ * chain minus the HWND drawing (bodycam.cpp:436: GetBodyFromEmotion then
+ * UpdateBody) directly on the self avatar. intensity01 is clamped to [0,1]
+ * here; the 0.2-center detente is the CALLER's job (GetEmotionFromPoint's UI
+ * behavior, which stays in Swift -- bodycam.cpp:409-419).
+ * DEVIATION from the brief's Step 3 sketch (recorded in the task report):
+ * CEmotion's real constructor is CEmotion(double intensity, double emotion)
+ * (avatar.h:62) -- intensity FIRST, angle/emotion SECOND -- the OPPOSITE
+ * argument order the sketch wrote. This implementation uses the real order.
+ *
+ * cc_strip_preview_self_text: the typing preview. Runs
+ * ChatPreSendText(text, self) (textpose.cpp:120) so the self avatar's pose
+ * reflects what the text WOULD infer, without adding a line. Mutates avatar
+ * pose state exactly like the original's per-edit preview (saywnd.cpp:975).
+ * ChatPreSendText itself no-ops (silently) if ccContext().session.comicView
+ * is false; it defaults true and nothing in this API clears it, so this is a
+ * live path in practice, not a hidden failure mode of this call.
+ *
+ * cc_strip_self_pose: the self avatar's CURRENT pose id (1-based, into the
+ * avatar's own m_arrPoses -- CreatePose/CreatePoseWithMask assign poseID =
+ * array-position + 1, avatar.cpp:434's own comment) -- for driving the
+ * wheel's live preview via cc_avatar_pose_image on a STANDALONE cc_avatar
+ * handle of the SAME .avb file. DEVIATION/CAVEAT (recorded prominently in the
+ * task report): this is NOT directly the same index space as
+ * cc_avatar_pose_image's `idx` parameter -- that idx is a 0-based index into
+ * a COMPACTED list that skips the icon pose (bridge_art.cpp's cc_avatar::
+ * poseIndices), so idx = (poseIndices such that poseIndices[idx] == poseID-1).
+ * A caller driving the wheel preview against a standalone cc_avatar must do
+ * that translation (or, more simply, treat poseID-1 as the idx directly,
+ * which is correct EXCEPT on the rare frame where the current pose happens to
+ * BE the icon pose, which the avatar's normal body/emotion machinery never
+ * selects in practice). Returns the pose id via out_pose_index; 0 = ok.
+ *
+ * cc_strip_self_annotations: fills `out` with the outbound annotation block
+ * for the CURRENT self pose/emotion state -- face/torso pose indices (the
+ * bInsertAnnotations sense: GetIndices' record-array indices, NOT the
+ * cc_avatar_pose_image poseID space above -- these are TWO DIFFERENT index
+ * spaces the original itself keeps distinct, see the task report's Step 1(c)
+ * finding) + EmotionToBytes wire emotion/intensity for both G (gesture/torso)
+ * and E (face) groups, cooked=1 -- mirroring bInsertAnnotations's own field
+ * reads (protsupp.cpp:364-370: GetIndices + GetEmotions + EmotionToBytes x2).
+ * mode/addressees are NOT filled (left 0 / empty) -- caller's job. */
+int32_t cc_strip_set_self_emotion(cc_strip* s, double angle_radians, double intensity01); /* 0 ok */
+int32_t cc_strip_preview_self_text(cc_strip* s, const char* text_bytes); /* 0 ok */
+int32_t cc_strip_self_pose(cc_strip* s, int32_t* out_pose_index); /* 0 ok */
+int32_t cc_strip_self_annotations(cc_strip* s, cc_annotations* out); /* 0 ok */
 
 /* ---- Protocol session (Plan 3): bytes in, events out ---------------------
  * The engine never opens a socket. Swift owns NWConnection and the event loop.

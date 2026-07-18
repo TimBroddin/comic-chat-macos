@@ -93,4 +93,16 @@ struct EngineGlobalStateSelfTests {
         let other = fixture("armando.avb")
         #expect(cc_run_strip_title_starring_selftest(avatar, other) == 0)
     }
+
+    // Plan 4b Task 2: the emotion-wheel engine surface (cc_strip_set_self_emotion/
+    // cc_strip_preview_self_text/cc_strip_self_pose/cc_strip_self_annotations).
+    // One participant registered as self; asserts a valid baseline pose id,
+    // set_self_emotion + self_annotations producing a cooked block with
+    // plausible wire emotion/intensity bytes, preview_self_text changing the
+    // resulting pose vs. a neutral baseline, and all four rejecting on a strip
+    // with no self set yet.
+    @Test func selfEmotionSelfTestPasses() {
+        let avatar = fixture("armando.avb")
+        #expect(cc_run_self_emotion_selftest(avatar) == 0)
+    }
 }

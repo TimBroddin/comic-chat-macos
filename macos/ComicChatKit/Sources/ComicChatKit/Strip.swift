@@ -140,6 +140,67 @@ public final class Strip {
         }
     }
 
+    // MARK: - Plan 4b Task 2: emotion-wheel engine surface
+
+    /// The wheel drag: sets the SELF participant's emotion (`angle` in
+    /// radians, `intensity` clamped to `[0, 1]` by the engine) and runs the
+    /// original `CBodyCam::UpdateEmotion` chain (`GetBodyFromEmotion` +
+    /// `UpdateBody`) on its avatar. `setSelf` must have been called first.
+    /// The 0.2 center detente is the CALLER's job (`GetEmotionFromPoint`'s UI
+    /// behavior) -- this call always applies the exact angle/intensity given.
+    public func setSelfEmotion(angle: Double, intensity: Double) throws {
+        let h = try requireHandle()
+        guard cc_strip_set_self_emotion(h, angle, intensity) == 0 else {
+            throw StripError(message: "setSelfEmotion(angle: \(angle), intensity: \(intensity)) failed")
+        }
+    }
+
+    /// The typing preview: runs the engine's text->emotion inference
+    /// (`ChatPreSendText`) against the SELF participant's avatar so its pose
+    /// reflects what `text` WOULD infer, without adding a line to the strip.
+    /// `setSelf` must have been called first.
+    public func previewSelfText(_ text: String) throws {
+        let h = try requireHandle()
+        // Same CP-1252-first encoding convention as addLine/setTitle.
+        let bytes = text.data(using: .windowsCP1252) ?? Data(text.utf8)
+        let rc: Int32 = bytes.withUnsafeBytes { rawBuf -> Int32 in
+            var withNul = [CChar](repeating: 0, count: rawBuf.count + 1)
+            for i in 0..<rawBuf.count { withNul[i] = CChar(bitPattern: rawBuf[i]) }
+            return cc_strip_preview_self_text(h, &withNul)
+        }
+        guard rc == 0 else {
+            throw StripError(message: "previewSelfText(\"\(text)\") failed")
+        }
+    }
+
+    /// The SELF participant's current pose index (1-based poseID into the
+    /// avatar's own pose array -- see `comicchat.h`'s `cc_strip_self_pose` doc
+    /// comment for the exact relationship to `cc_avatar_pose_image`'s index
+    /// space, which is a DIFFERENT, compacted/icon-skipping numbering).
+    /// `setSelf` must have been called first.
+    public func selfPoseIndex() throws -> Int32 {
+        let h = try requireHandle()
+        var idx: Int32 = -1
+        guard cc_strip_self_pose(h, &idx) == 0 else {
+            throw StripError(message: "selfPoseIndex() failed")
+        }
+        return idx
+    }
+
+    /// The outbound annotation block for the SELF participant's CURRENT pose/
+    /// emotion state (pose indices + wire emotion/intensity for both the
+    /// gesture/torso and face groups, `cooked == true`). `mode`/`addressees`
+    /// are left at their zero/empty defaults -- the caller's job to fill
+    /// before sending. `setSelf` must have been called first.
+    public func selfAnnotations(encoding: WireEncoding = .cp1252) throws -> Annotations {
+        let h = try requireHandle()
+        var cAnn = cc_annotations()
+        guard cc_strip_self_annotations(h, &cAnn) == 0 else {
+            throw StripError(message: "selfAnnotations() failed")
+        }
+        return Annotations(cAnnotations: cAnn, encoding: encoding)
+    }
+
     /// Ingest one scripted line spoken by `speaker` (a participant id from
     /// `addParticipant`). `addressees` name who the speaker is talking to
     /// (participant ids) — they drive the camera's facing/order.

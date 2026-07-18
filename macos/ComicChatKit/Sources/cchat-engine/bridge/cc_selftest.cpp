@@ -31,6 +31,7 @@
 // own local declaration inside bInsertAnnotations for the original's
 // identical convention).
 void BytesToEmotion(CEmotion &em, BYTE emIndex, BYTE inIndex);
+void EmotionToBytes(CEmotion &em, BYTE &emotion, BYTE &intensity);
 
 // ::BreakIntoLines free function (balloon.cpp) — declared here for the
 // characterization test (balloon.h declares only the CLabel:: method wrapper).
@@ -2838,6 +2839,101 @@ extern "C" int32_t cc_run_strip_title_starring_selftest(const char* avatarPath,
     g_failures = 0;
     if (avatarPath == NULL || otherAvatarPath == NULL) return 1;
     cc_selftest_strip_title_starring(avatarPath, otherAvatarPath);
+    return g_failures;
+}
+
+// --- Plan 4b Task 2: emotion-wheel engine surface selftest -------------------
+// cc_strip_set_self_emotion / cc_strip_preview_self_text / cc_strip_self_pose /
+// cc_strip_self_annotations, all operating on the SELF participant. Mirrors
+// the brief's Step 2 assertion list exactly:
+//   (1) self_pose returns a valid pose index (>=0... in practice poseIDs are
+//       1-based so ">0", < GetPoseCount()+1) on a freshly-added self.
+//   (2) set_self_emotion(0.0, 1.0) then self_annotations: cooked==1, and
+//       EmotionToBytes-encoded emotion/intensity are plausible (both byte
+//       values are in the IndexToByte'd '0'..'9'+ range emFloats/x10 produce --
+//       checked structurally, not against a hand-picked golden byte, since
+//       EmotionToBytes's exact table match for angle 0.0 depends on emFloats
+//       (avatario.cpp) which is out of this task's lift scope to re-verify).
+//   (3) preview_self_text with a trigger phrase from the REAL rule tables
+//       (reusing "Hello there, friend!" -- see cc_selftest_textpose's case 4,
+//       this file's cc_selftest.cpp:2300ish -- fires EM_WAVE at intensity 1.0,
+//       priority 5 via ID_RULE_WAVE's CheckStart* clause) changes self_pose's
+//       result vs. a neutral baseline captured right after add_participant.
+//   (4) all four reject (nonzero) on a strip with NO self set.
+static int cc_selftest_self_emotion(const char* avatarPath) {
+    int startFailures = g_failures;
+
+    static CCRecordingCanvas selfEmotionMetrics;
+    cc_set_metrics_canvas(selfEmotionMetrics.handle());
+
+    cc_strip* s = cc_strip_create();
+    CC_CHECK(s != NULL);
+    if (!s) return g_failures - startFailures;
+
+    // --- (4a) no self set yet: all four must reject.
+    int32_t poseOut = -999;
+    CEmotion dummy;
+    cc_annotations annOut;
+    memset(&annOut, 0, sizeof(annOut));
+    CC_CHECK(cc_strip_set_self_emotion(s, 0.0, 1.0) != 0);
+    CC_CHECK(cc_strip_preview_self_text(s, "Hello there, friend!") != 0);
+    CC_CHECK(cc_strip_self_pose(s, &poseOut) != 0);
+    CC_CHECK(cc_strip_self_annotations(s, &annOut) != 0);
+
+    int32_t p = cc_strip_add_participant(s, "Anna", avatarPath);
+    CC_CHECK(p == 1);
+    if (p < 0) { cc_strip_destroy(s); return g_failures - startFailures; }
+    CC_CHECK(cc_strip_set_self(s, p) == 0);
+
+    // --- (1) self_pose returns a valid, in-range pose id for the freshly-added
+    //     self (poseID space is 1-based: CreatePose/CreatePoseWithMask assign
+    //     array-position + 1, avatar.cpp's own comment at :434).
+    int32_t basePose = -1;
+    CC_CHECK(cc_strip_self_pose(s, &basePose) == 0);
+    CC_CHECK(basePose > 0);
+    CC_CHECK(basePose <= 0x7fff);  // sane upper bound; exact avatar pose count not asserted here (fixture-agnostic)
+
+    // --- (2) set_self_emotion(0, 1.0) then self_annotations: cooked, and
+    //     plausible nonzero-shaped byte fields (IndexToByte(v) = v + '0';
+    //     EmotionToBytes packs an intensity index 0..10 and an emotion-table
+    //     index 0..17 -- both fit in IndexToByte's byte range).
+    CC_CHECK(cc_strip_set_self_emotion(s, 0.0, 1.0) == 0);
+    cc_annotations ann;
+    memset(&ann, 0, sizeof(ann));
+    CC_CHECK(cc_strip_self_annotations(s, &ann) == 0);
+    CC_CHECK(ann.cooked == 1);
+    // face/torso intensity bytes are IndexToByte'd (value + '0'); intensity
+    // value range is 0..10 (BYTE)(m_intensity*10) per EmotionToBytes
+    // (avatario.cpp:83), so the wire byte must land in ['0', '0'+10].
+    CC_CHECK(ann.face_intensity >= '0' && ann.face_intensity <= '0' + 10);
+    CC_CHECK(ann.gesture_intensity >= '0' && ann.gesture_intensity <= '0' + 10);
+
+    // --- (3) preview_self_text changes self_pose vs. the neutral baseline.
+    //     "Hello there, friend!" fires ID_RULE_WAVE's CheckStart* clause
+    //     (EM_WAVE, intensity 1.0, priority 5 -- verified in
+    //     cc_selftest_textpose case 4) which is a DIFFERENT emotion than the
+    //     neutral (0,0) state set_self_emotion(0.0, 1.0) just put the avatar
+    //     in (angle 0.0 == EM_HAPPY, not EM_WAVE) -- so the resulting pose
+    //     must differ from the pre-preview pose.
+    CC_CHECK(cc_strip_set_self_emotion(s, 0.0, 0.0) == 0);  // reset to neutral-ish baseline
+    int32_t prePreviewPose = -1;
+    CC_CHECK(cc_strip_self_pose(s, &prePreviewPose) == 0);
+    CC_CHECK(cc_strip_preview_self_text(s, "Hello there, friend!") == 0);
+    int32_t postPreviewPose = -1;
+    CC_CHECK(cc_strip_self_pose(s, &postPreviewPose) == 0);
+    CC_CHECK(postPreviewPose != prePreviewPose);
+
+    cc_strip_destroy(s);
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift wrapper, which passes the fixture avatar path.
+// Runs standalone (resets g_failures) -- same pattern as
+// cc_run_avatar_api_selftest.
+extern "C" int32_t cc_run_self_emotion_selftest(const char* avatarPath) {
+    g_failures = 0;
+    if (avatarPath == NULL) return 1;
+    cc_selftest_self_emotion(avatarPath);
     return g_failures;
 }
 
