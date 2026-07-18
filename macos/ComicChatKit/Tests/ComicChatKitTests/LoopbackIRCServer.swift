@@ -121,11 +121,22 @@ final class LoopbackIRCServer: @unchecked Sendable {
     }
 
     func send(_ lines: [String]) async throws {
-        await waitForPeer()
         let payload = lines.map { $0 + "\r\n" }.joined()
         guard let data = payload.data(using: .isoLatin1) else {
             throw LoopbackError.sendFailed("non-Latin1 test payload")
         }
+        try await sendRaw(data)
+    }
+
+    /// Sends `data` verbatim, with no line-framing or re-encoding applied —
+    /// the byte-exact counterpart to `send(_:)` (which re-joins/CRLF-terminates
+    /// and re-encodes as ISO-Latin1, lossy for arbitrary captured bytes). Used
+    /// by `CaptureReplay` (Plan 3 Task 8) to feed a captured `s2c` chunk's
+    /// authoritative `hex` bytes exactly as the real server emitted them,
+    /// preserving whatever multi-line/partial-line TCP chunking the capture
+    /// recorded.
+    func sendRaw(_ data: Data) async throws {
+        await waitForPeer()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [peerState] in
                 guard let peer = peerState.peer else {
@@ -141,6 +152,49 @@ final class LoopbackIRCServer: @unchecked Sendable {
                 })
             }
         }
+    }
+
+    /// The bytes the peer (the `ProtocolSession`/engine under test) has sent
+    /// to this server so far, in receive order. Populated by a background
+    /// receive loop started on first access — `CaptureReplay` uses this to
+    /// collect `c2s` bytes the engine emits in response to a replayed capture,
+    /// for future byte-compare tests once real annotated `c2s` captures exist.
+    func startCollectingReceivedBytes() async {
+        // Must wait for the peer connection to actually exist before arming
+        // the receive loop: `newConnectionHandler`'s `state.peer = conn`
+        // (init, above) fires asynchronously once the TCP handshake
+        // completes on the SERVER side, which is not guaranteed to have
+        // already happened just because the CLIENT's `session.connect()`
+        // has returned (that only awaits the CLIENT side's `NWConnection`
+        // reaching `.ready`) -- an earlier version of this method started
+        // the loop synchronously and silently no-op'd (guard-return on a
+        // nil peer, never retried) when called immediately after `connect()`.
+        await waitForPeer()
+        queue.async { [self] in
+            if peerState.isCollectingReceives { return }
+            peerState.isCollectingReceives = true
+            receiveLoop()
+        }
+    }
+
+    private func receiveLoop() {
+        guard let peer = peerState.peer else { return }
+        peer.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, _ in
+            guard let self else { return }
+            self.queue.async {
+                if let data, !data.isEmpty {
+                    self.peerState.receivedBytes.append(data)
+                }
+                if !isComplete {
+                    self.receiveLoop()
+                }
+            }
+        }
+    }
+
+    /// Snapshot of everything received so far (see `startCollectingReceivedBytes`).
+    var receivedBytes: Data {
+        queue.sync { peerState.receivedBytes }
     }
 
     func stop() {
@@ -174,4 +228,7 @@ private final class PeerState: @unchecked Sendable {
     var peer: NWConnection?
     var peerIsReady = false
     var peerReadyContinuations: [CheckedContinuation<Void, Never>] = []
+    /// See `LoopbackIRCServer.startCollectingReceivedBytes`/`receivedBytes`.
+    var isCollectingReceives = false
+    var receivedBytes = Data()
 }

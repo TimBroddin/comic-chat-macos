@@ -2240,40 +2240,69 @@ void ccProcessMessage(CCSession& sess, char* szLine)
 // threaded (the original's comment) -- we re-find '\n' after each ProcessMessage
 // exactly like the original, since a handler can feed more (it doesn't here, but
 // the discipline is preserved).
+//
+// OUTER LOOP (Plan 3 Task 8 fix, discovered via captured-bytes replay,
+// spec section 8.2): the original Windows client's Receive() was called by
+// MFC's socket notification directly against the network buffer, so a
+// single call could never hand over more than m_nMaxMsgLength (512) bytes --
+// the OS read would naturally be bounded by the destination buffer size. The
+// bridge's equivalent (Swift's ProtocolSession.receiveLoop -> NWConnection,
+// Task 7) has no such bound: NWConnection.receive(maximumLength: 65536) can
+// legitimately deliver many IRC lines (well over 512 bytes total) in ONE
+// callback -- e.g. a real cchat.exe capture's post-001 MOTD burst
+// (Fixtures/captures/smoke-2.jsonl) arrives as a single ~1.4KB s2c chunk.
+// The original single-pass "append up to `space`, drain complete lines, done"
+// body silently DROPPED every byte past the first m_nMaxMsgLength of `data`
+// on such a call (never even copied into m_szInput, so gone for good, not
+// carried over) -- worse, the byte that happened to land at the truncation
+// boundary was often mid-line, so leftover partial-line bytes in m_szInput
+// then got PREPENDED to whatever the NEXT ccOnReceiveBytes call delivered,
+// producing corrupted concatenated "messages" (verified: replaying smoke-2.jsonl
+// produced a garbled statusLine mixing the tail of a 005 reply with the
+// following JOIN echo). Fix: loop the whole append-and-drain cycle,
+// advancing through `data`/`len` in m_nMaxMsgLength-sized (or smaller,
+// space-permitting) bites until every byte has been fed into m_szInput --
+// each bite still drains every complete line it produces before the next
+// bite is appended, so no more than m_nMaxMsgLength bytes are ever resident
+// in m_szInput at once (the single-line capacity bound this buffer was
+// actually sized for, ircproto.h's `m_szInput = new CHAR[m_nMaxMsgLength+1]`,
+// is preserved exactly). A single line longer than m_nMaxMsgLength still
+// behaves as before (the original's documented limitation, not something
+// this fix changes): it simply never completes with a '\n' inside the
+// capacity window and stalls harmlessly until more capacity frees up, which
+// cannot happen since the buffer is already full -- matching a real
+// bounded-line IRC server's contract, not a case any known capture exercises.
 void ccOnReceiveBytes(CCSession& sess, const uint8_t* data, size_t len)
 {
 	CIrcSocket& sock = sess.sock;
-	// Append into m_szInput up to its capacity (m_nMaxMsgLength). The original
-	// Receive()d directly into the tail with a bounded `space`; here we append
-	// the caller-supplied bytes with the same cap so a single over-long line
-	// can't overflow. Any bytes beyond capacity are dropped (matches the
-	// original's bounded Receive -- a well-behaved server never exceeds
-	// m_nMaxMsgLength per line).
-	char* startPtr = (char*)strchr(sock.m_szInput, '\0');
-	int space = (int)(sock.m_szInput + sock.m_nMaxMsgLength - startPtr);
-	int nRead = (int)len;
-	if (nRead > space) nRead = space;
-	if (nRead > 0) {
-		memcpy(startPtr, data, (size_t)nRead);
+	size_t offset = 0;
+	while (offset < len) {
+		char* startPtr = (char*)strchr(sock.m_szInput, '\0');
+		int space = (int)(sock.m_szInput + sock.m_nMaxMsgLength - startPtr);
+		if (space <= 0) break;  // buffer full with no line terminator yet -- see doc comment
+		size_t remaining = len - offset;
+		int nRead = (remaining < (size_t)space) ? (int)remaining : space;
+		memcpy(startPtr, data + offset, (size_t)nRead);
 		startPtr[nRead] = '\0';
-	}
+		offset += (size_t)nRead;
 
-	char* eoc = (char*)strchr(sock.m_szInput, '\n');
-	while (eoc) {
-		eoc++;
-		int comLen = (int)(eoc - sock.m_szInput);
-		strncpy(sock.m_szMessage, sock.m_szInput, comLen);
-		sock.m_szMessage[comLen] = '\0';
+		char* eoc = (char*)strchr(sock.m_szInput, '\n');
+		while (eoc) {
+			eoc++;
+			int comLen = (int)(eoc - sock.m_szInput);
+			strncpy(sock.m_szMessage, sock.m_szInput, comLen);
+			sock.m_szMessage[comLen] = '\0';
 
-		// move the rest of the message forward
-		char* eob = (char*)strchr(sock.m_szInput, '\0');
-		int nRest = (int)(eob - eoc);
-		memmove(sock.m_szInput, eoc, (size_t)nRest);
-		sock.m_szInput[nRest] = '\0';
+			// move the rest of the message forward
+			char* eob = (char*)strchr(sock.m_szInput, '\0');
+			int nRest = (int)(eob - eoc);
+			memmove(sock.m_szInput, eoc, (size_t)nRest);
+			sock.m_szInput[nRest] = '\0';
 
-		TRACE("Got message: %.100s\n", sock.m_szMessage);
-		ccProcessMessage(sess, sock.m_szMessage);
-		eoc = (char*)strchr(sock.m_szInput, '\n');  // re-find after ProcessMessage (reentrant)
+			TRACE("Got message: %.100s\n", sock.m_szMessage);
+			ccProcessMessage(sess, sock.m_szMessage);
+			eoc = (char*)strchr(sock.m_szInput, '\n');  // re-find after ProcessMessage (reentrant)
+		}
 	}
 }
 
