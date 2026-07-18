@@ -2512,6 +2512,17 @@ extern "C" int32_t cc_run_strip_selftest(const char* avatarPath,
 // on_event() call. Proves the boundary compiles, links, round-trips a byte,
 // and invokes a callback -- nothing more.
 static int cc_selftest_session_skeleton() {
+    // Review fix round 1: NULL-safety. cc_session_feed_bytes/fire_timer/
+    // test_echo must tolerate a NULL handle exactly like cc_session_destroy
+    // already does (the binding contract in comicchat.h: "no-op if s is
+    // NULL"). Reaching the CC_CHECK calls below without crashing IS the
+    // assertion -- a NULL deref would abort the process before we get here.
+    cc_session_feed_bytes(nullptr, reinterpret_cast<const uint8_t*>("x"), 1);
+    cc_session_fire_timer(nullptr, 0);
+    cc_session_test_echo(nullptr);
+    cc_session_destroy(nullptr);
+    CC_CHECK(true);  // survived all four NULL-handle calls above
+
     struct Cap { std::string sent; int events = 0; } cap;
     cc_session_config cfg = {};
     cfg.user_data = &cap;

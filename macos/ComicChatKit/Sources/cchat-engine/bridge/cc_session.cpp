@@ -32,15 +32,20 @@ void cc_session_destroy(cc_session* h) {
 }
 void cc_session_feed_bytes(cc_session* h, const uint8_t* d, size_t n) {
     CCSession* s = reinterpret_cast<CCSession*>(h);
+    if (!s) return;
     g_session = s;                       // activate for lifted code (Task 3+)
     s->inbuf.append(reinterpret_cast<const char*>(d), n);
     // Task 3 replaces this with the lifted line-framer + parse dispatch.
     g_session = nullptr;
 }
-void cc_session_fire_timer(cc_session* h, int32_t) { (void)h; /* Task 4 */ }
+void cc_session_fire_timer(cc_session* h, int32_t) {
+    if (!h) return;
+    /* Task 4 */
+}
 
 void cc_session_test_echo(cc_session* h) {
     CCSession* s = reinterpret_cast<CCSession*>(h);
+    if (!s) return;
     g_session = s;
     if (s->cfg.send) s->cfg.send(s->cfg.user_data,
                                  reinterpret_cast<const uint8_t*>("ECHO\r\n"), 6);

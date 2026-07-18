@@ -289,8 +289,8 @@ typedef struct cc_session_config {
 
 cc_session* cc_session_create(const cc_session_config* cfg);   /* NULL on bad cfg */
 void        cc_session_destroy(cc_session* s);                 /* no-op if NULL */
-void        cc_session_feed_bytes(cc_session* s, const uint8_t* data, size_t len);
-void        cc_session_fire_timer(cc_session* s, int32_t timer_id);
+void        cc_session_feed_bytes(cc_session* s, const uint8_t* data, size_t len); /* no-op if s is NULL */
+void        cc_session_fire_timer(cc_session* s, int32_t timer_id);                /* no-op if s is NULL */
 
 /* Test-only hook (Task 1): drives one send("ECHO\r\n") + one on_event. Removed
  * once real parsing lands; kept behind CC_SESSION_TESTHOOK. */
