@@ -107,6 +107,39 @@ public final class Strip {
         }
     }
 
+    /// Set (or update) the comic's title. Builds the title/starring credits
+    /// panel fresh (becoming PANEL 0) if no panels exist yet, or rebuilds the
+    /// existing title panel's starring rows in place if panel 0 is already a
+    /// title panel (`cc_strip_set_title`'s AddTitle/UpdateTitle decision,
+    /// Plan 4a Task 7). Call before `addParticipant`/`addLine` so panel 0 is
+    /// the title panel, matching `addParticipant`'s member-join refresh
+    /// (which itself only fires once a title has been set).
+    public func setTitle(_ title: String) throws {
+        let h = try requireHandle()
+        // CP-1252 bytes, matching addLine's encoding convention for engine text.
+        let bytes = title.data(using: .windowsCP1252) ?? Data(title.utf8)
+        let rc: Int32 = bytes.withUnsafeBytes { rawBuf -> Int32 in
+            var withNul = [CChar](repeating: 0, count: rawBuf.count + 1)
+            for i in 0..<rawBuf.count { withNul[i] = CChar(bitPattern: rawBuf[i]) }
+            return cc_strip_set_title(h, &withNul)
+        }
+        guard rc == 0 else {
+            throw StripError(message: "setTitle(\"\(title)\") failed")
+        }
+    }
+
+    /// Record `participant` (an id from `addParticipant`) as the strip's own
+    /// avatar -- starring order puts self first. `AddStars` renders nothing
+    /// until this is called (mirrors the original's "not registered yet"
+    /// guard); if a title has already been set, this also refreshes the
+    /// title panel immediately so self's starring row appears.
+    public func setSelf(_ participant: Int32) throws {
+        let h = try requireHandle()
+        guard cc_strip_set_self(h, participant) == 0 else {
+            throw StripError(message: "setSelf(\(participant)) failed")
+        }
+    }
+
     /// Ingest one scripted line spoken by `speaker` (a participant id from
     /// `addParticipant`). `addressees` name who the speaker is talking to
     /// (participant ids) — they drive the camera's facing/order.

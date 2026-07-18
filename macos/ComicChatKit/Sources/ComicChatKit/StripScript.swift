@@ -8,6 +8,8 @@ import CoreGraphics
 /// ```json
 /// {
 ///   "backdrop": "field.bgb",
+///   "title": "MY COMIC",
+///   "self": "Anna",
 ///   "participants": [
 ///     {"nick": "Anna", "avatar": "anna.avb"},
 ///     {"nick": "Armando", "avatar": "armando.avb"}
@@ -21,6 +23,11 @@ import CoreGraphics
 /// ```
 ///
 /// - `backdrop` is optional; omit it for no backdrop call.
+/// - `title` is optional (Plan 4a Task 7); if present, builds the title/
+///   starring panel (panel 0) via `Strip.setTitle`.
+/// - `self` is optional (Plan 4a Task 7); a participant nick (must be declared
+///   in `participants`) recorded via `Strip.setSelf` so the starring credits
+///   render. Applied before `title` when both are present.
 /// - `mode` is optional (default `"say"`); one of `say`, `think`, `whisper`,
 ///   `action` (mapped to `Strip.Mode.say/.think/.whisper/.action`).
 /// - `to` is optional (default `[]`); each entry must be a participant nick
@@ -90,6 +97,23 @@ public struct StripScript {
         var backdrop: String?
         var participants: [JSONParticipant]
         var lines: [JSONLine]
+        /// Plan 4a Task 7: optional comic title -- if present, builds the
+        /// title/starring panel (panel 0) via `Strip.setTitle`.
+        var title: String?
+        /// Plan 4a Task 7: optional self participant nick (must be declared in
+        /// `participants`) -- if present, calls `Strip.setSelf` so the
+        /// starring credits render (AddStars renders nothing until a self
+        /// participant is set). Applied BEFORE `title` (self-before-title is
+        /// the brief's documented valid ordering; both orders are valid, but
+        /// this one renders the starring rows on the very first title build
+        /// rather than needing a later refresh). Named `selfNick`, not `self`
+        /// (a Swift keyword), even though the JSON key is `"self"`.
+        var selfNick: String?
+
+        enum CodingKeys: String, CodingKey {
+            case backdrop, participants, lines, title
+            case selfNick = "self"
+        }
     }
     struct JSONParticipant: Codable {
         var nick: String
@@ -113,6 +137,11 @@ public struct StripScript {
     let backdropPath: String?
     let participants: [(nick: String, avatarPath: String)]
     let lines: [ResolvedLine]
+    /// Plan 4a Task 7: optional comic title (JSON `"title"`).
+    let title: String?
+    /// Plan 4a Task 7: optional self participant nick (JSON `"self"`),
+    /// validated against `participants` at init time.
+    let selfNick: String?
 
     /// Decode and validate the script at `url`. `comicartDir`, if given,
     /// resolves bare (non-absolute) avatar/backdrop names; if omitted, bare
@@ -177,9 +206,17 @@ public struct StripScript {
                                               mode: mode, to: to))
         }
 
+        if let selfNick = root.selfNick {
+            guard nickSeen.contains(selfNick) else {
+                throw ScriptError.unknownNick(selfNick)
+            }
+        }
+
         self.backdropPath = root.backdrop.map(resolve)
         self.participants = resolvedParticipants
         self.lines = resolvedLines
+        self.title = root.title
+        self.selfNick = root.selfNick
     }
 
     /// The rendered result: PNG bytes plus the dimensions/panel count the
@@ -208,6 +245,17 @@ public struct StripScript {
             case .failure(let error):
                 throw error
             }
+        }
+
+        // Plan 4a Task 7: self-before-title (see selfNick's doc comment) --
+        // AddStars renders the starring rows on the very first AddTitle call
+        // when self is already set, rather than needing set_title's later
+        // add_participant/set_self-triggered UpdateTitle refresh.
+        if let selfNick = selfNick {
+            try strip.setSelf(ids[selfNick]!)   // validated in init: present in ids
+        }
+        if let title = title {
+            try strip.setTitle(title)
         }
 
         if let backdrop = backdropPath {

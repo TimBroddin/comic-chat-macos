@@ -514,28 +514,32 @@ char *GetRandomTitle()
 #endif // CC_NO_UI (R11: GetRandomTitle)
 
 
-// R11 (whole function): AddStarsAux serves the title-page "starring" credits —
-// it reaches the doc's live member map (g_mapNickToPtr), g_puiSelf, and the
-// connection status. None of that exists headless, and the title page is not on
-// the AddLine layout path. Title/starring rendering is a known functional
-// deferral this plan (session.comicsTitle exists for when it's restored). See
-// the R11 list in p2-task-8-report.md.
-#ifndef CC_NO_UI
+// Plan 4a Task 7 (un-R11): AddStarsAux serves the title-page "starring"
+// credits. Two reroutes (R17), everything else verbatim:
+//   - g_mapNickToPtr (the doc's live member map, keyed by nick) -> the
+//     headless session user table (ccContext().session.users[0..userCount)),
+//     which is where every registered participant's CUserInfo lives in this
+//     port (cc_compose.cpp's cc_strip_add_participant wiring invariant).
+//   - g_puiSelf (pointer to the doc's own CUserInfo) -> a same-shape
+//     comparison against ccContext().session.selfParticipant (the id
+//     cc_strip_set_self records): `pui->GetAvatarID() == selfParticipant`
+//     identifies the same "is this the self entry" test g_puiSelf pointer
+//     identity performed, since every session user's GetAvatarID() is unique
+//     and stable for the session's lifetime.
+// The insertion/ordering algorithm itself (self first, then by departed-last +
+// m_nSends-descending) is untouched.
 void AddStarsAux(CPtrArray &stars, int maxStars)
 {
 	int inserted, GetAvatarUpperBound();
-	void *p;
-	CString nick;
+	CCSessionSettings &sess = ccContext().session;  // R17: was g_mapNickToPtr's owning doc
 
-	POSITION pos = g_mapNickToPtr->GetStartPosition();
-	while (pos) {
-		g_mapNickToPtr->GetNextAssoc(pos, nick, p);
-		CUserInfo *pui = (CUserInfo *) p;
+	for (int u = 0; u < sess.userCount; u++) {  // R17: was g_mapNickToPtr's GetStartPosition/GetNextAssoc walk
+		CUserInfo *pui = &sess.users[u].info;
 		CAvatarX *newAv = GetAvatar(pui->GetAvatarID());
 		if (!newAv->m_icon) continue;
 		BOOL usDeparted = pui->IsDeparted();
 
-		if (pui == g_puiSelf) {
+		if (pui->GetAvatarID() == sess.selfParticipant) {  // R17: was (pui == g_puiSelf)
 			stars.InsertAt(0, newAv);
 			continue;
 		} else {
@@ -584,7 +588,6 @@ void AddStarsAux(CPtrArray &stars, int maxStars)
 	}
 #endif
 }
-#endif // CC_NO_UI (R11: AddStarsAux)
 
 
 BOOL CPanelElement::SetBBox(int left, int bottom, int right, int top)
@@ -1367,12 +1370,15 @@ void CUnitPanelPage::GetBBox(RECT *rect) {
 }
 
 
-// R11 (whole function): AddTitle builds the title/starring credits panel —
-// CLabel/CStarLabel title art + AddStars (which reaches the doc's member map).
-// Title rendering is a known functional deferral this plan (headless strips have
-// no title panel; session.comicsTitle exists for restoration). AddTitle is a
-// pure virtual in CPage -> #else no-op keeps the class instantiable.
-#ifndef CC_NO_UI
+// Plan 4a Task 7 (un-R11): AddTitle builds the title/starring credits panel --
+// CLabel/CStarLabel title art + AddStars (which reads the session user table,
+// also un-R11'd this task). One reroute:
+//   - starringStr.LoadString(ID_STARRING) -> a direct R9 constant. ID_STARRING
+//     (resource.h:990, value 63017) has no other lifted reader and this port
+//     has no resource compiler (R6), so rather than add a single-entry
+//     LoadString registration for one never-reused id, the verified resource
+//     TEXT itself (chat.rc:2275: `ID_STARRING "STARRING"` -- all caps,
+//     verbatim) becomes the constant directly.
 void CUnitPanelPage::AddTitle(const char *title) {
 	CString starringStr;
 	RECT border;
@@ -1380,7 +1386,7 @@ void CUnitPanelPage::AddTitle(const char *title) {
 	CLabel *titleL = new CLabel(title, m_fiTitle);
 	titleL->SetBBox(0, -m_unitHeight/2, m_unitWidth, -100);
 	titleL->GetBBox(&border);
-	starringStr.LoadString(ID_STARRING);
+	starringStr = "STARRING";  // R9: was starringStr.LoadString(ID_STARRING) -- chat.rc:2275
 	CLabel *starringL = new CLabel(starringStr, m_fiShout);
 	starringL->SetBBox(0, -m_unitHeight, m_unitWidth, border.bottom);
 	CUnitPanel *newPanel = new CUnitPanel;
@@ -1392,16 +1398,13 @@ void CUnitPanelPage::AddTitle(const char *title) {
 	AddStars(newPanel, border.bottom);
 	AddPanel(newPanel);
 }
-#else
-void CUnitPanelPage::AddTitle(const char *) {}  // R11: title panel deferred headless
-#endif // CC_NO_UI (R11: AddTitle)
 
 
-// R11 (whole function): UpdateTitle rebuilds the title/starring panel. Reads
-// GetChatDoc()->GetComicsTitle() (would be R17 session.comicsTitle if ported)
-// and calls AddStars/AddTitle (R11) + RefreshPanelN. Title is deferred (see
-// AddTitle). UpdateTitle is a pure virtual in CPage -> #else no-op.
-#ifndef CC_NO_UI
+// Plan 4a Task 7 (un-R11): UpdateTitle rebuilds the title/starring panel. One
+// reroute (already applied by Plan 2 Task 8, ahead of this task's un-wrap):
+// GetChatDoc()->GetComicsTitle() -> ccContext().session.comicsTitle. AddStars
+// and RefreshPanelN are both live now (AddStars un-R11'd this task;
+// RefreshPanelN was already a live headless no-op, panel.cpp:1094).
 void CUnitPanelPage::UpdateTitle() {
 	if (m_panels.IsEmpty())
 		AddTitle(ccContext().session.comicsTitle);  // R17: was GetChatDoc()->GetComicsTitle()
@@ -1417,9 +1420,6 @@ void CUnitPanelPage::UpdateTitle() {
 		RefreshPanelN(0);
 	}
 }
-#else
-void CUnitPanelPage::UpdateTitle() {}  // R11: title panel deferred headless
-#endif // CC_NO_UI (R11: UpdateTitle)
 
 
 // R11 (whole function): ShowInfo builds the per-avatar "info" credit panels
@@ -1504,13 +1504,12 @@ void CUnitPanelPage::ShowInfo(USHORT, const char *, char) {}  // R11: info panel
 #endif // CC_NO_UI (R11: ShowInfo)
 
 
-// R11 (whole function): AddStars builds the starring-credits rows — reaches
-// MyAvatarID()/MyAvatar() (return 0/NULL headless) and AddStarsAux (R11), and
-// draws CStarLabel icon+name rows. Part of the deferred title subsystem.
-// AddStars is a plain virtual (not pure) in CUnitPanelPage; wrapping the whole
-// body is safe because no lifted code outside the (also-R11) title functions
-// calls it.
-#ifndef CC_NO_UI
+// Plan 4a Task 7 (un-R11): AddStars builds the starring-credits rows -- reaches
+// MyAvatarID()/MyAvatar() (now live, un-R11'd this task: returns the
+// set_self participant/its CAvatarX, 0/NULL if unset -- the early return
+// below preserves the "not registered yet" guard verbatim) and AddStarsAux
+// (also un-R11'd this task), and draws CStarLabel icon+name rows. No reroute
+// needed in this body -- verbatim.
 void CUnitPanelPage::AddStars(CUnitPanel *panel, int topY) {
 	CPtrArray stars;
 	CPtrArray sLabels;
@@ -1567,9 +1566,6 @@ void CUnitPanelPage::AddStars(CUnitPanel *panel, int topY) {
 		topY -= rowHeight;
 	}
 }
-#else
-void CUnitPanelPage::AddStars(CUnitPanel *, int) {}  // R11: starring credits deferred headless
-#endif // CC_NO_UI (R11: AddStars)
 
 
 // R11 (whole function): PageSizeInPanels reads CPrintInfo::m_rectDraw (the

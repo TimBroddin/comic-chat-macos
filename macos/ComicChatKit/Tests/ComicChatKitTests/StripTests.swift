@@ -131,6 +131,36 @@ extension EngineGlobalStateSelfTests {
         }
     }
 
+    // Plan 4a Task 7: the Strip.setTitle/setSelf Swift wrappers (not just the
+    // underlying C API, which cc_run_strip_title_starring_selftest already
+    // covers in BodyDrawTests.swift). setSelf before setTitle, then a line;
+    // panel 0 is the title panel and panelCount grows with each speech panel.
+    @Test func setTitleAndSetSelfBuildTitlePanel() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            let strip = try Strip()
+            let avatar = fixture("anna.avb")
+            let a = try strip.addParticipant(nick: "Anna", avbPath: avatar)
+
+            try strip.setSelf(a)
+            try strip.setTitle("MY COMIC")
+            #expect(strip.panelCount == 1)   // title panel only, no lines yet
+
+            try strip.addLine(speaker: a, text: "Hello there", modes: .say, addressees: [])
+            #expect(strip.panelCount == 2)   // title panel (0) + one speech panel
+
+            let recorder = RecordingCanvas()
+            try strip.compose(onto: recorder)
+            let joined = recorder.log.joined(separator: "\n")
+            #expect(joined.contains("MY COMIC"))
+            #expect(joined.contains("STARRING"))
+            #expect(joined.contains("Anna"))
+        }
+    }
+
     // (b) THE EXIT MILESTONE: the same conversation composited through CGCanvas
     // into real pixels. Asserts non-empty PNG data, expected pixel dimensions
     // (page size in twips / 20 points, at 2x scale), and >1% non-white pixels

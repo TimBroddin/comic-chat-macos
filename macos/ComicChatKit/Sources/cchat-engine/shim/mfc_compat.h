@@ -746,6 +746,15 @@ struct CHARFORMAT;
 #define RGN_COPY    5
 #define LOGPIXELSX  88
 #define LOGPIXELSY  90
+// DrawTextEx flags (rule R9; Plan 4a Task 7): real Win32 bit values, needed
+// only so CStarLabel::Draw's un-wrapped call site (balloon.cpp) still compiles
+// with its original flags expression -- CDC::DrawTextEllipsis (below) takes
+// the combined UINT opaquely and never decodes individual bits, so exact
+// values matter only for documentation fidelity with the original constants.
+#define DT_LEFT          0x00000000
+#define DT_SINGLELINE    0x00000020
+#define DT_NOPREFIX      0x00000800
+#define DT_END_ELLIPSIS  0x00008000
 // SRCCOPY already defined above (Plan 1, dib.h default-arg compatibility).
 // StretchDIBits only supports SRCCOPY in this adapter (R14(i)); any other
 // rop is a forced-explicit-transformation site (ASSERT(0) — ports that need
@@ -1007,6 +1016,63 @@ public:
         toLogical(x, y, lx, ly);
         canvasWrap().draw_text(&f, lx, ly, textColor_, bkMode_ == OPAQUE ? 1 : 0,
                                 bkColor_, s, len);
+    }
+
+    // R9 (Plan 4a Task 7): adapter for CStarLabel::Draw's
+    // DrawTextEx(pdc->m_hDC, sz, -1, &rect, DT_LEFT|DT_NOPREFIX|DT_SINGLELINE|
+    // DT_END_ELLIPSIS, NULL) -- a Win32 single-line ellipsized-draw idiom with
+    // no 1:1 cc_canvas op (R14: unmappable GDI idiom; measure_text/draw_text
+    // only draw a caller-supplied byte run, they don't fit-and-truncate).
+    // Built over the two ops that DO exist: measure_text (binary-search the
+    // longest prefix that, with "..." appended, fits the box width) then
+    // draw_text (the actual paint, left-justified, single line, transparent
+    // background -- flags is accepted but not decoded: every caller in this
+    // port passes exactly DT_LEFT|DT_NOPREFIX|DT_SINGLELINE|DT_END_ELLIPSIS,
+    // and there is no other combination to honor).
+    //
+    // Box-top alignment: draw_text's `y` is the GDI TA_TOP box-top (see
+    // comicchat.h's doc comment on cc_canvas_ops::draw_text) -- the same
+    // convention TextOut(rect->left, rect->top, ...) above already uses, so
+    // this draws at the box's top-left corner, matching DrawTextEx's default
+    // (no DT_VCENTER/DT_BOTTOM) top alignment.
+    //
+    // sz is NOT required to be NUL-terminated at exactly its fitting point --
+    // it must be a NUL-terminated C string (mirrors DrawTextEx's nCount==-1
+    // convention, the only form CStarLabel::Draw ever uses).
+    void DrawTextEllipsis(const char* sz, RECT* rc, UINT flags) {
+        (void)flags;  // see comment above: accepted, not decoded
+        int boxWidth = rc->right - rc->left;
+        int fullLen = (int)strlen(sz);
+
+        CSize fullExtent = GetTextExtent(sz, fullLen);
+        if (fullExtent.cx <= boxWidth) {
+            // Untruncated: the whole string already fits.
+            TextOut(rc->left, rc->top, sz, fullLen);
+            return;
+        }
+
+        // Truncated: binary-search the longest prefix length (0..fullLen)
+        // whose measured width, WITH "..." appended, is <= boxWidth. The
+        // search predicate is monotone (longer prefix -> wider), so a
+        // standard binary search finds the max fitting length in O(log n)
+        // measure_text calls rather than a linear scan.
+        static const char kEllipsis[] = "...";
+        const int ellipsisLen = 3;
+        int lo = 0, hi = fullLen;  // invariant: lo fits, hi may not
+        while (lo < hi) {
+            int mid = lo + (hi - lo + 1) / 2;  // round up -- probe toward hi
+            CSize prefixExtent = GetTextExtent(sz, mid);
+            CSize ellipsisExtent = GetTextExtent(kEllipsis, ellipsisLen);
+            if (prefixExtent.cx + ellipsisExtent.cx <= boxWidth) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        std::string truncated(sz, sz + lo);
+        truncated += kEllipsis;
+        TextOut(rc->left, rc->top, truncated.c_str(), (int)truncated.size());
     }
 
     // --- paths (see brief's "Adapter semantics": between BeginPath/EndPath,

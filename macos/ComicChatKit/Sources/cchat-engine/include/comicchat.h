@@ -58,6 +58,16 @@ int32_t cc_run_panel_geometry_selftest(const char* avatar_path);
  * needs two fixture paths. */
 int32_t cc_run_avatar_api_selftest(const char* avatar_path, const char* other_avatar_path);
 
+/* Plan 4a Task 7: title/starring lift selftest. Opens avatar_path TWICE (two
+ * participants) plus other_avatar_path (a third, added after a title is set --
+ * exercises the add_participant/UpdateTitle member-join wiring). Drives
+ * set_self, set_title, two lines, and asserts the composed recording-canvas
+ * log carries the title text, "STARRING", and every participant's nickname in
+ * the starring rows -- see cc_selftest_strip_title_starring's own comment for
+ * the full assertion list. Returns 0 on success (failure count otherwise).
+ * Kept out of cc_run_selftests because it needs two fixture paths. */
+int32_t cc_run_strip_title_starring_selftest(const char* avatar_path, const char* other_avatar_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env
@@ -349,6 +359,45 @@ void      cc_strip_get_panel_geometry(const cc_strip* s, int32_t* unit_w,
 /* Composite the finished page onto `canvas` (the R16 headless replacement for
  * CUnitPanelPage::Draw). Returns 0 on success. */
 int32_t   cc_strip_compose(cc_strip* s, cc_canvas* canvas); /* 0 ok */
+
+/* Plan 4a Task 7: title/starring panel (un-R11 lift of AddTitle/UpdateTitle/
+ * AddStars/AddStarsAux + CStarLabel::Draw).
+ *
+ * cc_strip_set_title stores `title_bytes` (CP-1252) into
+ * ccContext().session.comicsTitle and either builds the title panel fresh
+ * (CUnitPanelPage::AddTitle, if no panels exist yet -- the title becomes
+ * PANEL 0) or rebuilds the existing title panel's starring rows in place
+ * (CUnitPanelPage::UpdateTitle, if panel 0 already exists), per the original
+ * UpdateTitle's own branch (panel.cpp AddTitle/UpdateTitle). Calling this
+ * BEFORE any cc_strip_add_participant/add_line makes panel 0 the title panel;
+ * calling it after lines exist updates panel 0 (which by then is a real
+ * speech panel from the FIRST line -- see the note below). Returns 0 on
+ * success, non-zero if `s`/`title_bytes` is NULL.
+ *
+ * cc_strip_set_self records `participant` (a participant id from
+ * add_participant) as the strip's own avatar -- the original's
+ * GetChatDoc()->m_myAvatarID / MyAvatarID(), which this port has no doc to
+ * back (R17: ccContext().session.selfParticipant). AddStars renders NOTHING
+ * until a self participant is set (it early-returns, exactly like the
+ * original -- panel.cpp AddStars' "not registered yet" guard) -- so
+ * set_title BEFORE set_self renders a title-only panel (valid: the title/
+ * starring-header labels exist, the starring ROWS don't yet). Once a title
+ * already exists (comicsTitle non-empty), set_self also triggers UpdateTitle
+ * so the just-registered self's starring row appears immediately. Returns 0
+ * on success, non-zero if `s` is NULL or `participant` is not a known id.
+ *
+ * ORDER NOTE (panel 0 vs. line panels): AddTitle always AddPanel's onto the
+ * TAIL of an empty page, so calling set_title on a strip with ZERO panels
+ * makes the title panel panel 0. If lines were already added before
+ * set_title is first called, panel 0 is whatever the first LINE built --
+ * set_title's AddTitle branch only fires on m_panels.IsEmpty(), so in that
+ * case it instead falls through and would need panels to already look like a
+ * title panel for UpdateTitle's rebuild-in-place branch to be safe; callers
+ * in this port always call set_title (and set_self) before the first
+ * add_line/add_line_cooked, matching the "title panel is always panel 0"
+ * contract Task 11 relies on. */
+int32_t   cc_strip_set_title(cc_strip* s, const char* title_bytes); /* 0 ok */
+int32_t   cc_strip_set_self(cc_strip* s, int32_t participant); /* 0 ok; starring order: self first */
 
 /* ---- Protocol session (Plan 3): bytes in, events out ---------------------
  * The engine never opens a socket. Swift owns NWConnection and the event loop.

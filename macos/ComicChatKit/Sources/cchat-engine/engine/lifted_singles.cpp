@@ -40,6 +40,12 @@
 //     * CUserInfo::CUserInfo()   -- userinfo.cpp:111 (trivial field zeroing)
 //     * CUserInfo::GetScreenName -- userinfo.cpp:172 (first non-inline virtual,
 //                                   emits the vtable; self-contained, no theApp)
+//     * CUserInfo::SetScreenName -- userinfo.cpp:163 (Plan 4a Task 7: needed by
+//                                   the inline CUserInfo::SetName, userinfo.h:
+//                                   127-131, which cc_strip_add_participant now
+//                                   calls so AddStars' starring rows have a
+//                                   real nickname to render -- self-contained,
+//                                   no theApp)
 //   The one remaining vtable slot, GetQualifiedName (userinfo.cpp:179, touches
 //   theApp.m_bShowIdentity -- UI), is an R12(b) trap stub in cc_link_stubs.cpp
 //   (never called on session users). Plan 3 lifts userinfo.cpp and deletes
@@ -169,6 +175,18 @@ CString & CUserInfo::GetScreenName() {
 		return m_strScreenName;
 	else
 		return m_strName;
+}
+
+// lifted verbatim from userinfo.cpp:163 (Plan 4a Task 7 addition — see Entry 3
+// comment above). Self-contained (reads/writes only members), so it is
+// faithful to lift as-is.
+void CUserInfo::SetScreenName(const char *name) {
+	if (name) {
+		m_strScreenName = name;
+		m_flags |= UF_SCREENNAME;
+	}
+	else
+		m_flags &= ~UF_SCREENNAME;
 }
 
 // --- Entry 4: pageview.cpp cross-file singles (R12a + R17) -------------------

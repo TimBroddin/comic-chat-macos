@@ -208,13 +208,19 @@ LoadTorso:
 	return bRet;
 }
 
-#ifndef CC_NO_UI  // R11: screen-name lookup is UI/session layer (CUserInfo), not load/parse path
+// Plan 4a Task 7 (un-R11, DISCOVERED DEPENDENCY -- flagged in report, not in
+// the brief's explicit reroute list): AddStars (panel.cpp, un-R11'd this task)
+// calls star->GetScreenName(&szNickname) on every starring row; this was left
+// R11-wrapped in Plan 2 only because AddStars itself was wrapped then (no
+// lifted caller reached it). No reroute needed -- CUserInfo::GetScreenName()
+// is already live (lifted_singles.cpp:167, Plan 2 Task 8/R12a), and m_userInfo
+// is populated by cc_strip_add_participant's wiring invariant (cc_compose.cpp)
+// for every avatar this can be called on. Verbatim body.
 void CAvatarX::GetScreenName(const char **screenName) {
 	CUserInfo *pui = (CUserInfo *) m_userInfo;
 	ASSERT(pui);
 	*screenName = (LPCTSTR) pui->GetScreenName();
 }
-#endif
 
 CBody *CAvatarSimple::GetBodyFromEmotion(CEmotion &emotion) {
 	CBodySingle *body = new CBodySingle(m_avatarID);
@@ -550,13 +556,17 @@ CAvatarX *CAvatarX::IndexAvatar() {
 }
 
 
-// R11: my-avatar lookup is UI/session layer (GetChatDoc), not load/parse path.
-// Header declarations (avatar.h) stay as-is; stub bodies return "no avatar
-// selected" so callers outside CC_NO_UI (e.g. GetNextAvatarName) still work.
-#ifndef CC_NO_UI
+// Plan 4a Task 7 (un-R11): my-avatar lookup was UI/session layer (GetChatDoc),
+// not load/parse path -- but AddStars (panel.cpp) needs a real answer to
+// render the starring credits, so this un-wraps with an R17 reroute:
+// GetChatDoc()->m_myAvatarID (the doc field cc_strip_set_self now has no doc
+// to write) -> ccContext().session.selfParticipant (same zero-sentinel
+// convention: 0 == "no self set yet", set by cc_strip_set_self). GetChatDoc()
+// itself doesn't exist headless (chatdoc.h deleted per R8), so every
+// GetChatDoc()-guarded read collapses to the session field directly.
 CAvatarX *MyAvatar() {
-	if (GetChatDoc() && GetChatDoc()->m_myAvatarID != 0)
-		return ((CAvatarX *) avatars[GetChatDoc()->m_myAvatarID]);
+	if (ccContext().session.selfParticipant != 0)  // R17: was GetChatDoc() && GetChatDoc()->m_myAvatarID != 0
+		return ((CAvatarX *) avatars[ccContext().session.selfParticipant]);  // R17: was avatars[GetChatDoc()->m_myAvatarID]
 	else return NULL;
 }
 
@@ -565,14 +575,8 @@ const char *MyAvatarURL() {
 }
 
 UINT MyAvatarID() {
-	if (GetChatDoc()) return GetChatDoc()->m_myAvatarID;
-	else return 0;
+	return ccContext().session.selfParticipant;  // R17: was GetChatDoc() ? GetChatDoc()->m_myAvatarID : 0
 }
-#else
-CAvatarX *MyAvatar() { return NULL; }
-const char *MyAvatarURL() { return NULL; }
-UINT MyAvatarID() { return 0; }
-#endif
 
 #if 0
 	avatars[10] = MakeAvatar_Simple("GreekChorus", "kibbitz", 10, 0, 129, 97, 40);

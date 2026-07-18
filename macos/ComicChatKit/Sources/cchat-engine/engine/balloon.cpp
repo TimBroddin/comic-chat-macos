@@ -1147,16 +1147,18 @@ void CLabel::GetBBox(RECT *r)
 
 // CStarLabel members
 
-// R11 (Plan 2 Task 6): CStarLabel::Draw renders "conversation star" labels via
-// DrawTextEx -- a Win32 single-line ellipsized-draw idiom with no cc_canvas
-// adapter mapping (R14: unmappable GDI idiom). It is a UI decoration, not part
-// of layout geometry; the definition stays for vtable completeness (it
-// overrides CLabel::Draw), body wrapped whole with an empty #else (star labels
-// simply don't render headlessly). Restored verbatim when the UI layer lands.
+// Plan 4a Task 7 (un-R11): CStarLabel::Draw renders "conversation star"
+// labels. One reroute: DrawTextEx(pdc->m_hDC, ..., DT_LEFT|DT_NOPREFIX|
+// DT_SINGLELINE|DT_END_ELLIPSIS, NULL) -> pdc->DrawTextEllipsis(...) (R9 shim
+// member, mfc_compat.h) -- a Win32 single-line ellipsized-draw idiom with no
+// 1:1 cc_canvas op (R14: unmappable GDI idiom), now implemented over the
+// existing measure_text/draw_text ops instead of a raw HDC call. `ul`/
+// `dmgArea` are unused in the original too (CLabel::Draw's override
+// signature -- this file's own live CLabel::Draw, balloon.cpp:914, leaves
+// them unused the same way).
 void CStarLabel::Draw(CDC *pdc, POINT *ul, RECT *dmgArea)
 {
 	// 04/28/98 RegisB - created CStarLabel for conversation stars
-#ifndef CC_NO_UI
 	CFormatInfo fi;
 	GetFormatInfoCommon(pdc, &fi);
 
@@ -1166,13 +1168,10 @@ void CStarLabel::Draw(CDC *pdc, POINT *ul, RECT *dmgArea)
 
 	pdc->SetBkMode(TRANSPARENT);
 
-	DrawTextEx(pdc->m_hDC, fi.m_rgszStarts[0], -1, &rect, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS, NULL);
+	pdc->DrawTextEllipsis(fi.m_rgszStarts[0], &rect, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS);  // R9: was DrawTextEx(pdc->m_hDC, ..., NULL)
 
 	pdc->SelectObject(pOldFont);
 	pdc->SetTextColor(crOldColor);
-#else
-	(void)pdc; (void)ul; (void)dmgArea;
-#endif
 }
 
 

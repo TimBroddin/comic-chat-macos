@@ -68,6 +68,15 @@ struct CCSessionSettings {
     UINT     backdropID = 0;
     char     comicsTitle[128] = "";
 
+    // Plan 4a Task 7 (R17): MyAvatarID()/MyAvatar() (avatar.cpp) read
+    // GetChatDoc()->m_myAvatarID -- the doc's notion of "which participant is
+    // me" (set by the original's SetMyAvatar, chatdoc.h). GetChatDoc() itself
+    // doesn't exist headless (chatdoc.h is deleted per R8), so this is the
+    // session-side replacement: 0 == "no self set yet" (the original's same
+    // zero-sentinel convention -- MyAvatarID() returns 0 when unset), set by
+    // the new cc_strip_set_self bridge entry.
+    UINT     selfParticipant = 0;
+
     // Plan 2 Task 9 (R17): textpose.cpp's ChatPreSendText read
     // GetChatDoc()->m_bComicView (textpose.cpp:122) to gate emotion inference
     // ("only has to do with Comics mode" -- chatdoc.cpp:211's comment on the

@@ -2743,6 +2743,158 @@ extern "C" int32_t cc_run_avatar_api_selftest(const char* avatarPath,
     return g_failures;
 }
 
+// --- Plan 4a Task 7: title/starring lift (un-R11 AddTitle/UpdateTitle/
+//     AddStars/AddStarsAux + CStarLabel::Draw) + cc_strip_set_title/set_self.
+// Two participants -> set_self(p1) -> set_title("MY COMIC") -> two lines ->
+// compose. Asserts: panel_count >= 3 (title + 2 speech panels), the ops
+// stream carries a text op with "MY COMIC" (the title label) and one with
+// "STARRING" (ID_STARRING's verified chat.rc text, all caps) and BOTH
+// participants' nicknames (the starring rows AddStarsAux/AddStars build).
+// Then a 3rd participant joins (title already set -> cc_strip_add_participant's
+// conditional UpdateTitle refresh fires) -> recompose -> its nickname appears
+// too, proving the member-join wiring.
+static int cc_selftest_strip_title_starring(const char* avatarPath,
+                                            const char* otherAvatarPath) {
+    int startFailures = g_failures;
+
+    static CCRecordingCanvas titleMetrics;
+    cc_set_metrics_canvas(titleMetrics.handle());
+
+    cc_strip* s = cc_strip_create();
+    CC_CHECK(s != NULL);
+    if (!s) return g_failures - startFailures;
+
+    int32_t p1 = cc_strip_add_participant(s, "Anna", avatarPath);
+    int32_t p2 = cc_strip_add_participant(s, "Boris", avatarPath);
+    CC_CHECK(p1 == 1);
+    CC_CHECK(p2 == 2);
+    if (p1 < 0 || p2 < 0) { cc_strip_destroy(s); return g_failures - startFailures; }
+
+    // --- set_self before set_title: title-only panel is a valid state
+    // (AddStars early-returns "not registered yet" until self is set --
+    // panel.cpp -- so this ordering choice, self first, is the one the brief
+    // calls out as valid; here self IS set before title, so AddStars renders
+    // starring rows on the very first AddTitle call, not just on a later
+    // UpdateTitle).
+    CC_CHECK(cc_strip_set_self(s, p1) == 0);
+    // Bad participant id -> rejected.
+    CC_CHECK(cc_strip_set_self(s, 999) != 0);
+
+    CC_CHECK(cc_strip_set_title(s, "MY COMIC") == 0);
+
+    int32_t aAddr[1] = { p2 };
+    int32_t bAddr[1] = { p1 };
+    CC_CHECK(cc_strip_add_line(s, p1, "Hello there", CC_MODE_SAY, aAddr, 1) == 0);
+    CC_CHECK(cc_strip_add_line(s, p2, "Hi yourself", CC_MODE_SAY, bAddr, 1) == 0);
+
+    int32_t panelCount = cc_strip_panel_count(s);
+    CC_CHECK(panelCount >= 3);   // title panel (0) + >= 2 speech panels
+
+    {
+        CCRecordingCanvas compose;
+        CC_CHECK(cc_strip_compose(s, compose.handle()) == 0);
+        const std::vector<std::string>& log = compose.log();
+        CC_CHECK(!log.empty());
+
+        bool sawTitle = false, sawStarring = false, sawAnna = false, sawBoris = false;
+        for (size_t i = 0; i < log.size(); i++) {
+            if (log[i].compare(0, 5, "text ") != 0) continue;
+            if (log[i].find("\"MY COMIC\"") != std::string::npos) sawTitle = true;
+            if (log[i].find("STARRING") != std::string::npos) sawStarring = true;
+            if (log[i].find("ANNA") != std::string::npos) sawAnna = true;      // Capitalize()'d balloon text
+            if (log[i].find("Anna") != std::string::npos) sawAnna = true;      // starring row (CLabel, not capitalized)
+            if (log[i].find("Boris") != std::string::npos) sawBoris = true;
+        }
+        CC_CHECK(sawTitle);
+        CC_CHECK(sawStarring);
+        CC_CHECK(sawAnna);
+        CC_CHECK(sawBoris);
+    }
+
+    // --- 3rd participant joins AFTER a title is set -> cc_strip_add_participant's
+    //     conditional UpdateTitle fires -> recompose shows the new nickname too.
+    int32_t p3 = cc_strip_add_participant(s, "Carla", otherAvatarPath);
+    CC_CHECK(p3 == 3);
+    if (p3 >= 0) {
+        CCRecordingCanvas compose2;
+        CC_CHECK(cc_strip_compose(s, compose2.handle()) == 0);
+        const std::vector<std::string>& log2 = compose2.log();
+        bool sawCarla = false;
+        for (size_t i = 0; i < log2.size(); i++) {
+            if (log2[i].compare(0, 5, "text ") != 0) continue;
+            if (log2[i].find("Carla") != std::string::npos) sawCarla = true;
+        }
+        CC_CHECK(sawCarla);
+    }
+
+    cc_strip_destroy(s);
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift wrapper, which passes the anna.avb + armando.avb
+// fixture paths. Runs standalone (resets g_failures).
+extern "C" int32_t cc_run_strip_title_starring_selftest(const char* avatarPath,
+                                                         const char* otherAvatarPath) {
+    g_failures = 0;
+    if (avatarPath == NULL || otherAvatarPath == NULL) return 1;
+    cc_selftest_strip_title_starring(avatarPath, otherAvatarPath);
+    return g_failures;
+}
+
+// --- Plan 4a Task 7: CDC::DrawTextEllipsis selftest --------------------------
+// Drives the new shim member directly over a recording canvas: a short string
+// (fits the box) must draw UNTRUNCATED; a long string (doesn't fit) must draw
+// truncated, ending in "..." and fitting the box width. The recording
+// canvas's measure_text is deterministic (len*120 wide, cc_recording_canvas.cpp)
+// so both expectations are exact arithmetic, not approximate.
+static void cc_selftest_draw_text_ellipsis() {
+    LOGFONT lf;
+    memset(&lf, 0, sizeof(lf));
+    strcpy(lf.lfFaceName, "Comic Sans MS");
+    lf.lfHeight = -240;
+    lf.lfWeight = 400;
+    CFont font;
+    font.CreateFontIndirect(&lf);
+
+    // --- (a) short string, box wide enough: untruncated, exact text.
+    {
+        CCRecordingCanvas rec;
+        CDC dc(rec.handle());
+        dc.SelectObject(&font);
+        RECT rect; SetRect(&rect, 0, 0, 1200, -240);   // 1200 twips wide
+        dc.DrawTextEllipsis("hi", &rect, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == 1);
+        if (!log.empty())
+            CC_CHECK(log.back() == "text 0,0 color=000000 \"hi\"");
+    }
+
+    // --- (b) long string, box too narrow: truncated, ends "...", fits.
+    {
+        CCRecordingCanvas rec2;
+        CDC dc2(rec2.handle());
+        dc2.SelectObject(&font);
+        RECT rect; SetRect(&rect, 0, 0, 600, -240);    // 600 twips: "hello world" (11*120=1320) doesn't fit
+        dc2.DrawTextEllipsis("hello world", &rect, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const std::vector<std::string>& log = rec2.log();
+        CC_CHECK(log.size() == 1);
+        if (!log.empty()) {
+            // Ends in "...".
+            CC_CHECK(log.back().size() >= 4);
+            CC_CHECK(log.back().compare(log.back().size() - 4, 4, "...\"") == 0);
+            // Extract the drawn text between the quotes and verify it fits
+            // (len*120 <= boxWidth) and is shorter than the original (proof
+            // truncation actually happened, not a no-op passthrough).
+            size_t q1 = log.back().find('"');
+            size_t q2 = log.back().rfind('"');
+            CC_CHECK(q1 != std::string::npos && q2 != std::string::npos && q2 > q1);
+            std::string drawn = log.back().substr(q1 + 1, q2 - q1 - 1);
+            CC_CHECK(drawn.size() < strlen("hello world"));
+            CC_CHECK((int32_t)(drawn.size() * 120) <= 600);
+        }
+    }
+}
+
 // --- Plan 3 Task 1: cc_session C boundary skeleton --------------------------
 // No parsing yet: creates a cc_session, feeds it a byte string (accumulates
 // into an internal buffer only), then drives the test-only echo hook and
@@ -4964,5 +5116,6 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_pv_comment_grammar_suppressed();        // GetInfo/HeresInfo/BDrop(2) -> no event (R20)
     cc_selftest_pv_data_appears_as();                   // DATA-borne "# Appears as" -> CC_EV_APPEARS_AS
     cc_selftest_pv_whisper_action_ctcp();               // WHISPER carrying ACTION -> CC_EV_ACTION
+    cc_selftest_draw_text_ellipsis();                   // Plan 4a Task 7: CDC::DrawTextEllipsis
     return g_failures;
 }

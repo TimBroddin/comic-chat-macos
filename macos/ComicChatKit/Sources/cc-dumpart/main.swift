@@ -40,6 +40,8 @@ usage: cc-dumpart --script <conversation.json> <out.png>
 JSON schema:
 {
   "backdrop": "field.bgb",
+  "title": "MY COMIC",
+  "self": "Anna",
   "participants": [
     {"nick": "Anna", "avatar": "anna.avb"},
     {"nick": "Armando", "avatar": "armando.avb"}
@@ -52,6 +54,11 @@ JSON schema:
 }
 
 - "backdrop" is optional (omit for no backdrop).
+- "title" is optional (Plan 4a Task 7): builds the title/starring panel
+  (panel 0).
+- "self" is optional (Plan 4a Task 7): a declared participant nick: the
+  starring credits list this participant first. Applied before "title" when
+  both are present.
 - "mode" is optional, default "say"; one of: say, think, whisper, action.
 - "to" is optional, default []; entries must be declared participant nicks.
 - "avatar"/"backdrop": an absolute path is used as-is; a bare name (e.g.

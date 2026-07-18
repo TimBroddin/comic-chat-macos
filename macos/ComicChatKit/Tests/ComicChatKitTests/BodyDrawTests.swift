@@ -81,4 +81,16 @@ struct EngineGlobalStateSelfTests {
         let other = fixture("armando.avb")
         #expect(cc_run_avatar_api_selftest(avatar, other) == 0)
     }
+
+    // Plan 4a Task 7: title/starring lift (un-R11 AddTitle/UpdateTitle/AddStars/
+    // AddStarsAux + CStarLabel::Draw) + cc_strip_set_title/set_self. Two
+    // participants -> set_self -> set_title -> two lines -> compose: asserts
+    // panel_count >= 3, the title text + "STARRING" + both nicknames appear in
+    // the composed log. A 3rd participant (added after the title is set)
+    // exercises the add_participant -> UpdateTitle member-join refresh.
+    @Test func stripTitleStarringSelfTestPasses() {
+        let avatar = fixture("anna.avb")
+        let other = fixture("armando.avb")
+        #expect(cc_run_strip_title_starring_selftest(avatar, other) == 0)
+    }
 }
