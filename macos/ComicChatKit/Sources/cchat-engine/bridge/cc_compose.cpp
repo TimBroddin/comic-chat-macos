@@ -57,6 +57,7 @@ void InitializeBackDrops();               // backdrop.cpp:168
 void DestroyBackDropArt();                // backdrop.cpp:318
 void BytesToEmotion(CEmotion &em, BYTE emIndex, BYTE inIndex);  // avatario.cpp:88
 void EmotionToBytes(CEmotion &em, BYTE &emotion, BYTE &intensity);  // avatario.cpp:74
+BYTE ByteToIndex(BYTE);  // protsupp.cpp -- inverse of IndexToByte(v) = v + '0'
 
 // ============================================================================
 // cc_strip
@@ -769,16 +770,26 @@ extern "C" int32_t cc_strip_self_annotations(cc_strip* s, cc_annotations* out) {
     CEmotion face, torso;
     av->GetEmotions(face, torso);                          // protsupp.cpp:365
 
+    // EmotionToBytes returns WIRE bytes (IndexToByte(v) = v + '0'), matching
+    // bInsertAnnotations's own two calls (protsupp.cpp:369-370) exactly -- but
+    // cc_annotations stores RAW indices, not wire bytes (comicchat.h's own
+    // field comment: "Values are indices, NOT the +'0' wire bytes"), same as
+    // gesture_pose/face_pose below. ccEncodeAnnotations (cc_session.cpp:
+    // 436-441) re-wraps these fields through IndexToByte again before the
+    // wire sprintf, and the decoder (protsupp.cpp:422-432) stores
+    // ByteToIndex(wireByte) -- so this function must unwrap EmotionToBytes'
+    // output with ByteToIndex before storing, or the send path double-wraps
+    // (e.g. struct 57 -> wire 'i' = 105) and a peer decodes garbage.
     BYTE faceEmotion, faceIntensity, torsoEmotion, torsoIntensity;
     EmotionToBytes(face, faceEmotion, faceIntensity);       // protsupp.cpp:369
     EmotionToBytes(torso, torsoEmotion, torsoIntensity);    // protsupp.cpp:370
 
     out->gesture_pose = torsoIndex;
-    out->gesture_emotion = torsoEmotion;
-    out->gesture_intensity = torsoIntensity;
+    out->gesture_emotion = ByteToIndex(torsoEmotion);
+    out->gesture_intensity = ByteToIndex(torsoIntensity);
     out->face_pose = faceIndex;
-    out->face_emotion = faceEmotion;
-    out->face_intensity = faceIntensity;
+    out->face_emotion = ByteToIndex(faceEmotion);
+    out->face_intensity = ByteToIndex(faceIntensity);
     out->requested = bbRequested ? 1 : 0;
     out->mode = 0;              // caller's job (Task 3)
     out->addressee_count = 0;   // caller's job (Task 3)

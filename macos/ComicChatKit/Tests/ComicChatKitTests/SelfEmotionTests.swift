@@ -35,13 +35,42 @@ extension EngineGlobalStateSelfTests {
             let ann = try strip.selfAnnotations()
 
             #expect(ann.cooked == true)
-            // EmotionToBytes packs IndexToByte(v) = v + '0' bytes; intensity
-            // index range is 0...10 (BYTE)(m_intensity*10), so both intensity
-            // fields must land in ['0', '0'+10] -- the same structural check
-            // the C selftest makes (cc_selftest.cpp's cc_selftest_self_emotion).
-            let zero = Int32(Character("0").asciiValue!)
-            #expect(ann.faceIntensity >= zero && ann.faceIntensity <= zero + 10)
-            #expect(ann.gestureIntensity >= zero && ann.gestureIntensity <= zero + 10)
+            // cc_annotations stores RAW indices, NOT EmotionToBytes' +'0' wire
+            // bytes (comicchat.h's field comment: "Values are indices, NOT the
+            // +'0' wire bytes"; cc_strip_self_annotations unwraps via
+            // ByteToIndex before storing -- review Critical fix, see
+            // cc_compose.cpp). Intensity index range is 0...10
+            // (BYTE)(m_intensity*10) and emotion index range is 0...17
+            // (avatario.cpp's emFloats table, 18 entries) -- the same
+            // structural check the C selftest makes
+            // (cc_selftest.cpp's cc_selftest_self_emotion).
+            #expect(ann.faceIntensity >= 0 && ann.faceIntensity <= 10)
+            #expect(ann.gestureIntensity >= 0 && ann.gestureIntensity <= 10)
+            #expect(ann.faceEmotion >= 0 && ann.faceEmotion <= 17)
+            #expect(ann.gestureEmotion >= 0 && ann.gestureEmotion <= 17)
+
+            // Round-trip pin: setSelfEmotion(angle: 0, intensity: 1.0) drives
+            // GetBodyFromEmotion's nearest-neighbor snap to the closest
+            // (angle, intensity) body record the armando.avb fixture actually
+            // has (avatar.cpp's CAvatarComplex::GetBodyFromEmotion /
+            // CAvatarSimple::GetBodyFromEmotion, both a nearest-match search,
+            // NOT a verbatim store of the requested intensity) -- so the
+            // resulting CEmotion.m_intensity GetEmotions later reads back is
+            // whatever discrete value that nearest record carries, which can
+            // differ between the face and torso/gesture groups depending on
+            // what records the fixture defines for each. Verified empirically
+            // for this fixture: the FACE group's nearest record is an exact
+            // intensity-1.0 match, so its raw intensity index is exactly 10
+            // per EmotionToBytes' quantization (BYTE)(m_intensity * 10)
+            // (avatario.cpp:83, truncating, no rounding) -- pinning that
+            // exact value here catches a re-introduced wire-byte bug (which
+            // would produce 58 = '0'+10, not 10) even if the range checks
+            // above were loosened by mistake. The gesture/torso group is
+            // NOT pinned to an exact value (only the range check above)
+            // because this fixture's torso records don't include an
+            // intensity-1.0 match near angle 0, so its raw value is fixture-
+            // specific, not derivable from the formula alone.
+            #expect(ann.faceIntensity == 10)
         }
     }
 

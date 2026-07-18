@@ -2894,19 +2894,24 @@ static int cc_selftest_self_emotion(const char* avatarPath) {
     CC_CHECK(basePose <= 0x7fff);  // sane upper bound; exact avatar pose count not asserted here (fixture-agnostic)
 
     // --- (2) set_self_emotion(0, 1.0) then self_annotations: cooked, and
-    //     plausible nonzero-shaped byte fields (IndexToByte(v) = v + '0';
-    //     EmotionToBytes packs an intensity index 0..10 and an emotion-table
-    //     index 0..17 -- both fit in IndexToByte's byte range).
+    //     plausible nonzero-shaped RAW index fields. cc_annotations stores
+    //     plain indices, NOT EmotionToBytes' +'0' wire bytes (comicchat.h's
+    //     field comment; cc_strip_self_annotations unwraps via ByteToIndex
+    //     before storing, review Critical fix) -- EmotionToBytes packs an
+    //     intensity index 0..10 and an emotion-table index 0..17
+    //     (avatario.cpp:74-85), so those are the ranges to assert here.
     CC_CHECK(cc_strip_set_self_emotion(s, 0.0, 1.0) == 0);
     cc_annotations ann;
     memset(&ann, 0, sizeof(ann));
     CC_CHECK(cc_strip_self_annotations(s, &ann) == 0);
     CC_CHECK(ann.cooked == 1);
-    // face/torso intensity bytes are IndexToByte'd (value + '0'); intensity
-    // value range is 0..10 (BYTE)(m_intensity*10) per EmotionToBytes
-    // (avatario.cpp:83), so the wire byte must land in ['0', '0'+10].
-    CC_CHECK(ann.face_intensity >= '0' && ann.face_intensity <= '0' + 10);
-    CC_CHECK(ann.gesture_intensity >= '0' && ann.gesture_intensity <= '0' + 10);
+    // face/torso intensity/emotion fields are RAW indices (0..10 for
+    // intensity per (BYTE)(m_intensity*10); 0..17 for emotion, sizeof
+    // emFloats/sizeof(float) - 1, avatario.cpp:43-62,74-85).
+    CC_CHECK(ann.face_intensity >= 0 && ann.face_intensity <= 10);
+    CC_CHECK(ann.gesture_intensity >= 0 && ann.gesture_intensity <= 10);
+    CC_CHECK(ann.face_emotion >= 0 && ann.face_emotion <= 17);
+    CC_CHECK(ann.gesture_emotion >= 0 && ann.gesture_emotion <= 17);
 
     // --- (3) preview_self_text changes self_pose vs. the neutral baseline.
     //     "Hello there, friend!" fires ID_RULE_WAVE's CheckStart* clause

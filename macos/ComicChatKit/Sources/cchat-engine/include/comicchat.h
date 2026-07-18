@@ -454,10 +454,14 @@ int32_t   cc_strip_set_self(cc_strip* s, int32_t participant); /* 0 ok; starring
  * bInsertAnnotations sense: GetIndices' record-array indices, NOT the
  * cc_avatar_pose_image poseID space above -- these are TWO DIFFERENT index
  * spaces the original itself keeps distinct, see the task report's Step 1(c)
- * finding) + EmotionToBytes wire emotion/intensity for both G (gesture/torso)
- * and E (face) groups, cooked=1 -- mirroring bInsertAnnotations's own field
- * reads (protsupp.cpp:364-370: GetIndices + GetEmotions + EmotionToBytes x2).
- * mode/addressees are NOT filled (left 0 / empty) -- caller's job. */
+ * finding) + RAW emotion/intensity indices for both G (gesture/torso) and E
+ * (face) groups -- mirroring bInsertAnnotations's own field reads
+ * (protsupp.cpp:364-370: GetIndices + GetEmotions + EmotionToBytes x2), but
+ * unwrapped back to the struct's index-space convention via ByteToIndex
+ * (EmotionToBytes itself returns +'0' wire bytes, matching bInsertAnnotations's
+ * needs; cc_annotations stores plain indices, per this header's own field
+ * comment above, so this function inverts that wrapping before storing).
+ * cooked=1. mode/addressees are NOT filled (left 0 / empty) -- caller's job. */
 int32_t cc_strip_set_self_emotion(cc_strip* s, double angle_radians, double intensity01); /* 0 ok */
 int32_t cc_strip_preview_self_text(cc_strip* s, const char* text_bytes); /* 0 ok */
 int32_t cc_strip_self_pose(cc_strip* s, int32_t* out_pose_index); /* 0 ok */
