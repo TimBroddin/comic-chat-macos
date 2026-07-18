@@ -3,6 +3,7 @@
 #include "comicchat.h"     // cc_proto_event (real union + enum, Plan 3 Task 5a)
 #include "defines.h"       // BM_*/CGESTUREPREFIX/CEXPRESSIONPREFIX/CMODEPREFIX (Plan 3 Task 4)
 #include "protsupp.h"      // IndexToByte (Plan 3 Task 4 outbound wiring)
+#include "ircsock.h"       // ccOnReceiveBytes/ccFireIsIrcXTimeout (Plan 3 Task 5b)
 #include <cassert>
 #include <cstring>
 #include <cstdio>
@@ -38,14 +39,23 @@ void cc_session_destroy(cc_session* h) {
 void cc_session_feed_bytes(cc_session* h, const uint8_t* d, size_t n) {
     CCSession* s = reinterpret_cast<CCSession*>(h);
     if (!s) return;
-    g_session = s;                       // activate for lifted code (Task 3+)
-    s->inbuf.append(reinterpret_cast<const char*>(d), n);
-    // Task 3 replaces this with the lifted line-framer + parse dispatch.
+    g_session = s;                       // activate for lifted code (Task 5b)
+    // Task 5b: run the lifted OnReceive line-framer -> ParseIt -> HandleCommand/
+    // HandleResultCode/HandleErrorCode dispatch (ircsock.cpp). The framer owns
+    // its own buffering (sock.m_szInput); the old s->inbuf std::string is no
+    // longer used for framing (kept as a member for source-compat but unused).
+    ccOnReceiveBytes(*s, d, n);
     g_session = nullptr;
 }
-void cc_session_fire_timer(cc_session* h, int32_t) {
-    if (!h) return;
-    /* Task 4 */
+void cc_session_fire_timer(cc_session* h, int32_t timer_id) {
+    CCSession* s = reinterpret_cast<CCSession*>(h);
+    if (!s) return;
+    g_session = s;
+    // Task 5b: the only protocol timer is the one-shot ISIRCX probe timeout ->
+    // HrModeIsIrcXFailure (plain-IRC fallback).
+    if (timer_id == CC_TIMER_ISIRCX_PROBE)
+        ccFireIsIrcXTimeout(*s);
+    g_session = nullptr;
 }
 
 void cc_session_test_echo(cc_session* h) {

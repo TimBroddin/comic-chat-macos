@@ -2561,7 +2561,16 @@ static int cc_selftest_session_skeleton() {
 
     cc_session* s = cc_session_create(&cfg);
     CC_CHECK(s != nullptr);
-    cc_session_feed_bytes(s, reinterpret_cast<const uint8_t*>("PING x\r\n"), 8);
+    // Plan 3 Task 5b: feed_bytes now runs the lifted line-framer + parse
+    // dispatch (was a no-op buffer in Task 1). Feeding a server PING drives the
+    // cmdidPing handler, which answers PONG through cfg.send -- so this now
+    // validates the whole framer->ProcessMessage->HandleCommand->PONG path.
+    // A real server PING carries the token in the ":"-trailing param
+    // (PING :token); the cmdidPing handler echoes pParse->lastString, so
+    // "PING :hello" -> "PONG :hello" (exactly the original ircsock.cpp:1696).
+    cc_session_feed_bytes(s, reinterpret_cast<const uint8_t*>("PING :hello\r\n"), 13);
+    CC_CHECK(cap.sent == "PONG :hello\r\n");
+    cap.sent.clear();
     cc_session_test_echo(s);          // test-only: drives one send + one event
     CC_CHECK(cap.sent == "ECHO\r\n");
     CC_CHECK(cap.events == 1);
@@ -3816,6 +3825,393 @@ static int cc_selftest_event_union() {
     return 0;
 }
 
+// ============================================================================
+// Plan 3 Task 5b: parser lift (ircsock.cpp). The first failing test is the
+// brief's parse-vector selftest, verbatim.
+// ============================================================================
+#include <algorithm>   // std::find (Task 5b brief selftest)
+
+static int cc_selftest_parse_join_privmsg() {
+    struct Cap { std::vector<int> types; std::string last_text; std::string last_nick; } cap;
+    cc_session_config cfg = {};
+    cfg.user_data = &cap; cfg.send = [](void*,const uint8_t*,size_t){};
+    cfg.own_nick = [](void*){ return "Anon"; };
+    cfg.on_event = [](void* ud, const cc_proto_event* ev){
+        Cap* c = static_cast<Cap*>(ud); c->types.push_back(ev->type);
+        if (ev->type==CC_EV_TEXT){ c->last_text=ev->u.text.text; c->last_nick=ev->u.text.nick; }
+    };
+    cc_session* s = cc_session_create(&cfg);
+    const char* wire =
+        ":srv 001 Anon :Welcome\r\n"
+        ":Bob!bob@h JOIN :#comicrig\r\n"
+        ":Bob!bob@h PRIVMSG #comicrig :(#G295E193M1) hello\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    // expect: LOGGED_IN, USER_JOINED, TEXT(with annotations, "hello", "Bob")
+    CC_CHECK(cap.types.size() >= 3);
+    CC_CHECK(cap.types[0]==CC_EV_LOGGED_IN);
+    CC_CHECK(std::find(cap.types.begin(),cap.types.end(),CC_EV_USER_JOINED)!=cap.types.end());
+    CC_CHECK(cap.last_text=="hello" && cap.last_nick=="Bob");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// ============================================================================
+// Plan 3 Task 5b Step 6: coverage vectors -- one selftest per event family,
+// with the FULL expected event stream hand-traced from the exercised handler +
+// the original ircsock.cpp line it lifts. Each records EVERY emitted event
+// (type + a couple of load-bearing fields) into a capture and asserts the
+// whole sequence. `sent` also captures outbound bytes (PONG + auto-queries) so
+// the reply-triggered follow-up emits (WHO/MODE/PropGet after a self-JOIN) are
+// visible.
+// ============================================================================
+namespace {
+struct PVCap {
+    std::vector<int> types;
+    std::vector<std::string> a;   // per-event "primary" string field
+    std::vector<std::string> b;   // per-event "secondary" string field
+    std::vector<uint32_t> tokens;
+    std::string sent;
+};
+void pvOnEvent(void* ud, const cc_proto_event* ev) {
+    PVCap* c = static_cast<PVCap*>(ud);
+    c->types.push_back(ev->type);
+    c->tokens.push_back(ev->room_token);
+    std::string pa, pb;
+    switch (ev->type) {
+        case CC_EV_LOGGED_IN:      pa = ev->u.logged_in.nick; break;
+        case CC_EV_SERVER_CAPS:    pa = std::to_string(ev->u.server_caps.ircx); pb = std::to_string(ev->u.server_caps.max_msg_len); break;
+        case CC_EV_DISCONNECTED_HINT: pa = ev->u.disconnected_hint.text; break;
+        case CC_EV_SELF_JOINED:    pa = ev->u.self_joined.channel; break;
+        case CC_EV_SELF_PARTED:    pa = ev->u.self_parted.channel; break;
+        case CC_EV_USER_JOINED:    pa = ev->u.user_joined.nick; pb = ev->u.user_joined.ident; break;
+        case CC_EV_USER_PARTED:    pa = ev->u.user_parted.nick; pb = ev->u.user_parted.reason; break;
+        case CC_EV_USER_QUIT:      pa = ev->u.user_quit.nick; pb = ev->u.user_quit.reason; break;
+        case CC_EV_NAMES:          pa = ev->u.names.channel; pb = ev->u.names.nicks; break;
+        case CC_EV_END_OF_NAMES:   pa = ev->u.end_of_names.channel; break;
+        case CC_EV_NICK_CHANGED:   pa = ev->u.nick_changed.old_nick; pb = ev->u.nick_changed.new_nick; break;
+        case CC_EV_TEXT:           pa = ev->u.text.text; pb = ev->u.text.nick; break;
+        case CC_EV_DATA:           pa = ev->u.data.nick; pb = std::to_string(ev->u.data.annotations.mode); break;
+        case CC_EV_WHISPER:        pa = ev->u.whisper.text; pb = ev->u.whisper.nick; break;
+        case CC_EV_TOPIC_CHANGED:  pa = ev->u.topic_changed.channel; pb = ev->u.topic_changed.topic; break;
+        case CC_EV_CHANNEL_MODE:   pa = ev->u.channel_mode.modes; pb = ev->u.channel_mode.arg; break;
+        case CC_EV_USER_MODE:      pa = ev->u.user_mode.nick; pb = ev->u.user_mode.modes; break;
+        case CC_EV_ROOM_PROP:      pa = ev->u.room_prop.key; pb = ev->u.room_prop.value; break;
+        case CC_EV_ROOM_LIST_ITEM: pa = ev->u.room_list_item.name; pb = std::to_string(ev->u.room_list_item.users); break;
+        case CC_EV_WHOIS_RESULT:   pa = ev->u.whois_result.nick; pb = ev->u.whois_result.host; break;
+        case CC_EV_WHO_RESULT:     pa = ev->u.who_result.nick; pb = ev->u.who_result.channel; break;
+        case CC_EV_MOTD:           pa = ev->u.motd.luser; pb = ev->u.motd.motd; break;
+        case CC_EV_ERROR:          pa = std::to_string(ev->u.error.code); pb = ev->u.error.text; break;
+        case CC_EV_NICK_REJECTED:  pa = std::to_string(ev->u.nick_rejected.kind); pb = ev->u.nick_rejected.bad_nick; break;
+        case CC_EV_STATUS_LINE:    pa = ev->u.status_line.text; break;
+        case CC_EV_AWAY_PEER:      pa = ev->u.away_peer.nick; pb = ev->u.away_peer.message; break;
+        default: break;
+    }
+    c->a.push_back(pa); c->b.push_back(pb);
+}
+void pvOnSend(void* ud, const uint8_t* d, size_t n) {
+    static_cast<PVCap*>(ud)->sent.append((const char*)d, n);
+}
+const char* pvOwnNick(void*) { return "Anon"; }
+
+// count how many times an event type appears
+int pvCount(const PVCap& c, int type) {
+    int n = 0; for (int t : c.types) if (t == type) n++; return n;
+}
+// index of first occurrence of `type` (or -1)
+int pvFind(const PVCap& c, int type, int from = 0) {
+    for (int i = from; i < (int)c.types.size(); i++) if (c.types[i] == type) return i;
+    return -1;
+}
+cc_session* pvMake(PVCap* cap, cc_session_config& cfg) {
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.user_data = cap; cfg.send = pvOnSend; cfg.on_event = pvOnEvent; cfg.own_nick = pvOwnNick;
+    return cc_session_create(&cfg);
+}
+} // namespace
+
+// VECTOR 1: self-JOIN triggers the auto MODE + WHO queries (HandleCommand
+// cmdidJoin self branch, ircsock.cpp:1391-1425). Hand-trace: on the self JOIN,
+// emit CC_EV_SELF_JOINED, then bExecuteQuery issues "MODE #comicrig\r\n" +
+// "WHO #comicrig\r\n" (non-IRCX: no PropGet). Then a 324 CHANNELMODEIS
+// (:2127) emits CC_EV_CHANNEL_MODE; a 352 WHO reply (:2576) emits
+// CC_EV_WHO_RESULT (routed by the qpInitialWho cell); 315 ENDOFWHO dequeues.
+static int cc_selftest_pv_selfjoin_autoqueries() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    // register the room token first so the emitted events carry it
+    uint32_t tok = cc_session_register_room(s, "#comicrig");
+    const char* wire =
+        ":srv 001 Anon :Welcome\r\n"
+        ":Anon!anon@h JOIN :#comicrig\r\n";          // SELF join
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    // self-join emitted + auto MODE/WHO sent
+    CC_CHECK(pvFind(cap, CC_EV_LOGGED_IN) == 0);
+    CC_CHECK(pvFind(cap, CC_EV_SELF_JOINED) >= 0);
+    CC_CHECK(cap.tokens[pvFind(cap, CC_EV_SELF_JOINED)] == tok);
+    CC_CHECK(cap.sent.find("MODE #comicrig\r\n") != std::string::npos);
+    CC_CHECK(cap.sent.find("WHO #comicrig\r\n") != std::string::npos);
+    // Now feed the server's answers: 324 mode, 352 who, 315 endofwho.
+    cap.sent.clear();
+    const char* replies =
+        ":srv 324 Anon #comicrig +nt\r\n"
+        ":srv 352 Anon #comicrig bob h srv Bob H@ :0 Bob Real\r\n"
+        ":srv 315 Anon #comicrig :End of WHO\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)replies, strlen(replies));
+    // 324 -> CC_EV_CHANNEL_MODE("+nt"); 352 -> CC_EV_WHO_RESULT(nick Bob)
+    int im = pvFind(cap, CC_EV_CHANNEL_MODE);
+    CC_CHECK(im >= 0 && cap.a[im] == "+nt");
+    int iw = pvFind(cap, CC_EV_WHO_RESULT);
+    CC_CHECK(iw >= 0 && cap.a[iw] == "Bob" && cap.b[iw] == "#comicrig");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 2: NICK across users (HandleCommand cmdidNick, ircsock.cpp:1576-1611).
+// Bob renames to Bobby (other user, is_self=0), then our own nick Anon->Anon2
+// (self, is_self=1). Hand-trace: two CC_EV_NICK_CHANGED, first is_self=0 with
+// old=Bob new=Bobby, second is_self=1 with old=Anon new=Anon2.
+static int cc_selftest_pv_nick_across_users() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire =
+        ":Bob!bob@h NICK :Bobby\r\n"
+        ":Anon!anon@h NICK :Anon2\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    CC_CHECK(pvCount(cap, CC_EV_NICK_CHANGED) == 2);
+    int i0 = pvFind(cap, CC_EV_NICK_CHANGED);
+    CC_CHECK(cap.a[i0] == "Bob" && cap.b[i0] == "Bobby");
+    int i1 = pvFind(cap, CC_EV_NICK_CHANGED, i0 + 1);
+    CC_CHECK(cap.a[i1] == "Anon" && cap.b[i1] == "Anon2");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 3: TOPIC set (HandleCommand cmdidTopic, ircsock.cpp:1779-1830). A
+// TOPIC command from Bob sets the room topic. Hand-trace: one
+// CC_EV_TOPIC_CHANGED(channel=#comicrig, topic="Welcome all").
+static int cc_selftest_pv_topic_set() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire = ":Bob!bob@h TOPIC #comicrig :Welcome all\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int it = pvFind(cap, CC_EV_TOPIC_CHANGED);
+    CC_CHECK(it >= 0 && cap.a[it] == "#comicrig" && cap.b[it] == "Welcome all");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 4: channel MODE delta (HandleCommand cmdidMode channel branch,
+// ircsock.cpp:1448-1511 + ParseChannelMode :299-400). "+o Bob" arrives.
+// Hand-trace: one CC_EV_CHANNEL_MODE(modes="+o", arg="Bob"). ParseChannelMode's
+// +o branch (member-status) is carried by the emitted delta (Swift applies it).
+static int cc_selftest_pv_channel_mode_delta() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire = ":srv MODE #comicrig +o Bob\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int im = pvFind(cap, CC_EV_CHANNEL_MODE);
+    CC_CHECK(im >= 0 && cap.a[im] == "+o" && cap.b[im] == "Bob");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 5: IRCX DATA CCUDI1 out-of-band annotation (HandleCommand cmdidData,
+// ircsock.cpp:1275-1323) vs the inline plain-IRC form. Both carry the same
+// "#G295E193M1" block. Hand-trace:
+//   * DATA line -> CC_EV_DATA(nick=Bob, annotations.mode=1, gesture_pose=2...)
+//   * inline PRIVMSG "(#G295E193M1) hi" -> CC_EV_TEXT(text="hi", has_annotations=1)
+// This freezes the two-transport decode (state-and-codec §3.3): IndexToByte
+// packs value+'0', so '2'=index 2, '9'=index 9, '5'=index 5, etc.
+static int cc_selftest_pv_data_vs_inline() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    // full-capture on_event to inspect annotation fields
+    struct DCap { cc_annotations dataAnn{}; int haveData=0; cc_annotations textAnn{}; int haveText=0; std::string textBody; } dc;
+    cfg.user_data = &dc;
+    cfg.on_event = [](void* ud, const cc_proto_event* ev){
+        DCap* c = static_cast<DCap*>(ud);
+        if (ev->type==CC_EV_DATA){ c->dataAnn = ev->u.data.annotations; c->haveData=1; }
+        if (ev->type==CC_EV_TEXT){ c->textAnn = ev->u.text.annotations; c->haveText = ev->u.text.has_annotations; c->textBody = ev->u.text.text; }
+    };
+    cc_session_destroy(s);
+    s = cc_session_create(&cfg);
+    const char* wire =
+        ":Bob!bob@h DATA #comicrig CCUDI1 :#G295E193M1\r\n"          // IRCX out-of-band
+        ":Bob!bob@h PRIVMSG #comicrig :(#G295E193M1) hi\r\n";        // plain-IRC inline
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    // DATA decode: #G <2><9><5> E <1><9><3> M <1>. IndexToByte(v)=v+'0', so
+    // ByteToIndex('2')=2, ('9')=9, ('5')=5, ('1')=1, ('3')=3.
+    CC_CHECK(dc.haveData == 1);
+    CC_CHECK(dc.dataAnn.gesture_pose == 2 && dc.dataAnn.gesture_emotion == 9 && dc.dataAnn.gesture_intensity == 5);
+    CC_CHECK(dc.dataAnn.face_pose == 1 && dc.dataAnn.face_emotion == 9 && dc.dataAnn.face_intensity == 3);
+    CC_CHECK(dc.dataAnn.mode == 1 && dc.dataAnn.cooked == 1);
+    // inline decode: same block, text after ") " is "hi".
+    CC_CHECK(dc.haveText == 1 && dc.textBody == "hi");
+    CC_CHECK(dc.textAnn.gesture_pose == 2 && dc.textAnn.mode == 1);
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 6: WHISPER inbound (HandleCommand cmdidWhisper, ircsock.cpp:1832-1844).
+// "WHISPER #comicrig Anon :psst" -> CC_EV_WHISPER(nick=Bob, text="psst").
+static int cc_selftest_pv_whisper() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire = ":Bob!bob@h WHISPER #comicrig Anon :psst\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int iw = pvFind(cap, CC_EV_WHISPER);
+    CC_CHECK(iw >= 0 && cap.a[iw] == "psst" && cap.b[iw] == "Bob");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 7: "# Appears as" avatar announce (Task-6 seam). For THIS task the
+// PRIVMSG/DATA handlers emit the raw event; classification into CC_EV_APPEARS_AS
+// is Task 6. Here a "# Appears as" arriving via PRIVMSG emits CC_EV_TEXT with
+// the raw "# Appears as ..." body (no inline annotations, since it doesn't
+// start with "(#"). This freezes the seam: Task 6 will reclassify. Documented.
+static int cc_selftest_pv_appears_as_seam() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire = ":Bob!bob@h PRIVMSG #comicrig :# Appears as bob.http://x/bob.avb\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int it = pvFind(cap, CC_EV_TEXT);
+    CC_CHECK(it >= 0);
+    // raw text carries the "# Appears as ..." payload (Task 6 classifies it)
+    CC_CHECK(cap.a[it].find("# Appears as bob") == 0);
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 8: room LIST (HandleResultCode 321/322/323, ircsock.cpp:2311-2506).
+// Hand-trace: issue LIST (register a qpRoomListDlg ctList cell), then feed
+// 321 begin, 322 item, 323 end -> CC_EV_ROOM_LIST_BEGIN, CC_EV_ROOM_LIST_ITEM
+// (#comicrig, 3 users, "Welcome"), CC_EV_ROOM_LIST_END.
+static int cc_selftest_pv_room_list() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    CC_CHECK(cc_session_list(s, nullptr) == 0);   // enqueues ctList/qpRoomListDlg
+    cap.sent.clear();
+    const char* wire =
+        ":srv 321 Anon Channel :Users Name\r\n"
+        ":srv 322 Anon #comicrig 3 :Welcome\r\n"
+        ":srv 323 Anon :End of LIST\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    CC_CHECK(pvFind(cap, CC_EV_ROOM_LIST_BEGIN) >= 0);
+    int ii = pvFind(cap, CC_EV_ROOM_LIST_ITEM);
+    CC_CHECK(ii >= 0 && cap.a[ii] == "#comicrig" && cap.b[ii] == "3");
+    CC_CHECK(pvFind(cap, CC_EV_ROOM_LIST_END) >= 0);
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 9: MOTD (HandleResultCode 375/372/376, ircsock.cpp:2755-2808). Login
+// (001) enqueues the qpInitialLUsersMOTD cell; 375 start (silent), 372 lines
+// (accumulate silently while the cell is qpInitialLUsersMOTD -- NOT qpLUsersMOTD,
+// so 372 emits a status line? no: our gate suppresses only qpLUsersMOTD; the
+// initial sequence is qpInitialLUsersMOTD, so 372 DOES emit status). 376
+// flushes -> CC_EV_MOTD(motd="line1\r\nline2\r\n"). Hand-trace the 376 event.
+static int cc_selftest_pv_motd() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire =
+        ":srv 001 Anon :Welcome\r\n"      // enqueues qpInitialLUsersMOTD
+        ":srv 375 Anon :- srv MOTD -\r\n"
+        ":srv 372 Anon :- line one\r\n"
+        ":srv 372 Anon :- line two\r\n"
+        ":srv 376 Anon :End of MOTD\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int im = pvFind(cap, CC_EV_MOTD);
+    CC_CHECK(im >= 0);
+    // 372 strips a leading "- "; the accumulator joins with "\r\n".
+    CC_CHECK(cap.b[im] == "line one\r\nline two\r\n");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 10: 433 nick-collision (HandleErrorCode 431/432/433,
+// ircsock.cpp:3128-3136). "433 Anon Taken :Nickname in use" ->
+// CC_EV_NICK_REJECTED(kind=433, bad_nick="Taken"). Swift owns the retry.
+static int cc_selftest_pv_nick_collision() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire = ":srv 433 Anon Taken :Nickname is already in use\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int in = pvFind(cap, CC_EV_NICK_REJECTED);
+    CC_CHECK(in >= 0 && cap.a[in] == "433" && cap.b[in] == "Taken");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 11: fatal ERROR (HandleCommand cmdidError, ircsock.cpp:1325-1346).
+// A verbatim ERROR line (not during the ISIRCX probe) -> CC_EV_DISCONNECTED_HINT
+// with the text. R20: user-facing, carried as the event payload (not ccLog).
+static int cc_selftest_pv_fatal_error() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire = "ERROR :Closing Link: you are banned\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int ie = pvFind(cap, CC_EV_DISCONNECTED_HINT);
+    CC_CHECK(ie >= 0 && cap.a[ie] == "Closing Link: you are banned");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 12: IRCX server caps + probe-timer cancel (HandleResultCode 800,
+// ircsock.cpp:2817-2900). The probe is sent (cc_session_probe_ircx enqueues the
+// ctModeIsIrcX cell + requests the timer); the 800 (state 0) reply sets IRCX,
+// parses ANON, grows to maxlen 1024, cancels the timer, emits CC_EV_SERVER_CAPS,
+// and sends "IRCX\r\n".
+static int cc_selftest_pv_ircx_caps() {
+    PVCap cap; cc_session_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    struct TCap { PVCap pv; int cancelId = -1; } tc;
+    cfg.user_data = &tc.pv; cfg.send = pvOnSend; cfg.on_event = pvOnEvent; cfg.own_nick = pvOwnNick;
+    cfg.set_timer = [](void*, int32_t, int32_t){};
+    // cancel_timer records the id; wrap via a static since the lambda can't
+    // capture with a C function-pointer signature -- use user_data indirection.
+    static int s_cancelId; static int s_cancelCalls;
+    s_cancelId = -1; s_cancelCalls = 0;
+    cfg.cancel_timer = [](void*, int32_t id){ s_cancelId = id; s_cancelCalls++; };
+    cc_session* s = cc_session_create(&cfg);
+    CC_CHECK(cc_session_probe_ircx(s) == 0);
+    tc.pv.sent.clear();
+    // 800 state-0: :srv 800 * 0 0 NTLM,ANON 1024 *
+    const char* wire = ":srv 800 * 0 0 NTLM,ANON 1024 *\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int ic = pvFind(tc.pv, CC_EV_SERVER_CAPS);
+    CC_CHECK(ic >= 0 && tc.pv.a[ic] == "1" /*ircx*/ && tc.pv.b[ic] == "1024" /*maxlen*/);
+    CC_CHECK(tc.pv.sent.find("IRCX\r\n") != std::string::npos);
+    CC_CHECK(s_cancelCalls == 1 && s_cancelId == CC_TIMER_ISIRCX_PROBE);
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 13: PART/QUIT membership (HandleCommand cmdidPart :1668, cmdidQuit
+// :1760). Bob parts (other -> CC_EV_USER_PARTED), Carl quits (-> CC_EV_USER_QUIT),
+// then we ourselves part (-> CC_EV_SELF_PARTED).
+static int cc_selftest_pv_part_quit() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire =
+        ":Bob!bob@h PART #comicrig :bye\r\n"
+        ":Carl!carl@h QUIT :Client exited\r\n"
+        ":Anon!anon@h PART #comicrig\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int ip = pvFind(cap, CC_EV_USER_PARTED);
+    CC_CHECK(ip >= 0 && cap.a[ip] == "Bob" && cap.b[ip] == "bye");
+    int iq = pvFind(cap, CC_EV_USER_QUIT);
+    CC_CHECK(iq >= 0 && cap.a[iq] == "Carl" && cap.b[iq] == "Client exited");
+    CC_CHECK(pvFind(cap, CC_EV_SELF_PARTED) >= 0);
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 14: NAMES reply (HandleResultCode 353/366, ircsock.cpp:2508-2574).
+// A self-JOIN enqueues the ctNames cell; 353 emits CC_EV_NAMES(nicks) and 366
+// emits CC_EV_END_OF_NAMES.
+static int cc_selftest_pv_names() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire =
+        ":Anon!anon@h JOIN :#comicrig\r\n"                       // enqueues ctNames
+        ":srv 353 Anon = #comicrig :Anon @Bob Carl\r\n"
+        ":srv 366 Anon #comicrig :End of NAMES\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    int in = pvFind(cap, CC_EV_NAMES);
+    CC_CHECK(in >= 0 && cap.a[in] == "#comicrig" && cap.b[in] == "Anon @Bob Carl");
+    CC_CHECK(pvFind(cap, CC_EV_END_OF_NAMES) >= 0);
+    cc_session_destroy(s);
+    return 0;
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -3864,5 +4260,21 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_outbound_ircx_probe_timer();    // Plan 3 Task 4: MODE ISIRCX + timer request
     cc_selftest_outbound_say_chunking();        // Plan 3 Task 4: bChatSendToTarget multi-chunk path
     cc_selftest_event_union();                  // Plan 3 Task 5a: cc_proto_event union completeness
+    cc_selftest_parse_join_privmsg();           // Plan 3 Task 5b: parse-vector event stream
+    // Plan 3 Task 5b Step 6: per-event-family coverage vectors (hand-traced)
+    cc_selftest_pv_selfjoin_autoqueries();      // self-JOIN + auto MODE/WHO + 324/352/315
+    cc_selftest_pv_nick_across_users();         // NICK other + self
+    cc_selftest_pv_topic_set();                 // TOPIC set
+    cc_selftest_pv_channel_mode_delta();        // channel MODE +o delta
+    cc_selftest_pv_data_vs_inline();            // IRCX DATA CCUDI1 vs inline (# annotations)
+    cc_selftest_pv_whisper();                   // WHISPER inbound
+    cc_selftest_pv_appears_as_seam();           // "# Appears as" (Task-6 seam: raw CC_EV_TEXT)
+    cc_selftest_pv_room_list();                 // room LIST 321/322/323
+    cc_selftest_pv_motd();                      // MOTD 375/372/376
+    cc_selftest_pv_nick_collision();            // 433 nick-rejected
+    cc_selftest_pv_fatal_error();               // fatal ERROR -> disconnected-hint
+    cc_selftest_pv_ircx_caps();                 // 800 IRCX caps + probe-timer cancel
+    cc_selftest_pv_part_quit();                 // PART/QUIT/self-PART
+    cc_selftest_pv_names();                     // 353/366 NAMES
     return g_failures;
 }

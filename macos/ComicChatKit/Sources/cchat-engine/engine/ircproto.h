@@ -79,41 +79,110 @@ typedef cc_own_identity (*PFNGETOWNIDENTITY)(void);
 // room the session currently considers joined.
 typedef BOOL (*PFNISJOINEDCHANNEL)(const char *szEncodedChannel);
 
-// --- CIrcSocket (outbound-scoped subset; see header note above) ------------
+// --- CIrcSocket (outbound-scoped subset + Task 5b inbound state) ------------
+// Task 5b (parser lift) RE-INTRODUCES the connection-scoped inbound state the
+// original CIrcSocket held (the CAsyncSocket base and the SSPI/auth blocks stay
+// dropped -- R21 -- Swift owns the socket): the input framing buffer
+// (m_szInput/m_szMessage, driven by the lifted OnReceive framer that now lives
+// in cc_session_feed_bytes), the login/registration state (m_bRegistered,
+// m_iConnected), the IRCX capability/negotiation flags (m_bAnonAllowed,
+// m_bJustSentModeIsIrcX), the MOTD/LUSER accumulators, and the reconnect-buffer
+// growth on the 800 reply (HrInitAlloc). m_queries already existed (Task 4).
 class CIrcSocket {
 public:
 	CIrcSocket() {
 		m_bIrcXServer = FALSE;
+		m_bRegistered = FALSE;
+		m_bAnonAllowed = FALSE;
+		m_bJustSentModeIsIrcX = FALSE;
+		m_iConnected = 0;
 		m_nMaxMsgLength = 512;   // g_nDefaultIOBuff, ircsock.h:12
 		m_szOutput2 = new CHAR[m_nMaxMsgLength + 1];
 		m_szOutput2[0] = '\0';
+		// Task 5b: framing buffers (OnReceive framer lifted into
+		// cc_session_feed_bytes). Allocated to the default IO buffer size; the
+		// 800 reply grows them via HrInitAlloc, exactly like the original.
+		m_szInput   = new CHAR[m_nMaxMsgLength + 1];
+		m_szMessage = new CHAR[m_nMaxMsgLength + 1];
+		m_szInput[0] = m_szMessage[0] = '\0';
 	}
 	~CIrcSocket() {
 		delete [] m_szOutput2;
+		delete [] m_szInput;
+		delete [] m_szMessage;
+	}
+
+	// Task 5b: reset the reconnect-survivable inbound subset (Reset(), original
+	// ircsock.cpp:473-484 minus the dropped SSPI package arrays).
+	void Reset() {
+		m_bIrcXServer = FALSE;
+		m_bRegistered = FALSE;
+		m_bAnonAllowed = FALSE;
+		m_bJustSentModeIsIrcX = FALSE;
+		if (m_szInput) *m_szInput = '\0';
+	}
+	// Task 5b: grow the framing buffers to the server-advertised max message
+	// length (original HrInitAlloc, ircsock.cpp:487-523 minus cui.bAllocOutBuff
+	// -- the shared app out-buffer is not part of this port; ircproto's builders
+	// use m_szOutput2). Returns TRUE on success.
+	BOOL HrInitAlloc(SHORT nMaxIOBuff) {
+		CHAR* pIn  = new CHAR[nMaxIOBuff + 1];
+		CHAR* pOut = new CHAR[nMaxIOBuff + 1];
+		CHAR* pMsg = new CHAR[nMaxIOBuff + 1];
+		if (!pIn || !pOut || !pMsg) { delete[] pIn; delete[] pOut; delete[] pMsg; return FALSE; }
+		delete [] m_szInput;   m_szInput   = pIn;
+		delete [] m_szOutput2; m_szOutput2 = pOut;
+		delete [] m_szMessage; m_szMessage = pMsg;
+		*m_szInput = *m_szOutput2 = *m_szMessage = '\0';
+		m_nMaxMsgLength = nMaxIOBuff;
+		return TRUE;
 	}
 
 	BOOL			m_bIrcXServer;
+	BOOL			m_bRegistered;
+	BOOL			m_bAnonAllowed;
+	BOOL			m_bJustSentModeIsIrcX;
+	INT				m_iConnected;
 	SHORT			m_nMaxMsgLength;
 	CHAR			*m_szOutput2;
+	CHAR			*m_szInput;			// Task 5b: line-framing input buffer
+	CHAR			*m_szMessage;		// Task 5b: current framed line
+	CString			m_strMOTD;			// Task 5b: MOTD accumulator (372/375/376)
+	CString			m_strLUSER;			// Task 5b: LUSER accumulator (251-255)
 	CQueryPtrList	m_queries;
 };
 
 // --- CIrcProto (outbound-scoped subset; see header note above) -------------
 class CIrcProto {
 public:
-	CIrcProto() { m_bInRoom = FALSE; m_dwModes = m_dwMaxUsers = 0L; }
+	CIrcProto() { m_bInRoom = FALSE; m_dwModes = m_dwMaxUsers = 0L;
+		m_prgdwTopicFormatting = NULL; m_bSetMode = FALSE; }
+	// Task 5b: free the topic-formatting run array the parser new's (the
+	// original CRoomInfo destructor freed it; here CIrcProto owns it). delete
+	// on a CDWordArray* is a plain heap free (mfc_compat CDWordArray has a
+	// trivial dtor); NULL is safe.
+	~CIrcProto() { delete m_prgdwTopicFormatting; }
 
 	CIrcSocket*		m_pSock;
 	BOOL			m_bInRoom;
 	CString			m_strClientData;
 
-	// Room state (CRoomInfo subset this task's outbound bodies read; see
-	// header note above for why this isn't an inherited CRoomInfo).
+	// Room state (CRoomInfo subset; Task 4 lifted the outbound-read subset,
+	// Task 5b RE-INTRODUCES the rest the parser writes/reads -- see the header
+	// note and the p3-task-5b report's "CRoomInfo reconciliation" narrative).
+	// The engine holds exactly ONE CIrcProto per session (cc_session.h), so this
+	// is the transient room-property scratch the original's `currentRoom` (a
+	// CRoomInfo* aliasing the active doc's m_proto) pointed at; Swift owns the
+	// canonical per-room copy (state-and-codec.md §1.4) via the emitted events.
 	CString			m_strChannel;			// Encoded channel name
+	CString			m_strPrettyChannel;		// Task 5b: decoded/pretty name
 	CString			m_strPassword;
 	CString			m_strTopic;
+	CString			m_strCreationModes;		// Task 5b (CRoomInfo base member)
+	CDWordArray*	m_prgdwTopicFormatting;	// Task 5b: TOPIC/332/PROP formatting runs
 	DWORD			m_dwModes;
 	DWORD			m_dwMaxUsers;
+	BOOL			m_bSetMode;				// Task 5b: deferred create-time mode/topic set
 
 	void	SendMessageText(char *szMesg);
 	BOOL	bChatSendToChannel(const char *szAnnotations, const char *szMesg, char *szNMText, USHORT uModes, PFNGETOWNIDENTITY pfnGetOwnIdentity);
