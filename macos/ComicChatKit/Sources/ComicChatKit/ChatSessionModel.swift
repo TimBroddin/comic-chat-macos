@@ -437,6 +437,10 @@ public final class ChatSessionModel: @unchecked Sendable {
             try? bridge?.apply(ev)
             recomposeLocked()
 
+        case .action:
+            try? bridge?.apply(ev)
+            recomposeLocked()
+
         case .whisper(let nick, _, let text, _):
             // Plan 4b Task 4: the IRCX WHISPER verb path -- see
             // `whisperBoxRoutingLocked`'s doc comment for both wire forms.

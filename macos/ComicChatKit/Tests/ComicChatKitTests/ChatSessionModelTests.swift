@@ -149,6 +149,82 @@ extension EngineGlobalStateSelfTests {
             server.stop()
         }
 
+        /// Plan 4b Task 4 fix round 2 regression test: `handleLocked`'s
+        /// `.text` case was split out into its own bound case to add
+        /// whisper-box routing (§8 Topology A finding), but that edit
+        /// dropped the `.action` arm that used to share `.text`'s
+        /// `bridge.apply + recomposeLocked` behavior — inbound `.action`
+        /// events (a peer's /me) fell through to `default: break`:
+        /// transcript-appended but never bridge-applied or recomposed, so
+        /// the action never rendered onto the comic strip. Pins that an
+        /// inbound CTCP ACTION both lands in the transcript AND triggers a
+        /// strip recompose (`onStripImage` firing again).
+        ///
+        /// Wire form verified against the engine parser (read-only check,
+        /// NOT assumed): `ircsock.cpp`'s `cmdidPrivMsg` handler classifies a
+        /// PRIVMSG's payload via `OnTextMsg`/`protsupp.cpp`'s payload-stage
+        /// dispatch, which recognizes an action via
+        /// `!strncmp(szMesg, actionID, g_nActionLen)`
+        /// (`protsupp.cpp:1147`), where `actionID` is `{0x01, 'A', 'C', 'T',
+        /// 'I', 'O', 'N'}` (`ircproto.h:241`) — the standard CTCP ACTION
+        /// prefix, `\x01ACTION <text>`, optionally terminated by a trailing
+        /// `\x01` (`ccPrepareTextAction`, `protsupp.cpp:1268`, trims at the
+        /// first `0x01` if present but does not require one). This test
+        /// sends the fully-terminated form.
+        @Test(.timeLimit(.minutes(1)))
+        func inboundActionRendersOntoStrip() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            let images = ImagesBox()
+            let imagesArrived = AsyncStream<Void>.makeStream()
+            model.onStripImage = { _, size in
+                images.append(size)
+                imagesArrived.continuation.yield()
+            }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            // Baseline: self-join's own announce-avatar recompose already
+            // fires onStripImage at least once before any peer activity —
+            // capture that count so we can prove a NEW recompose happens
+            // after the action, not just that one happened at some point.
+            var iter = imagesArrived.stream.makeAsyncIterator()
+            _ = await iter.next()
+            let baseline = images.count
+
+            try await server.send(":Bob!u@h PRIVMSG #p4 :\u{01}ACTION waves\u{01}")
+
+            // The engine's ccPrepareTextAction (protsupp.cpp:1265-1274)
+            // prepends the speaker's nick onto the action text itself
+            // (`strNewMesg = szNickname; strNewMesg += (szMesg +
+            // g_nActionLen)`), verified above by inspecting the actual
+            // transcript event -- so CC_EV_ACTION's text is "Bob waves",
+            // not the bare "waves" a first guess might expect.
+            func actionLanded() -> Bool {
+                model.transcript.contains {
+                    if case .action(let nick, let text, _) = $0 { return nick == "Bob" && text == "Bob waves" }
+                    return false
+                }
+            }
+            while !actionLanded() {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(actionLanded())
+
+            // The regression: before the fix, the .action event was
+            // transcript-appended (above) but never bridge-applied/
+            // recomposed, so onStripImage would never fire again here.
+            while images.count <= baseline {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(images.count > baseline, "expected a strip recompose after the inbound action, got no new onStripImage call (baseline \(baseline))")
+
+            model.shutdown()
+            server.stop()
+        }
+
         /// Polls `server.receivedBytes` until it contains `substring`, then
         /// returns the accumulated c2s bytes split into lines (CRLF-stripped,
         /// blank lines dropped) — the "receivedLines" accessor the brief
