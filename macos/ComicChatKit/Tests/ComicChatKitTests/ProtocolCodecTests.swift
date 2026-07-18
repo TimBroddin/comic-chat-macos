@@ -83,7 +83,12 @@ extension EngineGlobalStateSelfTests {
         func annotationDecodeReencodeByteCompare() async throws {
             let fixture = try loadFixture()
             let s2cChunks = fixture.filter { $0.direction == .s2c }
-            #expect(s2cChunks.count == 3, "expected exactly 3 s2c chunks in the hand-authored fixture (login, join, annotated say); got \(s2cChunks.count)")
+            // Plan 4b Task 4 extended this fixture with a 4th s2c chunk (a
+            // WHISPER line, for the whisper-box visual artifact) — this test
+            // only reads chunks 0-2 (login, join, annotated say) below, so
+            // the extra trailing chunk doesn't affect it; the count check
+            // just needs to allow >= 3 instead of exactly 3.
+            #expect(s2cChunks.count >= 3, "expected at least 3 s2c chunks in the hand-authored fixture (login, join, annotated say); got \(s2cChunks.count)")
 
             let server = try LoopbackIRCServer()
             let session = ProtocolSession(host: "127.0.0.1", port: server.port, nick: "Anon", encoding: .cp1252)

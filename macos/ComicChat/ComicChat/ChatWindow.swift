@@ -15,6 +15,7 @@ import ComicChatKit
 /// properties is what reliably drives `updateNSView`.
 struct ChatWindow: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.openWindow) private var openWindow
     @State private var composeText = ""
 
     var body: some View {
@@ -33,7 +34,15 @@ struct ChatWindow: View {
             }
             // Original layout (chatview.cpp:333-378): members over bodycam.
             VStack(spacing: 0) {
-                List(appState.members, id: \.self) { nick in Text(nick) }
+                List(appState.members, id: \.self) { nick in
+                    Text(nick)
+                        .contextMenu {
+                            Button("Whisper…") {
+                                appState.showWhisperBox(peer: nick)
+                                openWindow(id: "whispers")
+                            }
+                        }
+                }
                 Divider()
                 BodyCamView(poseImage: appState.selfPoseImage,
                             onEmotion: { angle, intensity in
@@ -52,6 +61,25 @@ struct ChatWindow: View {
             if ProcessInfo.processInfo.arguments.contains("--replay-fixture") {
                 appState.showConnectSheet = false
                 await appState.connect()
+            }
+            // Task 4's visual-artifact demo hook: `--open-whisper <peer>`
+            // auto-opens the whisper box for `peer` once a whisper from them
+            // has actually arrived (polls `whisperPeers`, bounded by this
+            // `.task`'s own lifetime) — same "demo-only launch flag" posture
+            // as `--replay-fixture` above, for headless/scripted screenshot
+            // capture where driving the member-list context menu via UI
+            // automation isn't available.
+            if let peerIndex = ProcessInfo.processInfo.arguments.firstIndex(of: "--open-whisper"),
+               peerIndex + 1 < ProcessInfo.processInfo.arguments.count {
+                let peer = ProcessInfo.processInfo.arguments[peerIndex + 1]
+                for _ in 0..<200 {
+                    if appState.whisperPeers.contains(peer) { break }
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                if appState.whisperPeers.contains(peer) {
+                    appState.showWhisperBox(peer: peer)
+                    openWindow(id: "whispers")
+                }
             }
         }
     }

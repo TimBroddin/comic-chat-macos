@@ -30,6 +30,23 @@ public struct ChatConfig: Sendable {
     }
 }
 
+/// One line of a whisper transcript (Plan 4b Task 4's "ONE tabbed box" —
+/// `ChatSessionModel.whisperHistories`' per-peer value). `nick` is the line's
+/// speaker (the peer for an inbound whisper, our own nick for `isOwn`);
+/// `isOwn` distinguishes our own outbound lines (right-aligned/secondary in
+/// the UI) from the peer's inbound ones.
+public struct WhisperLine: Sendable, Equatable {
+    public let nick: String
+    public let text: String
+    public let isOwn: Bool
+
+    public init(nick: String, text: String, isOwn: Bool) {
+        self.nick = nick
+        self.text = text
+        self.isOwn = isOwn
+    }
+}
+
 /// The app's headless, testable core (D1 §3.2's binding recommendation: all
 /// logic lives in ComicChatKit, only chrome lives in the app). Composes every
 /// prior Plan 4a task into one live loop:
@@ -66,6 +83,12 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// couldn't be loaded/rendered). Called on the MAIN thread, matching
     /// `onStripImage`/`onMembers`/`onStatus`'s posture.
     public var onSelfPose: (@Sendable (CGImage?) -> Void)?
+    /// Fired on the MAIN thread for every whisper line added to
+    /// `_whisperHistories` -- both an inbound `.whisper` event (peer = the
+    /// sender's nick) AND `sendWhisper`'s own synthetic own-line append (peer
+    /// = the addressee) -- see `WhisperBox`'s doc comment for how the app
+    /// layer uses this to drive unread badges/live transcript updates.
+    public var onWhisper: (@Sendable (String, WhisperLine) -> Void)?
 
     private let config: ChatConfig
     private let engineQueue = DispatchQueue(label: "com.comicchat.engine")
@@ -178,6 +201,20 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// whose stray post-`shutdown()` engine work was still in flight).
     private var isShutDown = false
     private var consumerTask: Task<Void, Never>?
+
+    // MARK: Whisper (Plan 4b Task 4)
+
+    /// Engine-queue-owned whisper transcripts, keyed by peer nick. Appended
+    /// to from `handleLocked`'s `.whisper` case (inbound) and from
+    /// `sendWhisper` (own outbound line) -- see `whisperHistories` (the
+    /// public, thread-safe snapshot reader) below.
+    private var _whisperHistories: [String: [WhisperLine]] = [:]
+    /// TEST-ONLY internal seam (reachable via `@testable import`): Task 5
+    /// wires this to a real settings toggle. Hard-coded to the spec default
+    /// `true` until then -- an inbound whisper is dropped from history (and
+    /// surfaces via `onStatus` instead) while this is `false`. Engine-queue
+    /// only.
+    var _acceptWhispers: Bool = true
 
     public init(config: ChatConfig) {
         self.config = config
@@ -308,8 +345,15 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///   .selfJoined            -> announceAvatar(channel:, name:), recompose
     ///   .appearsAs (unseen nick) -> private reply-announce (toNick:), then
     ///                               bridge.apply + recompose
-    ///   .text/.whisper/.action (strip-relevant) -> bridge.apply + recompose
+    ///   .text/.action (strip-relevant) -> bridge.apply + recompose
     ///        (.text only: own-say echo dedup first, see below)
+    ///   .whisper                -> Plan 4b Task 4: route to
+    ///                              `_whisperHistories`/`onWhisper` (unless
+    ///                              `_acceptWhispers == false`, in which case
+    ///                              `onStatus` instead), THEN (unconditionally)
+    ///                              bridge.apply + recompose -- the existing
+    ///                              4a main-strip whisper-balloon rendering,
+    ///                              kept as-is.
     ///   .userJoined             -> bridge.apply + recompose, AND recompute
     ///                              sorted member list -> onMembers (final
     ///                              review: a join is both strip-relevant AND
@@ -364,7 +408,28 @@ public final class ChatSessionModel: @unchecked Sendable {
             try? bridge?.apply(ev)
             recomposeLocked()
 
-        case .text, .whisper, .action:
+        case .text, .action:
+            try? bridge?.apply(ev)
+            recomposeLocked()
+
+        case .whisper(let nick, _, let text, _):
+            // Plan 4b Task 4: Task-5's acceptWhispers setting doesn't exist
+            // yet -- `_acceptWhispers` is a hard-coded-true internal seam
+            // until then. When false, the whisper is dropped from
+            // `_whisperHistories`/`onWhisper` entirely and surfaces only via
+            // `onStatus` (matching the brief's drop-path contract). The
+            // main-strip whisper-balloon rendering (`bridge.apply` +
+            // `recomposeLocked`) is EXISTING 4a behavior for room-scoped
+            // whispers and is unconditionally kept either way -- this task
+            // only adds the tabbed-box routing alongside it.
+            if _acceptWhispers {
+                let line = WhisperLine(nick: nick, text: text, isOwn: false)
+                _whisperHistories[nick, default: []].append(line)
+                let cb = onWhisper
+                DispatchQueue.main.async { cb?(nick, line) }
+            } else {
+                emitStatus("Whisper from \(nick) blocked (whispers disabled)")
+            }
             try? bridge?.apply(ev)
             recomposeLocked()
 
@@ -564,6 +629,56 @@ public final class ChatSessionModel: @unchecked Sendable {
         let synthetic = ProtocolEvent.text(nick: ownNick, ident: "", target: config.room,
                                           text: text, kind: 0, annotations: ann)
         enqueueHandle(synthetic, fromServer: false)
+    }
+
+    // MARK: - whisper (Plan 4b Task 4)
+
+    /// Thread-safe snapshot of `_whisperHistories` (see that property's doc
+    /// comment for why the engine-queue-owned storage is private) — the
+    /// per-peer whisper transcripts the whisper box's `NavigationSplitView`
+    /// reads.
+    public var whisperHistories: [String: [WhisperLine]] {
+        engineQueue.sync { _whisperHistories }
+    }
+
+    /// Sends a whisper to `peer` (room-agnostic wire-wise — `cc_session_send_whisper`
+    /// actually speaks a plain `PRIVMSG <peer> :...`, see `WhisperRoutingTests`'
+    /// doc comment for the verified wire form) with COOKED SM_WHISPER-mode
+    /// annotations built from the current wheel/preview state, mirroring
+    /// `send(_:mode:)`'s own-render posture: the own line is appended to
+    /// `_whisperHistories[peer]` and re-broadcast via `onWhisper` locally,
+    /// rather than waiting for a possible server echo.
+    ///
+    /// DEVIATION FROM THE BRIEF'S SKETCH (noted per the task instructions):
+    /// the brief's sketch read `self.session.ownNick` inside the
+    /// `engineQueue.async` closure below. `session.ownNick` does its own
+    /// `sessionQueue.sync` internally, and `sessionQueue` IS `engineQueue`
+    /// (shared by injection, `ProtocolSession`'s own doc comment) — calling
+    /// it from a closure already running ON that same serial queue is a
+    /// same-queue reentrant `sync`, which traps (the exact hazard
+    /// `currentOwnNick`'s own doc comment documents this for `handleLocked`'s
+    /// echo-dedup check; the same hazard applies here). This uses
+    /// `currentOwnNick` (the engine-queue-local mirror) instead. Note this is
+    /// unlike `send(_:mode:)`'s own `let ownNick = session.ownNick` line,
+    /// which reads it OFF the engine queue (not inside an `engineQueue.async`
+    /// closure) and is therefore legal as written — the trap is specific to
+    /// reading it FROM INSIDE an already-on-`engineQueue` closure, which is
+    /// exactly what this method's closure is.
+    public func sendWhisper(to peer: String, text: String) async throws {
+        let ann: Annotations? = session.performOnEngineQueue { [self] in
+            guard var a = try? strip?.selfAnnotations() else { return nil }
+            a.mode = Self.smMode(for: .whisper)
+            a.addressees = [peer]
+            return a
+        }
+        try await session.whisper(to: [peer], text: text, channel: config.room, annotations: ann)
+        engineQueue.async { [weak self] in
+            guard let self, !self.isShutDown else { return }
+            let line = WhisperLine(nick: self.currentOwnNick, text: text, isOwn: true)
+            self._whisperHistories[peer, default: []].append(line)
+            let cb = self.onWhisper
+            DispatchQueue.main.async { cb?(peer, line) }
+        }
     }
 
     /// TEST-ONLY (internal, reachable via `@testable import`): hops onto the

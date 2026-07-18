@@ -9,5 +9,14 @@ struct ComicChatApp: App {
             ChatWindow().environment(appState)
         }
         .commands { AppCommands(appState: appState) }
+
+        // Plan 4b Task 4: ONE tabbed whisper box, not a window per peer (D1
+        // §0 correction to spec §5 — see WhisperBox's own doc comment). A
+        // single fixed `id` scene; which peer's tab is pre-selected on open
+        // is handed off via `AppState.pendingWhisperPeer` (a `Window` scene
+        // takes no per-open parameter here), read by `WhisperBox.task`.
+        Window("Whispers", id: "whispers") {
+            WhisperBox().environment(appState)
+        }
     }
 }

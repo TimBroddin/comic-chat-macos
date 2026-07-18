@@ -16,6 +16,62 @@ public final class AppState {
     /// every emotion-wheel drag or typing-preview via `ChatSessionModel.onSelfPose`.
     public var selfPoseImage: CGImage?
 
+    // MARK: Whisper box (Plan 4b Task 4)
+
+    /// Peers we have ANY whisper history with, in first-contact order (a
+    /// peer is appended the first time `onWhisper` fires for them — inbound
+    /// OR our own outbound start of a new whisper). `WhisperBox`'s sidebar
+    /// list.
+    public var whisperPeers: [String] = []
+    /// Mirror of `ChatSessionModel.whisperHistories`, kept in sync from
+    /// `onWhisper` on the MAIN thread (the model's own storage is
+    /// engine-queue-owned and requires a `engineQueue.sync` hop per read —
+    /// this mirror avoids that on every SwiftUI body re-evaluation).
+    public var whisperHistories: [String: [WhisperLine]] = [:]
+    /// Unread count per peer — incremented on every INBOUND `onWhisper` for a
+    /// peer whose tab is not the currently-selected one in `WhisperBox`;
+    /// cleared when that peer's tab is selected (see `WhisperBox.selectedPeer`'s
+    /// `onChange`). Modern-Mac deviation from the original (noted in the
+    /// Task 4 report): the original auto-pops-up `CWhisperBox`/`CWhisperLeaf`
+    /// on first inbound whisper from a peer (whisprbx.cpp); this app instead
+    /// shows a status line + badge and leaves opening the window to the user
+    /// (Room > Whisper…/the member context menu), never auto-opening it.
+    public var whisperUnread: [String: Int] = [:]
+    /// Set by `showWhisperBox(peer:)`, read (and cleared) by `WhisperBox`'s
+    /// `.task`/`.onChange` on window appearance — the hand-off for "which
+    /// peer's tab should be selected" across the `openWindow(id:)` boundary,
+    /// since `Window` scenes take no per-open parameter in this SwiftUI
+    /// version (only a fixed `id`).
+    public var pendingWhisperPeer: String?
+
+    /// Requests the whisper box window be opened (via the CALLER's
+    /// `@Environment(\.openWindow)`, since `AppState` itself has no window
+    /// scene to open) with `peer`'s tab pre-selected, if given. Called from
+    /// `ChatWindow`'s member context menu ("Whisper…") and `AppCommands`'
+    /// Member menu.
+    public func showWhisperBox(peer: String?) {
+        if let peer {
+            pendingWhisperPeer = peer
+            if !whisperPeers.contains(peer) { whisperPeers.append(peer) }
+            whisperUnread[peer] = 0
+        }
+    }
+
+    /// Records one whisper line from `ChatSessionModel.onWhisper` into the
+    /// mirrors above. `peer` first-contact order seeds `whisperPeers`;
+    /// inbound lines (`!line.isOwn`) bump `whisperUnread[peer]` unless that
+    /// peer's tab is the one currently showing (`pendingWhisperPeer == peer`
+    /// is NOT sufficient for that check — `WhisperBox` clears unread directly
+    /// via its own `onChange(of: selectedPeer)`, so this always increments;
+    /// the box's clear-on-select is what actually keeps the badge honest).
+    func recordWhisper(peer: String, line: WhisperLine) {
+        if !whisperPeers.contains(peer) { whisperPeers.append(peer) }
+        whisperHistories[peer, default: []].append(line)
+        if !line.isOwn {
+            whisperUnread[peer, default: 0] += 1
+        }
+    }
+
     /// Kept alive for the process's whole replay session — `FixtureReplayServer`
     /// services exactly one connection, and its `NWListener`/`NWConnection`
     /// are torn down if this reference drops (Task 12's offline demo hook).
@@ -72,6 +128,8 @@ public final class AppState {
         m.onMembers = { [weak self] nicks in Task { @MainActor in self?.members = nicks } }
         m.onStatus = { [weak self] s in Task { @MainActor in self?.statusLine = s } }
         m.onSelfPose = { [weak self] img in Task { @MainActor in self?.selfPoseImage = img } }
+        m.onWhisper = { [weak self] peer, line in
+            Task { @MainActor in self?.recordWhisper(peer: peer, line: line) } }
         model = m
         do { try await m.start(); showConnectSheet = false }
         catch { statusLine = "Connect failed: \(error)" }
@@ -102,5 +160,9 @@ public final class AppState {
         selfPoseImage = nil
         replayServer?.stop()
         replayServer = nil
+        whisperPeers = []
+        whisperHistories = [:]
+        whisperUnread = [:]
+        pendingWhisperPeer = nil
     }
 }
