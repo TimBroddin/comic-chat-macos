@@ -3786,6 +3786,66 @@ static int cc_selftest_session_login() {
     return 0;
 }
 
+// --- cc_session_announce_avatar selftest (Plan 4a Task 8 Step 2): the
+// outbound avatar announce ("# Appears as ...", CRoomInfo::ChatAnnounceNewAvatar
+// v2.5-beta-1-modern/protsupp.cpp:817-843 -- see comicchat.h's doc comment for
+// the un-wrap-vs-R16 disposition). Byte ground truth is the original's own
+// sprintf grammar (no committed capture actually contains a real "# Appears
+// as" c2s line -- neither smoke-2.jsonl nor hand-authored-annotation.jsonl --
+// so this asserts against protsupp.cpp:833/835 + APPEARSPREFIX directly):
+//   channel-wide, no URL:      "PRIVMSG #comicrig :# Appears as Anna\r\n"
+//   private reply (to_nick):   "PRIVMSG Win :# Appears as Anna\r\n"
+//   with a URL:                "PRIVMSG #comicrig :# Appears as Anna.http://x\r\n"
+// Sent with an EMPTY message (bChatSendToTarget's szMesg=NULL/"" path) so the
+// announcement rides purely as the annotations argument -- the IRCX-DATA-vs-
+// plain-PRIVMSG branch is bChatSendToTarget's own IsIRCX() test, exercised
+// here on a plain (non-IRCX) session; Task 4's cc_selftest_pv_data_vs_inline
+// already covers the IRCX DATA-line half of that same branch for annotations
+// in general, so this test does not re-derive it.
+static int cc_selftest_announce_avatar() {
+    CCOutboundCap cap;
+    cc_session_config cfg = {};
+    cfg.user_data = &cap;
+    cfg.send = ccOutboundCapSend;
+    cfg.own_nick = ccOutboundOwnNick;
+    cc_session* s = cc_session_create(&cfg);
+    CC_CHECK(s != nullptr);
+    if (!s) return g_failures;
+
+    CC_CHECK(cc_session_join(s, "#comicrig", nullptr) == 0);
+    cap.sent.clear();
+    uint32_t token = cc_session_register_room(s, "#comicrig");
+    CC_CHECK(token != CC_ROOM_TOKEN_NONE);
+
+    // Channel-wide, no URL.
+    CC_CHECK(cc_session_announce_avatar(s, token, nullptr, "Anna", nullptr) == 0);
+    CC_CHECK(cap.sent == "PRIVMSG #comicrig :# Appears as Anna\r\n");
+    cap.sent.clear();
+
+    // Private reply-announce (to_nick set) -- bChatSendPrivMesg, not
+    // bChatSendToChannel (protsupp.cpp:868-877's reply rule).
+    CC_CHECK(cc_session_announce_avatar(s, token, "Win", "Anna", nullptr) == 0);
+    CC_CHECK(cap.sent == "PRIVMSG Win :# Appears as Anna\r\n");
+    cap.sent.clear();
+
+    // With a URL: "<name>.<url>" grammar (protsupp.cpp:833).
+    CC_CHECK(cc_session_announce_avatar(s, token, nullptr, "Anna", "http://x") == 0);
+    CC_CHECK(cap.sent == "PRIVMSG #comicrig :# Appears as Anna.http://x\r\n");
+    cap.sent.clear();
+
+    // NULL/empty name falls back to "NONE" (protsupp.cpp:830-831).
+    CC_CHECK(cc_session_announce_avatar(s, token, nullptr, nullptr, nullptr) == 0);
+    CC_CHECK(cap.sent == "PRIVMSG #comicrig :# Appears as NONE\r\n");
+    cap.sent.clear();
+
+    // Unknown room_token -> failure, no send.
+    CC_CHECK(cc_session_announce_avatar(s, CC_ROOM_TOKEN_NONE, nullptr, "Anna", nullptr) != 0);
+    CC_CHECK(cap.sent.empty());
+
+    cc_session_destroy(s);
+    return 0;
+}
+
 // --- ISIRCX probe timer-request selftest (Plan 3 Task 4 brief: "the MODE
 // ISIRCX path requests the 50s timer via cfg.set_timer(CC_TIMER_ISIRCX_PROBE,
 // 50000)"). Verifies both the wire bytes AND that the timer request reaches
@@ -5085,6 +5145,7 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_query_correlation();            // Plan 3 Task 4: CCQuery/CQueryPtrList
     cc_selftest_outbound_join_say();            // Plan 3 Task 4: outbound byte-compare
     cc_selftest_session_login();                // Plan 4a Task 2: NICK/USER (cc_session_login)
+    cc_selftest_announce_avatar();              // Plan 4a Task 8: cc_session_announce_avatar
     cc_selftest_outbound_ircx_probe_timer();    // Plan 3 Task 4: MODE ISIRCX + timer request
     cc_selftest_probe_451_cancels_timer();      // Plan 4a Task 2 fix: m_bJustSentModeIsIrcX side effect
     cc_selftest_outbound_say_chunking();        // Plan 3 Task 4: bChatSendToTarget multi-chunk path

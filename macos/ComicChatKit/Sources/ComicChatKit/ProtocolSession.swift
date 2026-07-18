@@ -540,6 +540,54 @@ public final class ProtocolSession: @unchecked Sendable {
         }
     }
 
+    /// Outbound avatar announce ("# Appears as <name>" / "# Appears as
+    /// <name>.<url>", `cc_session_announce_avatar` — see that C function's
+    /// comicchat.h doc comment for the full grammar/lift rationale). `toNick`
+    /// nil announces channel-wide; non-nil sends a private reply-announce to
+    /// that nick (the "someone appeared, tell them who we are back" case
+    /// Task 9 drives from a `.appearsAs` event for an unseen nick).
+    ///
+    /// `name`/`url` are encoded per `encoding` (mirrors `say`'s posture: wire
+    /// text is CP-1252 or UTF-8 per the session's configured encoding, NOT
+    /// assumed-ASCII `String.withCString` — an avatar name containing e.g. a
+    /// CP-1252-only curly quote must round-trip correctly here exactly as
+    /// `_ownNick`/addressee strings do via `WireCodec`, see
+    /// `refillOwnNickBuffer`/`ProtocolEvents.swift`'s own encode call sites).
+    public func announceAvatar(channel: String, toNick: String? = nil, name: String, url: String? = nil) async throws {
+        try await onQueueGated { s in
+            guard let token = self.roomTokenFor(channel) else {
+                throw ProtocolSessionError.commandFailed("announceAvatar: unknown channel \(channel)")
+            }
+            let rc = self.withEncodedCString(name) { namePtr in
+                self.withOptionalEncodedCString(toNick) { toNickPtr in
+                    self.withOptionalEncodedCString(url) { urlPtr in
+                        cc_session_announce_avatar(s, token, toNickPtr, namePtr, urlPtr)
+                    }
+                }
+            }
+            guard rc == 0 else { throw ProtocolSessionError.commandFailed("announceAvatar failed") }
+        }
+    }
+
+    /// Encodes `s` per `encoding` into a temporary NUL-terminated buffer and
+    /// hands `body` a pointer valid for the closure's duration — the
+    /// `withCString`-shaped equivalent of `WireCodec.encode`, needed because
+    /// plain `String.withCString` always encodes as UTF-8 regardless of the
+    /// session's `encoding` (see `announceAvatar`'s doc comment).
+    private func withEncodedCString<R>(_ s: String, _ body: (UnsafePointer<CChar>) -> R) -> R {
+        var bytes = WireCodec.encode(s, encoding: encoding)
+        bytes.append(0)
+        return bytes.withUnsafeBufferPointer { buf in
+            body(buf.baseAddress!.withMemoryRebound(to: CChar.self, capacity: buf.count) { $0 })
+        }
+    }
+
+    /// `withEncodedCString`, but passes `nil` straight through for a `nil` input.
+    private func withOptionalEncodedCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+        guard let s else { return body(nil) }
+        return withEncodedCString(s) { body($0) }
+    }
+
     public func whisper(to nicks: [String], text: String, channel: String,
                         annotations: Annotations? = nil) async throws {
         try await onQueueGated { s in

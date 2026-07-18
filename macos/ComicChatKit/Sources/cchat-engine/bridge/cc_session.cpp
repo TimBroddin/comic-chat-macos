@@ -493,6 +493,53 @@ int32_t cc_session_send_say(cc_session* h, uint32_t room_token, const cc_annotat
     return rc;
 }
 
+// --- cc_session_announce_avatar (Plan 4a Task 8) ---------------------------
+// R16 bridge reimplementation of CRoomInfo::ChatAnnounceNewAvatar
+// (v2.5-beta-1-modern/protsupp.cpp:817-843 -- see comicchat.h's doc comment
+// for the full un-wrap-vs-R16 rationale: the original lives on CRoomInfo, a
+// base this port's CIrcProto does not inherit, so there is no CRoomInfo file
+// to un-wrap the string-builder half out of). Builds "# Appears as <name>"
+// or "# Appears as <name>.<url>" (APPEARSPREFIX = " Appears as ",
+// ircproto.h:83) into a local buffer and sends it as the ANNOTATIONS
+// argument with an EMPTY message, exactly like the original's own
+// GetOutBuff()+bChatSendToChannel/bChatSendPrivMesg calls.
+static void ccBuildAnnounceAvatar(const char* name, const char* url, char* out, size_t outSize) {
+    if (!name || !*name) name = "NONE";  // protsupp.cpp:830-831
+    if (url && *url != '\0')
+        snprintf(out, outSize, "#%s%s.%s", " Appears as ", name, url);   // protsupp.cpp:833
+    else
+        snprintf(out, outSize, "#%s%s", " Appears as ", name);          // protsupp.cpp:835
+}
+
+int32_t cc_session_announce_avatar(cc_session* h, uint32_t room_token, const char* to_nick, const char* name, const char* url) {
+    CCSession* s = reinterpret_cast<CCSession*>(h);
+    if (!s) return 1;
+    CCSession* prevSession = g_session;
+    g_session = s;
+    int32_t rc = 1;
+    if (ccSessionSelectRoom(s, room_token)) {
+        // 512 (not the 256 ccEncodeAnnotations uses for its fixed-format
+        // G/E/M annotation block): name+url are arbitrary caller-supplied
+        // strings, potentially a full URL, so this matches g_nDefaultIOBuff
+        // (ircsock.h) -- the actual wire-line-length ceiling -- rather than
+        // an annotation-block-sized budget. snprintf still truncates safely
+        // (never overflows) if a caller somehow exceeds this.
+        char annBuf[512];
+        ccBuildAnnounceAvatar(name, url, annBuf, sizeof(annBuf));
+        BOOL ok;
+        if (to_nick && *to_nick) {
+            // Private reply-announce (protsupp.cpp:868-877's ProcessComment
+            // rule): bChatSendPrivMesg, not bChatSendToChannel.
+            ok = s->proto.bChatSendPrivMesg(to_nick, annBuf, nullptr, nullptr, FALSE, 0, ccSessionGetOwnIdentity);
+        } else {
+            ok = s->proto.bChatSendToChannel(annBuf, nullptr, nullptr, 0, ccSessionGetOwnIdentity);
+        }
+        rc = ok ? 0 : 1;
+    }
+    g_session = prevSession;
+    return rc;
+}
+
 int32_t cc_session_send_whisper(cc_session* h, uint32_t room_token, const cc_annotations* ann, const char* text, const char* const* nicks, int32_t nick_count) {
     CCSession* s = reinterpret_cast<CCSession*>(h);
     if (!s || !text || !nicks || nick_count <= 0) return 1;

@@ -639,6 +639,61 @@ int32_t cc_session_probe_ircx(cc_session* s);
  * once per session by its Swift caller, guarded by a one-shot flag there). */
 int32_t cc_session_login(cc_session* s);
 
+/* Plan 4a Task 8: outbound avatar announce, the Swift-driven equivalent of
+ * CRoomInfo::ChatAnnounceNewAvatar (v2.5-beta-1-modern/protsupp.cpp:817-843
+ * -- READ-ONLY original, not present in the lifted engine/protsupp.cpp at
+ * all: that file lifted only the RECEIVE-side "# Appears as" parser
+ * (ProcessComment), never this SEND-side builder). Builds:
+ *   "# Appears as <name>"       (url NULL or empty)
+ *   "# Appears as <name>.<url>" (url non-empty)
+ * -- APPEARSPREFIX's exact text (ircproto.h:83, " Appears as "), reproduced
+ * as an R16 bridge-side string builder in cc_session.cpp rather than an
+ * un-wrap: the original method lives on CRoomInfo, a base this port's
+ * CIrcProto does not inherit from (ircproto.cpp's own structural note), so
+ * there is no CRoomInfo file to un-wrap the string-builder half out of;
+ * cc_session.cpp's ccEncodeAnnotations (Plan 3 Task 4) already established
+ * this exact precedent -- a bridge-side reimplementation of an original
+ * string-building routine, citing the original's sprintf grammar byte for
+ * byte. Sent as the ANNOTATIONS argument with an EMPTY message via
+ * CIrcProto::bChatSendToChannel/bChatSendPrivMesg (bChatSendToTarget's own
+ * IsIRCX() branch then picks "DATA <target> CCUDI1 :<annotations>\r\n"
+ * (IRCX, no PRIVMSG line since the message is empty) vs plain
+ * "PRIVMSG <target> :<annotations>\r\n" -- inherited for free, exactly the
+ * brief's D4 §4 requirement).
+ *
+ * `to_nick` NULL sends channel-wide (bChatSendToChannel, protsupp.cpp:839's
+ * "initially we send a spurious announcement prior to connection" case);
+ * non-NULL sends a private reply-announce to that nick via
+ * bChatSendPrivMesg (protsupp.cpp:868-877's ProcessComment rule: on first
+ * "# Appears as" from a not-yet-comic-user peer, reply privately with our
+ * own avatar). `name` NULL/empty is sent as "NONE" (protsupp.cpp:830-831's
+ * fallback -- an empty avatar name is never sent literally empty).
+ *
+ * DROPPED (R20, each individually noted): (1) the original's
+ * `IsIRCX() || g_bSendComicsData || bForce` all-or-nothing send gate --
+ * `g_bSendComicsData` is a UI settings toggle never lifted into this
+ * engine, and `bForce` doesn't exist in this signature at all; this
+ * function always builds and sends (the original's gate decided WHETHER to
+ * send at all, not the grammar -- deferring that decision to the caller,
+ * same posture as (2) below). (2) `GetConnectionStatus() != CX_INCHANNEL`
+ * -- a CRoomInfo virtual this CIrcProto doesn't inherit (same structural gap
+ * bExecuteQuery's own DEVIATION comment documents); connection-status
+ * gating is Task 7's CCSession's job, done at the C-function layer by the
+ * Swift caller's `onQueueGated` (connectionStatus == .connected) exactly as
+ * bExecuteQuery's comment prescribes -- this function has no independent
+ * connection-status check of its own, mirroring bExecuteQuery.
+ *
+ * Reentrancy: follows cc_session_login's save/restore g_session pattern
+ * (this function CAN be called from inside an active engine frame, e.g. a
+ * reply-announce triggered synchronously from the inbound "# Appears as"
+ * dispatch once Task 9 wires that up -- unconditionally nulling g_session
+ * on exit would clobber a still-active outer frame's session pointer).
+ * 0 = ok, non-zero on a NULL session or an unknown/unregistered room_token
+ * (`name` NULL/empty is NOT a failure -- see the "NONE" fallback above). */
+int32_t cc_session_announce_avatar(cc_session* s, uint32_t room_token,
+                                   const char* to_nick, const char* name,
+                                   const char* url);
+
 #ifdef __cplusplus
 }
 #endif
