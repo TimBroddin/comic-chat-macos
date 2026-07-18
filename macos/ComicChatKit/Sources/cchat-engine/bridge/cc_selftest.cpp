@@ -2505,6 +2505,31 @@ extern "C" int32_t cc_run_strip_selftest(const char* avatarPath,
     return g_failures;
 }
 
+// --- Plan 3 Task 1: cc_session C boundary skeleton --------------------------
+// No parsing yet: creates a cc_session, feeds it a byte string (accumulates
+// into an internal buffer only), then drives the test-only echo hook and
+// asserts it produced exactly one send() with the expected bytes and one
+// on_event() call. Proves the boundary compiles, links, round-trips a byte,
+// and invokes a callback -- nothing more.
+static int cc_selftest_session_skeleton() {
+    struct Cap { std::string sent; int events = 0; } cap;
+    cc_session_config cfg = {};
+    cfg.user_data = &cap;
+    cfg.send = [](void* ud, const uint8_t* d, size_t n) {
+        static_cast<Cap*>(ud)->sent.append(reinterpret_cast<const char*>(d), n);
+    };
+    cfg.on_event = [](void* ud, const cc_proto_event*) { static_cast<Cap*>(ud)->events++; };
+
+    cc_session* s = cc_session_create(&cfg);
+    CC_CHECK(s != nullptr);
+    cc_session_feed_bytes(s, reinterpret_cast<const uint8_t*>("PING x\r\n"), 8);
+    cc_session_test_echo(s);          // test-only: drives one send + one event
+    CC_CHECK(cap.sent == "ECHO\r\n");
+    CC_CHECK(cap.events == 1);
+    cc_session_destroy(s);
+    return 0;
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -2535,5 +2560,6 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_panel_session();  // Task 8 Step 1: R17 session extensions
     testLoadStringResource();     // Task 9 R9 shim: CString::LoadString
     cc_selftest_textpose();       // Task 9: text -> emotion rule tables
+    cc_selftest_session_skeleton();  // Plan 3 Task 1: cc_session C boundary
     return g_failures;
 }

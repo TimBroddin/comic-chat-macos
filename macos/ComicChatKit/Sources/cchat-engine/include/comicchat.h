@@ -253,6 +253,49 @@ void      cc_strip_get_size(const cc_strip* s, int32_t* out_w, int32_t* out_h);
  * CUnitPanelPage::Draw). Returns 0 on success. */
 int32_t   cc_strip_compose(cc_strip* s, cc_canvas* canvas); /* 0 ok */
 
+/* ---- Protocol session (Plan 3): bytes in, events out ---------------------
+ * The engine never opens a socket. Swift owns NWConnection and the event loop.
+ * All calls are single-threaded (see the engine threading contract above).
+ * Text buffers are wire bytes (CP-1252 by default); the engine does not
+ * transcode — Swift converts for display. */
+
+typedef struct cc_session cc_session;
+typedef uint32_t cc_user_ref;     /* opaque per-user handle from resolve_user; 0 = unknown */
+#define CC_USER_REF_NONE 0u
+
+/* One-shot timer ids the engine may request (Swift schedules, then calls
+ * cc_session_fire_timer). Exactly one is used today. */
+#define CC_TIMER_ISIRCX_PROBE 1
+
+typedef void        (*cc_send_fn)(void* user_data, const uint8_t* data, size_t len);
+typedef void        (*cc_set_timer_fn)(void* user_data, int32_t timer_id, int32_t ms);
+typedef void        (*cc_cancel_timer_fn)(void* user_data, int32_t timer_id);
+struct cc_proto_event;  /* defined below in Task 5's block */
+typedef void        (*cc_on_event_fn)(void* user_data, const struct cc_proto_event* ev);
+typedef const char* (*cc_own_nick_fn)(void* user_data);   /* never NULL; "" if unknown */
+typedef cc_user_ref (*cc_resolve_user_fn)(void* user_data, const char* nick, uint32_t room_token);
+
+typedef struct cc_session_config {
+    void*               user_data;
+    cc_send_fn          send;
+    cc_set_timer_fn     set_timer;
+    cc_cancel_timer_fn  cancel_timer;
+    cc_on_event_fn      on_event;
+    cc_own_nick_fn      own_nick;
+    cc_resolve_user_fn  resolve_user;
+    const char*         local_host;    /* value gethostname would have returned; may be NULL */
+    int32_t             encoding;      /* 0 = CP-1252 (default), 1 = UTF-8 (per spec §4.5) */
+} cc_session_config;
+
+cc_session* cc_session_create(const cc_session_config* cfg);   /* NULL on bad cfg */
+void        cc_session_destroy(cc_session* s);                 /* no-op if NULL */
+void        cc_session_feed_bytes(cc_session* s, const uint8_t* data, size_t len);
+void        cc_session_fire_timer(cc_session* s, int32_t timer_id);
+
+/* Test-only hook (Task 1): drives one send("ECHO\r\n") + one on_event. Removed
+ * once real parsing lands; kept behind CC_SESSION_TESTHOOK. */
+void        cc_session_test_echo(cc_session* s);
+
 #ifdef __cplusplus
 }
 #endif
