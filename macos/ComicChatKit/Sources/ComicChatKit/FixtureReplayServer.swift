@@ -16,15 +16,39 @@ import Network
 /// suite). `c2s`/`meta` lines are read (so a whole real capture file can be
 /// pointed at directly) but never sent.
 ///
-/// PACING (documented choice, per the brief's "keep it dumb" instruction):
+/// ACTUAL BEHAVIOR (final review, Plan 4a: corrects the pacing design below,
+/// which reads as intentional but is dead code): `onClientReady`'s "send
+/// every s2c chunk before the first trigger fires" loop runs to completion —
+/// i.e. sends EVERY s2c chunk in the fixture — before `receiveLoop()` starts
+/// listening for any client bytes at all. That means all `s2c` chunks are
+/// always sent, unpaced, immediately on connect, and the trigger machinery in
+/// `onClientBytes` (the "MODE ISIRCX" / "NICK " / "JOIN " substring watches)
+/// never observes a client byte before `nextChunkIndex` has already reached
+/// `s2cChunks.count` — every trigger's `sendNextChunkLocked()` call is
+/// therefore always a no-op (`nextChunkIndex < s2cChunks.count` is already
+/// false). This is proven safe for this server's actual job: every fixture
+/// used here (see AppState's replay hook) is a canned login->join->comic
+/// sequence for an EVENT-DRIVEN client (`ProtocolSession`'s parser reacts to
+/// whatever bytes arrive whenever they arrive — it has no wall-clock
+/// expectations about WHEN the 451/001/JOIN-echo show up), so dumping the
+/// whole fixture on connect and letting the client's own state machine work
+/// through it byte-by-byte produces the same observable session as a
+/// carefully paced delivery would. Confirmed by both `FixtureReplayServerTests`
+/// and the live `--replay-fixture` demo (Task 12's exit milestone).
+///
+/// The paragraph below documents the ORIGINAL pacing design intent — kept for
+/// history/rationale, but per the above, `onClientBytes`'s trigger checks
+/// never fire in practice; do not rely on them:
+///
 /// a full capture's `c2s` lines are what the ORIGINAL client sent, which is
 /// almost never byte-identical to what `ProtocolSession`'s auto-login
 /// produces (e.g. `smoke-2.jsonl`'s "client 2" slice ends in a PING/PONG
 /// keepalive exchange and a QUIT/ERROR teardown that a live `ChatSessionModel`
 /// session never sends) — so pacing CANNOT simply be "replay c2s line N, then
-/// send s2c chunk N+1" against a raw capture. Instead this replays s2c CHUNKS
-/// paced by watching the CONNECTING client's own outbound bytes for three
-/// simple substring triggers, in order, each firing at most once:
+/// send s2c chunk N+1" against a raw capture. The intent was instead to
+/// replay s2c CHUNKS paced by watching the CONNECTING client's own outbound
+/// bytes for three simple substring triggers, in order, each firing at most
+/// once:
 ///   1. on connect (no trigger needed) -> send every s2c chunk BEFORE the
 ///      first trigger fires (a fixture's pre-probe-answer chunk, if any).
 ///   2. first "MODE ISIRCX" seen from the client -> send the NEXT s2c chunk
@@ -34,7 +58,7 @@ import Network
 ///      001 welcome + MOTD block).
 ///   4. first "JOIN " seen from the client -> send the NEXT s2c chunk (the
 ///      JOIN echo + NAMES/353/366 block, and everything else remaining).
-/// This is intentionally NOT a general capture-replay engine (it doesn't
+/// This was intended to NOT be a general capture-replay engine (it doesn't
 /// try to pace WHO/PING/etc. — a fixture prepared for this server, like
 /// `smoke-2-replay.jsonl`, should carry only the s2c chunks this trigger set
 /// can drive: pre-probe/451/001/join-echo, in that order). A fixture with
@@ -190,10 +214,12 @@ public final class FixtureReplayServer: @unchecked Sendable {
         conn.start(queue: queue)
     }
 
-    /// Runs on `queue`. Sends every s2c chunk before the FIRST trigger (see
-    /// this type's doc comment) — for a fixture whose first chunk is meant to
-    /// arrive unprompted (nothing to pace off yet), then arms the receive
-    /// loop that watches for the three trigger substrings.
+    /// Runs on `queue`. In practice (see this type's doc comment) this loop
+    /// always runs to completion — `hasAnyTrigger()` can only ever become
+    /// true from `onClientBytes`, which cannot run until `receiveLoop()`
+    /// below has been called at least once — so this sends the ENTIRE
+    /// fixture's s2c bytes before the receive loop ever arms. Currently
+    /// inert as a pacing mechanism — see doc comment.
     private func onClientReady() {
         while nextChunkIndex < s2cChunks.count, !hasAnyTrigger() {
             sendNextChunkLocked()
@@ -224,7 +250,10 @@ public final class FixtureReplayServer: @unchecked Sendable {
     /// at most one NEW trigger per call (in the fixed order MODE ISIRCX ->
     /// NICK -> JOIN, matching the login sequence those substrings appear in),
     /// sending the next queued s2c chunk each time a trigger fires for the
-    /// first time.
+    /// first time. Currently inert — see this type's doc comment: by the time
+    /// any client bytes reach this method, `onClientReady` has already sent
+    /// every s2c chunk, so every `sendNextChunkLocked()` call below is a
+    /// no-op (`nextChunkIndex` is already `== s2cChunks.count`).
     private func onClientBytes(_ data: Data) {
         let text = String(data: data, encoding: .isoLatin1) ?? ""
         receivedText += text

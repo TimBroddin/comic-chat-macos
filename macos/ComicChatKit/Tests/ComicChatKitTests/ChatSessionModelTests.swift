@@ -41,6 +41,25 @@ private final class ImagesBox: @unchecked Sendable {
     }
 }
 
+/// Thread-safe accumulator for `onMembers`'s captured `[String]` (same
+/// lock-guarded-box shape as `ImagesBox` above — `onMembers` is also a
+/// `@Sendable` closure called on the main thread via `DispatchQueue.main.async`,
+/// while the test body reads it from its own task).
+private final class MembersBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    func set(_ nicks: [String]) {
+        lock.lock(); defer { lock.unlock() }
+        storage = nicks
+    }
+
+    func get() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
+}
+
 extension EngineGlobalStateSelfTests {
     @Suite(.serialized)
     struct ChatSessionModelTests {
@@ -74,6 +93,43 @@ extension EngineGlobalStateSelfTests {
             #expect(sent.contains { $0.hasPrefix("PRIVMSG #p4 :") && $0.contains("hi win") })
             // the self-join announce (Task 8) went out
             #expect(sent.contains { $0.contains("# Appears as Anna") || $0.contains("# Appears as anna") })
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Final review (Plan 4a) regression test for the `.userJoined` ->
+        /// `emitMembers()` fix: after login/join, a peer JOINing mid-session
+        /// must refresh the member sidebar (`onMembers`), not just the strip.
+        /// Before the fix, `.userJoined` only routed to `bridge.apply` +
+        /// `recomposeLocked()` — the member list never updated until some
+        /// unrelated membership event (part/quit/kick/names/nick-change)
+        /// happened to fire.
+        @Test(.timeLimit(.minutes(1)))
+        func peerJoinRefreshesMemberSidebar() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            let members = MembersBox()
+            model.onMembers = { nicks in members.set(nicks) }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+            // a peer joins mid-session
+            try await server.send(":Peer!u@h JOIN #p4")
+            // Poll (rather than wait for a single `onMembers` callback):
+            // login/join itself already fires `emitMembers()` from `.names`/
+            // `.endOfNames` as independent detached `Task`s (see `emitMembers`'s
+            // doc comment), each racing to write `members` on its own
+            // schedule -- waiting for just ONE more callback after sending the
+            // peer's JOIN can observe an earlier, stale (pre-Peer) callback
+            // instead of the one this test actually cares about. Polling until
+            // the list actually contains "Peer" is the same shape as this
+            // file's other polling helpers (`waitForReceivedLine`) and is
+            // robust to that interleaving.
+            while !members.get().contains("Peer") {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(members.get().contains("Peer"))
             model.shutdown()
             server.stop()
         }

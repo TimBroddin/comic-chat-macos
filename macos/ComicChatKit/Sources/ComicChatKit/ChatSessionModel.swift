@@ -253,8 +253,11 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///   .selfJoined            -> announceAvatar(channel:, name:), recompose
     ///   .appearsAs (unseen nick) -> private reply-announce (toNick:), then
     ///                               bridge.apply + recompose
-    ///   .text/.whisper/.action/.userJoined (strip-relevant) -> bridge.apply
-    ///                               + recompose
+    ///   .text/.whisper/.action (strip-relevant) -> bridge.apply + recompose
+    ///   .userJoined             -> bridge.apply + recompose, AND recompute
+    ///                              sorted member list -> onMembers (final
+    ///                              review: a join is both strip-relevant AND
+    ///                              membership-relevant)
     ///   .userParted/.userQuit/.kicked/.names/.endOfNames/.nickChanged
     ///                           -> recompute sorted member list -> onMembers
     ///   .statusLine/.error/.disconnectedHint -> onStatus
@@ -286,9 +289,20 @@ public final class ChatSessionModel: @unchecked Sendable {
             try? bridge?.apply(ev)
             recomposeLocked()
 
-        case .text, .whisper, .action, .userJoined:
+        case .text, .whisper, .action:
             try? bridge?.apply(ev)
             recomposeLocked()
+
+        case .userJoined:
+            try? bridge?.apply(ev)
+            recomposeLocked()
+            // Final review (Plan 4a): a peer joining mid-session must also
+            // refresh the member sidebar -- match every other membership case
+            // below (parts/quits/kicks/names/nick-changes) which already call
+            // `emitMembers()`. Without this, a joining peer appears in the
+            // comic strip but never in the sidebar until some unrelated
+            // membership event happens to fire.
+            emitMembers()
 
         case .userParted, .userQuit, .kicked, .names, .endOfNames, .nickChanged:
             emitMembers()
@@ -450,6 +464,16 @@ public final class ChatSessionModel: @unchecked Sendable {
             self.strip?.close()
             self.strip = nil
             self.bridge = nil
+            // Final review (Plan 4a): deregister BEFORE releasing the box.
+            // `metricsCanvasBox`'s own doc comment explains why: the engine's
+            // process-global metrics-canvas pointer points directly at the
+            // box's (unretained, non-self-retaining) C structs, so releasing
+            // the box first would leave that pointer dangling for however
+            // long it takes `metricsCanvasBox = nil` to run -- and any other
+            // session/selftest in the process sharing that global registration
+            // could measure text against it in that window (bad access,
+            // exactly the crash this box's whole design exists to avoid).
+            cc_set_metrics_canvas(nil)
             self.metricsCanvasBox = nil
             self.metricsCanvas = nil
         }

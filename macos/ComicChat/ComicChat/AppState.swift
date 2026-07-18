@@ -19,6 +19,15 @@ public final class AppState {
     private var replayServer: FixtureReplayServer?
 
     public func connect() async {
+        // Final review (Plan 4a): tear down any existing session FIRST. Without
+        // this, ⌘N -> Connect while already connected builds a SECOND
+        // ChatSessionModel (with its own engine queue driving the same
+        // process-global engine state -- a two-serial-queues hazard) and
+        // drops the old `model` reference without ever calling its mandatory
+        // `shutdown()`. `disconnect()` is idempotent (safe to call with no
+        // active session).
+        disconnect()
+
         let artDir = Bundle.main.resourceURL!.appendingPathComponent("comicart").path
         var cfg = ChatConfig(host: settings.server, port: UInt16(exactly: settings.port) ?? 6667,
                              nick: settings.nick, room: settings.room,
