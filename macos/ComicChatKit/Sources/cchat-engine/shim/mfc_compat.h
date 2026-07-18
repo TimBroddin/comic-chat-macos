@@ -831,19 +831,21 @@ public:
         cc_image_free(&img);
     }
 
-    // --- pose-plane blit with alpha (rule R14(i); Plan 2 Task 7) ---------
+    // --- pose-plane blit with alpha (rule R14(i); Plan 2 Task 7, refined in
+    //     the Task 13 follow-on) -------------------------------------------
     // Draws one avatar pose plane (image DIB `image`, optional separate mask
-    // DIB `mask`) as a SINGLE alpha-composited draw_image -- the RGBA collapse
-    // of the original CBody draw's MERGEPAINT-mask + SRCAND-drawing ROP pair
-    // (bodycam.cpp DrawBody). The mask supplies the alpha channel exactly as
-    // the pose-image golden path does (bridge_decode_dib_pair_to_rgba reuses
-    // the same decodeDibToRgba the golden test regression-locks). `mask` may
-    // be NULL for a self-opaque plane (a mask-less pose). NOT used for the
-    // aura plane -- see DrawAuraImage below, which has different (MERGEPAINT-
-    // alone) polarity. The dest rect is logical coordinates (window origin
-    // applies), like every other GDI call; the src rect is the full decoded
-    // image. Defined out of line in mfc_compat.cpp (needs the full CDIB
-    // definition -- dib.h).
+    // DIB `mask`) as a SINGLE alpha-composited draw_image. With a non-NULL
+    // `mask`, it is the RGBA collapse of the original CBody draw's MERGEPAINT-
+    // mask + SRCAND-drawing ROP pair (bodycam.cpp DrawBody); the mask supplies
+    // the alpha exactly as the pose-image golden path does. When `mask` is
+    // NULL, the original blitted the drawing plane SRCAND-ALONE -- WHITE source
+    // pixels transparent, non-white opaque (NOT self-opaque; see
+    // bridge_decode_dib_pair_to_rgba's derivation). NOT used for the aura plane
+    // -- see DrawAuraImage below, which has different (MERGEPAINT-alone)
+    // polarity. The dest rect is logical coordinates (window origin applies),
+    // like every other GDI call; the src rect is the full decoded image.
+    // Defined out of line in mfc_compat.cpp (needs the full CDIB definition --
+    // dib.h).
     void DrawPoseImage(CDIB* image, CDIB* mask,
                        int destX, int destY, int destW, int destH);
 

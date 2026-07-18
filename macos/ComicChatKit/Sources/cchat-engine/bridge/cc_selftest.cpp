@@ -1467,6 +1467,101 @@ static int cc_selftest_bodydraw(const char* avatarPath) {
         free(bmi);
     }
 
+    // --- (d) R14(i) refinement: maskless pose blits emulate SRCAND-alone
+    //     white-transparency. The original's CBody DrawBody blits the drawing
+    //     plane SRCAND-ALONE whenever the mask guard ((flags & *MASK) &&
+    //     GetMask()) is false (bodycam.cpp: the mask MERGEPAINT is guarded, the
+    //     drawing SRCAND is unconditional). SRCAND's algebra (dest = src AND
+    //     dest) makes WHITE source pixels transparent (0xFF AND dest = dest)
+    //     and BLACK source pixels replace dest. bridge_decode_dib_pair_to_rgba
+    //     with maskBmi==NULL (the DrawPoseImage maskless path) must reproduce
+    //     that: white -> alpha 0, non-white -> alpha 255, RGB unchanged. (The
+    //     golden pose-export path decodeDibToRgba(drawing, mask) is a SEPARATE
+    //     entry point and stays fully opaque when maskless -- unchanged.)
+    //     Synthetic 2x1 1bpp image DIB: one white pixel, one black pixel.
+    {
+        size_t infoSize = sizeof(BITMAPINFOHEADER) + 2 * sizeof(RGBQUAD);
+        BITMAPINFO* bmi = (BITMAPINFO*)calloc(1, infoSize);
+        bmi->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi->bmiHeader.biWidth = 2;
+        bmi->bmiHeader.biHeight = 1;
+        bmi->bmiHeader.biPlanes = 1;
+        bmi->bmiHeader.biBitCount = 1;
+        bmi->bmiHeader.biCompression = BI_RGB;
+        bmi->bmiHeader.biClrUsed = 2;
+        // MonochromePalette convention (avbfile.cpp:15): index0 = white,
+        // index1 = black. This one IS consulted -- the pair decode reads the
+        // color table for RGB, then the SRCAND rule sets alpha from whiteness.
+        RGBQUAD* clr = (RGBQUAD*)((BYTE*)bmi + sizeof(BITMAPINFOHEADER));
+        clr[0].rgbRed = clr[0].rgbGreen = clr[0].rgbBlue = 255; // white
+        clr[1].rgbRed = clr[1].rgbGreen = clr[1].rgbBlue = 0;   // black
+
+        UINT storageWidth = DIBStorageWidth(2, 1);
+        BYTE* bits = (BYTE*)calloc(1, storageWidth);
+        // MSB-first: pixel 0 (leftmost) = bit 7; pixel 1 = bit 6. Want pixel 0
+        // WHITE (index 0 -> bit 0) and pixel 1 BLACK (index 1 -> bit 1): so the
+        // byte is 0b01000000 = 0x40.
+        bits[0] = 0x40;
+
+        int32_t w = 0, h = 0;
+        uint8_t* rgba = nullptr;
+        // maskBmi/maskBits NULL -> the maskless DrawPoseImage path.
+        bool ok = bridge_decode_dib_pair_to_rgba(bmi, bits, nullptr, nullptr,
+                                                 &w, &h, &rgba);
+        CC_CHECK(ok == TRUE);
+        CC_CHECK(w == 2 && h == 1);
+        if (ok && rgba != nullptr) {
+            // Pixel 0: white source -> transparent (SRCAND: white passes dest
+            // through). RGB stays white.
+            CC_CHECK(rgba[0] == 255 && rgba[1] == 255 && rgba[2] == 255);
+            CC_CHECK(rgba[3] == 0);
+            // Pixel 1: black source -> opaque (SRCAND: src replaces dest).
+            CC_CHECK(rgba[4] == 0 && rgba[5] == 0 && rgba[6] == 0);
+            CC_CHECK(rgba[7] == 255);
+            free(rgba);
+        }
+        free(bits);
+        free(bmi);
+    }
+
+    // --- (e) R14(i) refinement, call-shape lock: DrawPoseImage(image, NULL,...)
+    //     still emits exactly one image blit at the requested dest rect (the
+    //     maskless SRCAND fix is decode-internal; the CDC call shape and blit
+    //     geometry are unchanged). Uses the same synthetic maskless DIB, driven
+    //     through a real CDC over the recording canvas.
+    {
+        size_t infoSize = sizeof(BITMAPINFOHEADER) + 2 * sizeof(RGBQUAD);
+        BITMAPINFO* bmi = (BITMAPINFO*)calloc(1, infoSize);
+        bmi->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi->bmiHeader.biWidth = 2;
+        bmi->bmiHeader.biHeight = 1;
+        bmi->bmiHeader.biPlanes = 1;
+        bmi->bmiHeader.biBitCount = 1;
+        bmi->bmiHeader.biCompression = BI_RGB;
+        bmi->bmiHeader.biClrUsed = 2;
+        RGBQUAD* clr = (RGBQUAD*)((BYTE*)bmi + sizeof(BITMAPINFOHEADER));
+        clr[0].rgbRed = clr[0].rgbGreen = clr[0].rgbBlue = 255;
+        clr[1].rgbRed = clr[1].rgbGreen = clr[1].rgbBlue = 0;
+        UINT storageWidth = DIBStorageWidth(2, 1);
+        BYTE* bits = (BYTE*)calloc(1, storageWidth);
+        bits[0] = 0x40;
+
+        CDIB image;
+        CC_CHECK(image.Create(bmi, bits));
+
+        CCRecordingCanvas rec;
+        CDC dc(rec.handle());
+        dc.DrawPoseImage(&image, NULL, 0, 0, 200, -100);
+
+        const std::vector<std::string>& log = rec.log();
+        CC_CHECK(log.size() == 1);
+        if (log.size() == 1) {
+            CC_CHECK(log[0].rfind("image 0,0,200,-100 ", 0) == 0);
+        }
+        free(bits);
+        free(bmi);
+    }
+
     delete body;
     DestroyAvatars();  // deletes av (which owns pStream + poses/DIBs)
     return g_failures - startFailures;

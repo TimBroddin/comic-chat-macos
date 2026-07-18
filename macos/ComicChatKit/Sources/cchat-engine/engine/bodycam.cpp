@@ -559,7 +559,11 @@ void CBodyDouble::FlipBodyBox(RECT &fullRect, RECT &headRect, RECT &torsoRect) {
 // blitted once with the mask supplying alpha (the RGBA decode honors the exact
 // mask polarity -- white=transparent, black=opaque -- proven by the pose-image
 // golden test). The mask is passed only when the original's guard
-// ((flags & *MASK) && GetMask()) held; otherwise NULL (fully opaque). Auras
+// ((flags & *MASK) && GetMask()) held; otherwise NULL. The maskless case is
+// NOT fully opaque: the original blitted the drawing SRCAND-alone (the mask
+// MERGEPAINT was guarded, the drawing SRCAND unconditional), so white source
+// pixels are transparent -- see bridge_decode_dib_pair_to_rgba (bridge_art.cpp),
+// Task 13 follow-on R14(i) refinement. Auras
 // (drawn MERGEPAINT-alone, R14(v) fixed per the Task 7 review) collapse to a
 // single DrawAuraImage of the aura plane: RGB forced white, alpha set from
 // the aura bit (opaque where black/silhouette, transparent where
@@ -673,7 +677,9 @@ RECT CBodySingle::DrawBody(CDC *dc, RECT &clientRect, BOOL drawNimbus) {
 					   fullRect.left, fullRect.top,
 					   fullRect.right - fullRect.left, fullRect.bottom - fullRect.top);
 	// (drawing) SRCAND-alone -> one DrawPoseImage(drawing, mask). The single
-	// pose's mask supplies alpha (mask-less poses decode fully opaque).
+	// pose's mask supplies alpha; mask-less poses reproduce SRCAND-alone
+	// (white source transparent, non-white opaque) -- Task 13 follow-on
+	// R14(i) refinement, see bridge_decode_dib_pair_to_rgba (bridge_art.cpp).
 	if (pose->GetDrawing ())
 		dc->DrawPoseImage(pose->GetDrawing (), pose->GetMask (),
 					   fullRect.left, fullRect.top,

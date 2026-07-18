@@ -219,18 +219,57 @@ bool bridge_decode_dib_to_rgba(BITMAPINFO* bmi, void* bits,
     return decodeDibToRgba(&dib, nullptr, outWidth, outHeight, outRgba);
 }
 
-// Plan 2 Task 7 (R14(i)): the CBody draw path (bodycam.cpp DrawBody) composites
-// a pose plane's image DIB with its separate mask DIB in a single alpha-aware
-// blit -- the RGBA collapse of the original's MERGEPAINT-mask + SRCAND-drawing
-// ROP pair (see the transparency-rule block at the top of this file for the
-// per-mask-bit ROP algebra; mask bit 1 => opaque, mask bit 0 => transparent).
-// This is the SAME decode the pose-image golden path (cc_avatar_pose_image)
-// already uses -- decodeDibToRgba(drawing, mask) -- exposed here for CDIB*
-// callers (the CDC adapter's DrawPoseImage). `maskBmi`/`maskBits` may be NULL
-// (fully-opaque plane: no separate mask, e.g. the aura decoded as its own
-// self-opaque sprite, or a mask-less pose plane). Builds transient CDIBs over
-// the caller's memory (CDIB::Create copies the header, borrows the bits) and
-// reuses decodeDibToRgba(). Returns false (outputs untouched) on failure.
+// Plan 2 Task 7 (R14(i)) + Task 13 follow-on review fix (R14(i) refinement):
+// the CBody draw path (bodycam.cpp DrawBody) blits a pose plane. It has TWO
+// per-plane cases, and this one entry point (the CDC adapter's DrawPoseImage
+// sole caller) must reproduce BOTH -- selected by whether maskBmi/maskBits is
+// non-NULL:
+//
+//   MASKED (maskBmi != NULL): the original ran a MERGEPAINT-mask + SRCAND-
+//   drawing ROP PAIR (the mask guard `(flags & *MASK) && GetMask()` held).
+//   This collapses to decodeDibToRgba(drawing, mask): mask bit 1 => opaque,
+//   mask bit 0 => transparent (see the transparency-rule block at the top of
+//   this file). This is the SAME decode the pose-image golden path
+//   (cc_avatar_pose_image) uses; it is golden-locked and MUST NOT change.
+//
+//   MASKLESS (maskBmi == NULL): the original's mask MERGEPAINT was GUARDED and
+//   skipped, but the drawing SRCAND was UNCONDITIONAL (bodycam.cpp DrawBody:
+//   the `drawing->Draw(..., SRCAND)` calls run regardless of the mask guard) --
+//   so the drawing plane blitted SRCAND-ALONE: dest = drawing AND dest. Per
+//   GDI ROP algebra on this dataset's monochrome pose art (palette index0 =
+//   white RGB(255,255,255), index1 = black RGB(0,0,0)):
+//     white src (0xFF): dest = 0xFF AND dest = dest -> background PASSES
+//                       THROUGH -> TRANSPARENT (alpha 0).
+//     black src (0x00): dest = 0x00 AND dest = 0x00 -> src REPLACES dest ->
+//                       OPAQUE (alpha 255).
+//   The Task 7 R14(i) collapse mapped this maskless case to decodeDibToRgba
+//   (drawing, NULL), which decodes fully OPAQUE (alpha 255 everywhere) -- that
+//   painted the pose's white background as a solid box over the backdrop
+//   (visible as white rectangles behind zoomed characters; the torso pose of a
+//   TORSOFIRST CBodyDouble like anna/armando is maskless, so every panel showed
+//   it). THIS is the review-cycle correction: reproduce SRCAND-alone directly
+//   -- binary alpha keyed on source whiteness, RGB unchanged.
+//
+//   FIDELITY NOTE: SRCAND's exact algebra is per-channel (dest = src AND dest),
+//   which for a pure black/white 1bpp pose is EXACTLY "white transparent, black
+//   opaque" -- so binary alpha is exact for that (the common maskless case, e.g.
+//   anna/armando's monochrome torso). But some avatars ship full-color/greyscale
+//   maskless pose art (bolo, buck, cro, kirby, tux, xeno...), where the original
+//   SRCAND would darken the backdrop per channel rather than paint the src fully
+//   opaque; for those intermediate pixels binary alpha (fully opaque src) is an
+//   APPROXIMATION. It is still far closer than the pre-fix fully-opaque-plus-
+//   white-box behavior, and it is the semantics this review cycle authorized.
+//   Each decode that hits an intermediate pixel logs ONE summary line (ccLog,
+//   gated by CC_LOG_LEVEL) so the approximation is observable without flooding.
+//
+//   The golden pose-export path (cc_avatar_pose_image -> decodeDibToRgba
+//   directly) is a SEPARATE entry point that does NOT go through here, so this
+//   maskless SRCAND semantics is confined to the on-screen DrawPoseImage draw
+//   and leaves every pose-image/backdrop golden fingerprint untouched.
+//
+// Builds transient CDIBs over the caller's memory (CDIB::Create copies the
+// header, borrows the bits) and reuses decodeDibToRgba(). Returns false
+// (outputs untouched) on failure.
 bool bridge_decode_dib_pair_to_rgba(BITMAPINFO* imgBmi, void* imgBits,
                                      BITMAPINFO* maskBmi, void* maskBits,
                                      int32_t* outWidth, int32_t* outHeight,
@@ -238,13 +277,44 @@ bool bridge_decode_dib_pair_to_rgba(BITMAPINFO* imgBmi, void* imgBits,
     if (imgBmi == nullptr || imgBits == nullptr) return false;
     CDIB image;
     if (!image.Create(imgBmi, (BYTE*)imgBits)) return false;
-    CDIB mask;
-    CDIB* pMask = nullptr;
+
     if (maskBmi != nullptr && maskBits != nullptr) {
+        // MASKED: golden-locked mask/drawing pair decode (unchanged).
+        CDIB mask;
         if (!mask.Create(maskBmi, (BYTE*)maskBits)) return false;
-        pMask = &mask;
+        return decodeDibToRgba(&image, &mask, outWidth, outHeight, outRgba);
     }
-    return decodeDibToRgba(&image, pMask, outWidth, outHeight, outRgba);
+
+    // MASKLESS: decode fully opaque first (RGB is correct; alpha all 255),
+    // then apply SRCAND-alone white-transparency as a straight-alpha rewrite.
+    int32_t w = 0, h = 0;
+    uint8_t* rgba = nullptr;
+    if (!decodeDibToRgba(&image, nullptr, &w, &h, &rgba)) return false;
+
+    size_t pixelCount = (size_t)w * (size_t)h;
+    size_t approxCount = 0;   // intermediate (non-black-non-white) pixels
+    for (size_t i = 0; i < pixelCount; i++) {
+        uint8_t* px = rgba + i * 4;
+        bool isWhite = (px[0] == 255 && px[1] == 255 && px[2] == 255);
+        bool isBlack = (px[0] == 0 && px[1] == 0 && px[2] == 0);
+        // SRCAND-alone: white source is transparent, everything else opaque.
+        px[3] = isWhite ? 0 : 255;
+        if (!isWhite && !isBlack) approxCount++;
+    }
+    if (approxCount > 0) {
+        // Binary alpha is exact for pure black/white line art; intermediate
+        // (color/grey) maskless pose pixels are the documented approximation.
+        // ONE summary line per decode (gated by CC_LOG_LEVEL) keeps it
+        // observable without flooding at per-pixel scale.
+        ccLog("maskless pose SRCAND: %zu of %zu pixels non-black-non-white "
+              "(binary-alpha approximation of per-channel SRCAND)",
+              approxCount, pixelCount);
+    }
+
+    *outWidth = w;
+    *outHeight = h;
+    *outRgba = rgba;
+    return true;
 }
 
 // Plan 2 Task 7 review fix (R14(v)): the aura (whisper-nimbus) plane is drawn

@@ -85,13 +85,16 @@ void ccLogError(const char* fmt, ...) {
     va_end(ap);
 }
 
-// R14(i) (Plan 2 Task 7): CDC::DrawPoseImage -- the CBody draw path's
-// MERGEPAINT-mask + SRCAND-drawing ROP pair collapsed into ONE alpha-composited
-// draw_image. Defined here (not inline in the header) because it needs the full
-// CDIB definition (GetBitmapInfoAddress/GetBitsAddress) and bridge_art.h, which
-// mfc_compat.h keeps pointer-opaque. Reuses bridge_decode_dib_pair_to_rgba (the
-// same decodeDibToRgba the pose-image golden path regression-locks) so mask
-// polarity has one source of truth.
+// R14(i) (Plan 2 Task 7) + Task 13 follow-on (R14(i) refinement): CDC::
+// DrawPoseImage -- the CBody draw path's pose-plane blit collapsed into ONE
+// alpha-composited draw_image. When `mask` is non-NULL, the original's
+// MERGEPAINT-mask + SRCAND-drawing ROP pair (mask supplies alpha). When `mask`
+// is NULL, the original blitted the drawing plane SRCAND-ALONE (white source =
+// transparent, non-white = opaque) -- NOT fully opaque; bridge_decode_dib_pair_
+// to_rgba reproduces both cases (see its derivation). Defined here (not inline
+// in the header) because it needs the full CDIB definition (GetBitmapInfo
+// Address/GetBitsAddress) and bridge_art.h, which mfc_compat.h keeps pointer-
+// opaque.
 void CDC::DrawPoseImage(CDIB* image, CDIB* mask,
                         int destX, int destY, int destW, int destH) {
     if (image == nullptr) return;

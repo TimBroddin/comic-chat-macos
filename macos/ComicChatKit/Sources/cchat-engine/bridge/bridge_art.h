@@ -17,11 +17,19 @@ bool bridge_decode_dib_to_rgba(BITMAPINFO* bmi, void* bits,
                                 int32_t* outWidth, int32_t* outHeight,
                                 uint8_t** outRgba);
 
-// Plan 2 Task 7 (R14(i)): decode an image DIB + separate mask DIB into one
-// straight-alpha RGBA8 buffer (mask supplies the alpha, exactly as the
-// pose-image golden path does). maskBmi/maskBits may be NULL for a fully-opaque
-// plane. On success *outRgba is malloc'd; release it via cc_image_free.
-// The CDC adapter's DrawPoseImage (mfc_compat.cpp) is the sole caller.
+// Plan 2 Task 7 (R14(i)) + Task 13 follow-on (R14(i) refinement): decode a pose
+// plane for the CBody draw path's DrawPoseImage (mfc_compat.cpp), its sole
+// caller. Two cases, selected by maskBmi/maskBits:
+//   - non-NULL mask: mask supplies the alpha (mask/drawing pair decode, the
+//     SAME golden-locked semantics the pose-image path uses; mask bit 1 =>
+//     opaque, mask bit 0 => transparent).
+//   - NULL mask: the maskless plane blitted SRCAND-ALONE in the original
+//     (unconditional drawing SRCAND, guarded mask MERGEPAINT skipped) -- so
+//     WHITE source pixels are transparent (alpha 0) and everything else opaque
+//     (alpha 255), RGB unchanged. NOT fully opaque -- see the full derivation
+//     in bridge_art.cpp. This confines SRCAND semantics to the on-screen draw;
+//     the golden pose-export path (decodeDibToRgba directly) is untouched.
+// On success *outRgba is malloc'd; release it via cc_image_free.
 bool bridge_decode_dib_pair_to_rgba(BITMAPINFO* imgBmi, void* imgBits,
                                      BITMAPINFO* maskBmi, void* maskBits,
                                      int32_t* outWidth, int32_t* outHeight,
