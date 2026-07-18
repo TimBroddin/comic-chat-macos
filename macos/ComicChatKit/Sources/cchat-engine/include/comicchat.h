@@ -315,6 +315,73 @@ typedef struct cc_annotations {
     int32_t cooked;                                             /* both intensities present */
 } cc_annotations;
 
+/* ---- Outbound command builders (Plan 3 Task 4) -----------------------------
+ * Thin wrappers over ircproto.cpp's CIrcProto builders (engine/ircproto.{h,cpp}).
+ * Every one of these ultimately calls CIrcProto::SendMessageText, which
+ * reaches cfg.send -- the single outbound choke point (see ircproto.cpp's
+ * file header). All return 0 on success, non-zero on failure (mirrors the
+ * lifted BOOL builders: FALSE -> non-zero here).
+ *
+ * room_token identifies a joined room: 0 (CC_ROOM_TOKEN_NONE) is never a
+ * valid room. cc_session_register_room assigns a fresh token for a channel
+ * name (Swift calls this on join-confirm once Task 7 wires the real inbound
+ * flow; this task's own selftests call it directly to seed the mapping).
+ * See bridge/cc_session.h's header comment for the full token<->channel
+ * scheme and its documented single-CIrcProto-per-session simplification. */
+#define CC_ROOM_TOKEN_NONE 0u
+
+/* Register (or re-register) a channel name and return its room_token. Token
+ * assignment is dense and stable for the session's lifetime (see
+ * cc_session.h). channel must be the WIRE-encoded channel name (e.g.
+ * "#comicrig") -- callers that have a pretty/decoded name must EncodeChan it
+ * first (not this function's job; it does no codec work itself). */
+uint32_t cc_session_register_room(cc_session* s, const char* channel);
+/* Look up a room_token's channel name; "" if token is unknown/out of range. */
+const char* cc_session_room_channel(cc_session* s, uint32_t room_token);
+
+int32_t cc_session_join(cc_session* s, const char* channel, const char* key /*nullable*/);
+int32_t cc_session_part(cc_session* s, uint32_t room_token, const char* reason /*nullable*/);
+int32_t cc_session_create_room(cc_session* s, const char* channel, const char* creation_modes /*nullable*/, uint32_t max_users, const char* key /*nullable*/);
+int32_t cc_session_change_nick(cc_session* s, const char* new_nick);
+int32_t cc_session_set_topic(cc_session* s, uint32_t room_token, const char* topic);
+int32_t cc_session_kick(cc_session* s, uint32_t room_token, const char* nickname, const char* reason /*nullable*/);
+int32_t cc_session_invite(cc_session* s, uint32_t room_token, const char* nickname);
+int32_t cc_session_ban(cc_session* s, uint32_t room_token, const char* ban_pattern, int32_t ban /*1=ban,0=unban*/);
+int32_t cc_session_set_mode(cc_session* s, uint32_t room_token, uint32_t new_mode, uint32_t new_max_users, const char* new_password /*nullable*/);
+int32_t cc_session_away(cc_session* s, int32_t is_away, const char* message /*nullable*/);
+
+/* send_say: builds the annotation block from `ann` (see the deviation note in
+ * cc_session.cpp -- encodes `ann`'s already-decoded fields directly per the
+ * "#G...E...M...[T...]" grammar, rather than reconstructing fake CAvatarX/
+ * CUserInfo objects to feed the lifted bInsertAnnotations) and sends it via
+ * CIrcProto::bChatSendToChannel. `ann` may be NULL (no annotation block, bare
+ * text). `modes` is a bitwise CC_MODE_x / BM_x value (SAY/WHISPER/THINK/etc). */
+int32_t cc_session_send_say(cc_session* s, uint32_t room_token, const cc_annotations* ann, const char* text, uint16_t modes);
+/* send_whisper: same annotation handling as send_say, sent to each of
+ * `nicks` via CIrcProto::bChatSendPrivMesg (one wire send per nick, matching
+ * the original's per-addressee bChatSendPrivMesg loop -- see cc_session.cpp). */
+int32_t cc_session_send_whisper(cc_session* s, uint32_t room_token, const cc_annotations* ann, const char* text, const char* const* nicks, int32_t nick_count);
+
+int32_t cc_session_who(cc_session* s, const char* mask /*nullable*/);
+int32_t cc_session_list(cc_session* s, const char* query /*nullable, "LIST"/"LISTX" + optional channel filter*/);
+
+/* Sends the "MODE ISIRCX" probe (bExecuteQuery's ctModeIsIrcX case) and
+ * requests the one-shot 50s timeout timer (CC_TIMER_ISIRCX_PROBE) via
+ * cfg.set_timer -- the engine REQUESTS, Swift SCHEDULES (R21-adjacent; the
+ * engine never runs its own timers). In the original this probe is sent from
+ * CIrcSocket::OnConnect (ircsock.cpp:1050-1052, connection-establishment
+ * flow, not lifted this task) which arms the timer itself via
+ * ::AfxGetMainWnd()->SetTimer; this wrapper is the Task-4-scope equivalent so
+ * the timer-request wiring exists and is tested NOW, ahead of Task 5b/7
+ * wiring the real OnConnect call site (which will call this same C function,
+ * or fold its two lines directly into the connection-established handler --
+ * either is equivalent since bExecuteQuery+set_timer here has no other
+ * side effect). Cancel the timer via cfg.cancel_timer(CC_TIMER_ISIRCX_PROBE)
+ * on whichever of {IRCX capability reply, ERR_NOTREGISTERED, timer fires}
+ * happens first (HrModeIsIrcXFailure's original disambiguation, ircsock.cpp:
+ * 560 -- Task 5b's job once the reply handlers exist). */
+int32_t cc_session_probe_ircx(cc_session* s);
+
 #ifdef __cplusplus
 }
 #endif

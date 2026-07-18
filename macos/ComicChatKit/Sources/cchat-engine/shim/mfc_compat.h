@@ -329,6 +329,173 @@ inline void CharUpperBuff(char* s, int len) {
     }
 }
 
+// R9 (Plan 3 Task 4): CharUpper -- ccomp.cpp's bIsMaskCompare (the WHO-filter
+// mask/nickname comparator lifted for query.cpp's PRUSERMATCH support) calls
+// Win32's single-character CharUpper(LPTSTR) idiom: the character is packed
+// into the pointer's low byte via MAKELONG(ch, 0) (a real, if odd, Win32
+// convention for the "one-character-in, one-character-out" overload), and
+// CharUpper returns the same packing with the byte case-folded. Same CP-1252/
+// ASCII-only posture as CharUpperBuff above (documented there): only 0x00-0x7F
+// is folded, matching real CharUpperA for this port's plain-ASCII selftest
+// input domain; bytes >= 0x80 pass through unchanged (same flagged gap).
+inline LPTSTR CharUpper(LPTSTR lpsz) {
+    uintptr_t packed = (uintptr_t)lpsz;
+    if (packed <= 0xFFFFu) {
+        unsigned char c = (unsigned char)(packed & 0xFF);
+        if (c <= 0x7F) c = (unsigned char)toupper(c);
+        return (LPTSTR)(uintptr_t)c;
+    }
+    // Real multi-char-string overload (Win32 also allows CharUpper(LPTSTR) to
+    // uppercase a NUL-terminated buffer in place when the pointer is a real
+    // string, not a packed character) -- ccomp.cpp only ever uses the packed-
+    // character form, but keeping this arm makes the shim total rather than
+    // silently wrong if a future caller passes a real string pointer.
+    for (char* p = lpsz; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c <= 0x7F) *p = (char)toupper(c);
+    }
+    return lpsz;
+}
+
+// --- Win32 codepage-conversion NLS surface (rule R9; Plan 3 Task 4;
+//     ircproto.cpp's EncodeNick/DecodeNick/EncodeChan/DecodeChan/DecodeString/
+//     EncodeString -- the FIRST lifted functions in this port to call the raw
+//     Win32 MultiByteToWideChar/WideCharToMultiByte pair directly; Task 2's
+//     ccommon_str.cpp lift works entirely on wide-char buffers the CALLER
+//     already produced via these APIs, so this shim didn't exist yet). This
+//     port's permanent posture (Task 2) is single-byte CP-1252 (GetACP()'s
+//     one and only return value here); the wide encoding side is WCHAR ==
+//     uint16_t == UTF-16 code units (never surrogate pairs, since CP-1252 has
+//     no codepoint above U+FFFF -- see WCHAR's own typedef comment above).
+//     MB_PRECOMPOSED is a real Win32 flag (composed rather than decomposed
+//     Unicode forms) with no distinct effect on a single-byte->UTF-16
+//     expansion of a codepage with no combining sequences, so it's a no-op
+//     flag value here, kept only so call sites compile unchanged.
+#define CP_ACP 0
+#define MB_PRECOMPOSED 0x00000001
+inline UINT GetACP() { return CP_ACP; }
+
+// CP-1252's C1-control-block remap (0x80-0x9F): the only rows where CP-1252
+// diverges from plain Latin-1/ISO-8859-1. Values from the Unicode
+// Consortium's published CP-1252 mapping table (the same authoritative
+// source real Win32's kernel32 codepage tables encode). 0x81/0x8D/0x8F/0x90/
+// 0x9D have no assigned character in real CP-1252 -- Win32's own
+// MultiByteToWideChar maps these five to U+0081/U+008D/U+008F/U+0090/U+009D
+// (i.e. passes them through as C1 control codes, matching ISO-8859-1) rather
+// than failing the call; reproduced exactly (verified against the published
+// table, not guessed -- unlike mfc_compat.h's CharUpperBuff gap above, this
+// table IS complete and authoritative for the full byte range).
+inline WCHAR cc_cp1252_to_unicode(unsigned char b) {
+    static const WCHAR tbl[32] = {
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+        0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+        0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+        0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+    };
+    if (b >= 0x80 && b <= 0x9F) return tbl[b - 0x80];
+    return (WCHAR)b;  // 0x00-0x7F and 0xA0-0xFF: identical to Unicode code point
+}
+// Inverse of the table above (Unicode code point -> CP-1252 byte). Returns
+// '?' (0x3F, real Win32's WideCharToMultiByte default "unmappable" fallback
+// char with no lpUsedDefaultChar wired) for a code point this codepage
+// cannot represent at all (never reached by this port's own CP-1252 round
+// trips, since every wide string passed in came FROM cc_cp1252_to_unicode
+// above -- only relevant if fed non-CP-1252-origin UTF-16, e.g. UTF-8-decoded
+// wide text, which the codec functions this shim serves already handle on
+// their own path independent of these two conversion functions).
+inline unsigned char cc_unicode_to_cp1252(WCHAR w) {
+    if (w <= 0x7F) return (unsigned char)w;
+    if (w >= 0xA0 && w <= 0xFF) return (unsigned char)w;
+    static const struct { WCHAR u; unsigned char b; } rev[] = {
+        {0x20AC,0x80},{0x0081,0x81},{0x201A,0x82},{0x0192,0x83},{0x201E,0x84},
+        {0x2026,0x85},{0x2020,0x86},{0x2021,0x87},{0x02C6,0x88},{0x2030,0x89},
+        {0x0160,0x8A},{0x2039,0x8B},{0x0152,0x8C},{0x008D,0x8D},{0x017D,0x8E},
+        {0x008F,0x8F},{0x0090,0x90},{0x2018,0x91},{0x2019,0x92},{0x201C,0x93},
+        {0x201D,0x94},{0x2022,0x95},{0x2013,0x96},{0x2014,0x97},{0x02DC,0x98},
+        {0x2122,0x99},{0x0161,0x9A},{0x203A,0x9B},{0x0153,0x9C},{0x009D,0x9D},
+        {0x017E,0x9E},{0x0178,0x9F},
+    };
+    for (auto &e : rev) if (e.u == w) return e.b;
+    return (unsigned char)'?';
+}
+
+// MultiByteToWideChar(CP-1252 -> UTF-16): cchWideChar == -1 means szInStr is
+// NUL-terminated and the returned count includes the terminating NUL (Win32's
+// documented convention); a non-negative cchWideChar instead means "convert
+// exactly this many source bytes" and the return value is the number of wide
+// chars written (no implied NUL). dwFlags (MB_PRECOMPOSED) is accepted but
+// ignored (see header note above).
+inline int MultiByteToWideChar(UINT /*codepage*/, DWORD /*dwFlags*/,
+                                LPCSTR szInStr, int cchIn,
+                                LPWSTR wszOut, int cchWideCharBufSize) {
+    if (!szInStr) return 0;
+    int srcLen = (cchIn == -1) ? (int)strlen(szInStr) + 1 : cchIn;
+    if (cchWideCharBufSize == 0) return srcLen;  // size-query mode
+    int n = (srcLen < cchWideCharBufSize) ? srcLen : cchWideCharBufSize;
+    for (int i = 0; i < n; i++)
+        wszOut[i] = cc_cp1252_to_unicode((unsigned char)szInStr[i]);
+    return n;
+}
+
+// WideCharToMultiByte(UTF-16 -> CP-1252 or US_CODEPAGE, both single-byte on
+// this port -- see DecodeChan's `codepage` local, ircproto.cpp): cchWideChar
+// == -1 means wszInStr is NUL-terminated (returned count includes the NUL).
+// lpDefaultChar/lpUsedDefaultChar are never used by any lifted caller (all
+// pass NULL) so they're accepted but ignored, matching Win32's own optional-
+// parameter contract.
+inline int WideCharToMultiByte(UINT /*codepage*/, DWORD /*dwFlags*/,
+                                LPCWSTR wszInStr, int cchIn,
+                                LPSTR szOut, int cbMultiByteBufSize,
+                                LPCSTR /*lpDefaultChar*/, BOOL* /*lpUsedDefaultChar*/) {
+    if (!wszInStr) return 0;
+    int srcLen = 0;
+    if (cchIn == -1) { while (wszInStr[srcLen]) srcLen++; srcLen++; }
+    else srcLen = cchIn;
+    if (cbMultiByteBufSize == 0) return srcLen;  // size-query mode
+    int n = (srcLen < cbMultiByteBufSize) ? srcLen : cbMultiByteBufSize;
+    for (int i = 0; i < n; i++)
+        szOut[i] = (char)cc_unicode_to_cp1252(wszInStr[i]);
+    return n;
+}
+
+// --- GetStringTypeEx / character classification (rule R9; Plan 3 Task 4;
+//     ircproto.cpp's DecodeNickForScreen -- scans a decoded nickname for any
+//     control/blank character to decide whether to wrap it in quotes for
+//     display). CT_CTYPE1 is the only ctype real Win32 callers here ever
+//     request; C1_CNTRL/C1_BLANK are the only two bits DecodeNickForScreen
+//     tests. GetUserDefaultLCID's actual locale value is never inspected by
+//     that call site (only threaded through opaquely), so a fixed sentinel
+//     is exact.
+#define CT_CTYPE1 1
+#define C1_CNTRL  0x0002
+#define C1_BLANK  0x0004
+typedef DWORD LCID;
+inline LCID GetUserDefaultLCID() { return 0x0409; /* en-US, arbitrary sentinel */ }
+inline BOOL GetStringTypeEx(LCID /*lcid*/, DWORD dwInfoType, LPCSTR sz, int cch, WORD* out) {
+    if (dwInfoType != CT_CTYPE1) { ASSERT(0); return FALSE; }
+    for (int i = 0; i < cch; i++) {
+        unsigned char c = (unsigned char)sz[i];
+        WORD w = 0;
+        if (c < 0x20 || c == 0x7F) w |= C1_CNTRL;
+        if (c == ' ' || c == '\t') w |= C1_BLANK;
+        out[i] = w;
+    }
+    return TRUE;
+}
+
+// --- wsprintf (rule R9; ircproto.cpp's DecodeNickForScreen quoting) --------
+// Win32's wsprintfA is a constrained sprintf (1024-byte output cap, no
+// floating-point specifiers) -- DecodeNickForScreen's only use
+// (`wsprintf(szBufOut, "\"%s\"", pszDecodedNick)`) is a plain %s substitution
+// well within any real implementation's limits, so a direct vsnprintf-backed
+// forward is behavior-identical for every reachable call site.
+inline int wsprintf(char* out, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(out, 1024, fmt, ap);  // 1024: real wsprintfA's own output cap
+    va_end(ap);
+    return n;
+}
+
 // --- MFC exception-handling macros (rule R9; used by lifted avbfile.cpp /
 //     avatario.cpp around `new` calls that could throw). MFC's TRY/CATCH_ALL
 //     wrap try/catch(CException*); we have no CException hierarchy, so these
@@ -1374,6 +1541,17 @@ public:
     POSITION FindIndex(int nIndex) const {
         if (nIndex < 0 || (size_t)nIndex >= m_v.size()) return nullptr;
         return (POSITION)(uintptr_t)(nIndex + 1);
+    }
+
+    // R9 (Plan 3 Task 4): RemoveAt(POSITION) -- query.cpp's
+    // CQueryPtrList::FreeRemoveAt deletes then removes one query cell found
+    // earlier by FindQuery's returned POSITION (the reply-handler correlation
+    // path, Task 5b). Distinct from CPtrArray's int-indexed RemoveAt (already
+    // present on that class below) -- MFC overloads the name per-container;
+    // this is the CPtrList (POSITION-cursor) member.
+    void RemoveAt(POSITION pos) {
+        size_t idx = (size_t)(uintptr_t)pos - 1;
+        m_v.erase(m_v.begin() + (ptrdiff_t)idx);
     }
 
 private:

@@ -40,4 +40,13 @@ extern LPCTSTR SzNextUTF8Char(LPCTSTR szInStr);
 extern BOOL    bLowLevelQuoting(TCHAR chQuotingChar, BOOL bTreatAsByteArray, LPCTSTR szSrc, LPTSTR *pszDst, BOOL *pbFree, BOOL bRemoveCarriageReturns = FALSE);
 extern BOOL    bLowLevelUnquoting(TCHAR chQuotingChar, BOOL bTreatAsByteArray, LPCTSTR szSrc, LPTSTR szDst);
 
+// --- Plan 3 Task 4 addition: bExtendedNickname (ccommon.cpp:109) ------------
+// Needed by ircproto.cpp's ChatChangeNick/ChatBanUser/StrEncodeCommandParam
+// (IsIRCX() && bExtendedNickname(...) gates whether a nickname needs the
+// UTF-8 EncodeNick() treatment before going on the wire). Pure single-byte
+// character-class scan, zero dependency beyond g_chEOS (already in
+// mfc_compat.h) -- same tier as the five functions above, just not named in
+// the Task 2 brief because Task 2 had no outbound-builder caller yet.
+extern BOOL    bExtendedNickname(LPCTSTR szNickname);
+
 #endif // CCOMMON_STR_H

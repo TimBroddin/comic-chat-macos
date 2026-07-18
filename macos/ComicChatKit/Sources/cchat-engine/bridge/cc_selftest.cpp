@@ -20,6 +20,8 @@
 #include "ccommon_str.h" // Plan 3 Task 2: bLowLevelQuoting/Unquoting + UTF-8 codec
 #include "protsupp.h"    // Plan 3 Task 3: annotation codec (partial lift)
 #include "userinfo.h"    // Plan 3 Task 3: CUserInfo (annotation codec test rig)
+#include "query.h"       // Plan 3 Task 4: CCQuery/CQueryPtrList correlation list
+#include "ircproto.h"    // Plan 3 Task 4: outbound builders (CIrcProto/CIrcSocket)
 #include <unistd.h>   // mkstemp, close (testShimFileApis)
 
 // EmotionToBytes/BytesToEmotion (avatario.cpp) — declared here for the
@@ -3253,6 +3255,253 @@ static int cc_selftest_keystring() {
     return 0;
 }
 
+// --- query.cpp: CCQuery/CQueryPtrList correlation-list selftest (Plan 3 -----
+// Task 4 Step 3). Enqueues two queries of DIFFERENT command types (ctWho then
+// ctTopic), then a third of the SAME type as the first (ctWho) to verify
+// "oldest-matching" ordering, and checks FindQuery dequeues in enqueue order
+// (the enqueue-BEFORE-send discipline's correlation contract: the reply
+// handler for a given command type must match the OLDEST outstanding query
+// of that type, not the newest).
+static int cc_selftest_query_correlation() {
+    CQueryPtrList list;
+
+    CCQuery* q1 = new CCQuery(qpUserListDlg, ctWho, dtMax, nullptr, "", "", FALSE);
+    CCQuery* q2 = new CCQuery(qpSetTopic, ctTopic, dtMax, nullptr, "#room", "", FALSE);
+    CCQuery* q3 = new CCQuery(qpUserListDlg, ctWho, dtMax, nullptr, "", "", FALSE);
+
+    CC_CHECK(list.bAddQuery(q1) == TRUE);
+    CC_CHECK(list.bAddQuery(q2) == TRUE);
+    CC_CHECK(list.bAddQuery(q3) == TRUE);
+    CC_CHECK(list.GetCount() == 3);
+
+    // FindQuery(ctWho) must return q1 (oldest ctWho), not q3.
+    POSITION pos = nullptr;
+    LONG rank = 0;
+    CCQuery* found = list.FindQuery(ctWho, &pos, &rank);
+    CC_CHECK(found == q1);
+    CC_CHECK(rank == 1);  // first entry in the list
+    CC_CHECK(pos != nullptr);
+
+    // Dequeue it (matches the reply-handler idiom: FindQuery then
+    // FreeRemoveAt on the returned POSITION).
+    list.FreeRemoveAt(pos);
+    CC_CHECK(list.GetCount() == 2);
+
+    // Now FindQuery(ctWho) must return q3 (the only remaining ctWho query).
+    CCQuery* found2 = list.FindQuery(ctWho, &pos, &rank);
+    CC_CHECK(found2 == q3);
+
+    // FindQuery for a command type with no outstanding query returns NULL.
+    CCQuery* miss = list.FindQuery(ctList);
+    CC_CHECK(miss == nullptr);
+
+    // ctTopic query is still present, findable, dequeues correctly too.
+    CCQuery* foundTopic = list.FindQuery(ctTopic);
+    CC_CHECK(foundTopic == q2);
+    CC_CHECK(strcmp(foundTopic->GetChannelName(), "#room") == 0);
+
+    // FreeRemoveAll deletes every remaining query (q2, q3) and empties the
+    // list -- exercised via the destructor path (~CQueryPtrList calls it) by
+    // just letting `list` go out of scope; call it explicitly here too so
+    // the "empty after" assertion is direct.
+    list.FreeRemoveAll();
+    CC_CHECK(list.GetCount() == 0);
+    CC_CHECK(list.FindQuery(ctWho) == nullptr);
+
+    return 0;
+}
+
+// --- ircproto.cpp: outbound byte-compare selftest (Plan 3 Task 4 brief's ---
+// Step 1/7). Drives a JOIN and a SAY through the real cc_session_* C
+// functions and asserts EXACT wire bytes on the `send` capture -- this is
+// the interop contract the byte strings below encode.
+struct CCOutboundCap { std::string sent; };
+static void ccOutboundCapSend(void* ud, const uint8_t* d, size_t n) {
+    static_cast<CCOutboundCap*>(ud)->sent.append((const char*)d, n);
+}
+static const char* ccOutboundOwnNick(void*) { return "Anon"; }
+
+static int cc_selftest_outbound_join_say() {
+    CCOutboundCap cap;
+    cc_session_config cfg = {};
+    cfg.user_data = &cap;
+    cfg.send = ccOutboundCapSend;
+    cfg.own_nick = ccOutboundOwnNick;
+    cc_session* s = cc_session_create(&cfg);
+    CC_CHECK(s != nullptr);
+    if (!s) return g_failures;
+
+    // JOIN #comicrig (no key) -- ircproto.cpp:810's exact wire shape.
+    CC_CHECK(cc_session_join(s, "#comicrig", nullptr) == 0);
+    CC_CHECK(cap.sent == "JOIN #comicrig\r\n");
+    cap.sent.clear();
+
+    // JOIN with a key: "JOIN <chan> <key>\r\n" (ircproto.cpp:815).
+    CC_CHECK(cc_session_join(s, "#secretroom", "hunter2") == 0);
+    CC_CHECK(cap.sent == "JOIN #secretroom hunter2\r\n");
+    cap.sent.clear();
+
+    // Register the room the SAY targets (room-token<->channel mapping,
+    // cc_session.h) so the say assertion below can be tightened to the exact
+    // plain-IRC wire string (the brief's Step 7: loosened only until this
+    // mapping exists -- it now does).
+    uint32_t token = cc_session_register_room(s, "#comicrig");
+    CC_CHECK(token != CC_ROOM_TOKEN_NONE);
+
+    // SAY, no pose/addressees/requested -- SM_SAY (mode=1) with an all-zero
+    // G/E block. Exact plain-IRC transport (non-IRCX): the parenthesized
+    // annotation blob prefixes the text on a single PRIVMSG line
+    // (ircproto.cpp:554-556's sprintf grammar; IndexToByte(0)='0').
+    cc_annotations a;
+    memset(&a, 0, sizeof a);
+    a.mode = 1;  // SM_SAY
+    CC_CHECK(cc_session_send_say(s, token, &a, "hi", 0) == 0);
+    CC_CHECK(cap.sent == "PRIVMSG #comicrig :(#G000E000M1) hi\r\n");
+    cap.sent.clear();
+
+    // Plain NICK change.
+    CC_CHECK(cc_session_change_nick(s, "NewNick") == 0);
+    CC_CHECK(cap.sent == "NICK NewNick\r\n");
+    cap.sent.clear();
+
+    // PART: ChatPartChannel only sends if m_bInRoom (set true by
+    // cc_session_part's own wrapper -- see cc_session.cpp).
+    CC_CHECK(cc_session_part(s, token, nullptr) == 0);
+    CC_CHECK(cap.sent == "PART #comicrig\r\n");
+    cap.sent.clear();
+
+    // WHO with a mask.
+    CC_CHECK(cc_session_who(s, "Anon*") == 0);
+    CC_CHECK(cap.sent == "WHO Anon*\r\n");
+    cap.sent.clear();
+
+    // LIST with no filter (non-IRCX server default: ctList).
+    CC_CHECK(cc_session_list(s, nullptr) == 0);
+    CC_CHECK(cap.sent == "LIST\r\n");
+    cap.sent.clear();
+
+    cc_session_destroy(s);
+    return 0;
+}
+
+// --- ISIRCX probe timer-request selftest (Plan 3 Task 4 brief: "the MODE
+// ISIRCX path requests the 50s timer via cfg.set_timer(CC_TIMER_ISIRCX_PROBE,
+// 50000)"). Verifies both the wire bytes AND that the timer request reaches
+// cfg.set_timer with the exact id/duration -- the engine REQUESTS, this test
+// stands in for Swift's SCHEDULES half.
+struct CCIrcxProbeCap { std::string sent; int32_t timerId = -1; int32_t timerMs = -1; int timerCalls = 0; };
+static int cc_selftest_outbound_ircx_probe_timer() {
+    CCIrcxProbeCap cap;
+    cc_session_config cfg = {};
+    cfg.user_data = &cap;
+    cfg.send = [](void* ud, const uint8_t* d, size_t n) {
+        static_cast<CCIrcxProbeCap*>(ud)->sent.append((const char*)d, n);
+    };
+    cfg.set_timer = [](void* ud, int32_t id, int32_t ms) {
+        CCIrcxProbeCap* c = static_cast<CCIrcxProbeCap*>(ud);
+        c->timerId = id; c->timerMs = ms; c->timerCalls++;
+    };
+    cfg.own_nick = ccOutboundOwnNick;
+
+    cc_session* s = cc_session_create(&cfg);
+    CC_CHECK(s != nullptr);
+    if (!s) return g_failures;
+
+    CC_CHECK(cc_session_probe_ircx(s) == 0);
+    CC_CHECK(cap.sent == "MODE ISIRCX\r\n");
+    CC_CHECK(cap.timerCalls == 1);
+    CC_CHECK(cap.timerId == CC_TIMER_ISIRCX_PROBE);
+    CC_CHECK(cap.timerMs == 50000);
+
+    cc_session_destroy(s);
+    return 0;
+}
+
+// --- bChatSendToTarget chunking-path selftest (ircproto.cpp:481-698's most
+// complex lifted logic; the byte-compare tests above only ever exercise the
+// single-shot "fits in one line" branch). Sends a SAY long enough to force
+// the multi-chunk loop, and asserts: (a) more than one PRIVMSG line is sent,
+// (b) every line is well-formed ("PRIVMSG #chan :..." + CRLF), (c) the
+// reassembled body (chunk text only, ignoring the annotation prefix on the
+// first line) equals the original text with chunk-boundary spaces collapsed
+// (nGetBreakingPoint's "skip all spaces after the break" behavior,
+// ircproto.cpp:672-676) -- i.e. no characters are lost or corrupted across
+// the split, matching the original's own chunking contract.
+static int cc_selftest_outbound_say_chunking() {
+    CCOutboundCap cap;
+    cc_session_config cfg = {};
+    cfg.user_data = &cap;
+    cfg.send = ccOutboundCapSend;
+    cfg.own_nick = ccOutboundOwnNick;
+    cc_session* s = cc_session_create(&cfg);
+    CC_CHECK(s != nullptr);
+    if (!s) return g_failures;
+
+    CC_CHECK(cc_session_join(s, "#comicrig", nullptr) == 0);
+    cap.sent.clear();
+    uint32_t token = cc_session_register_room(s, "#comicrig");
+
+    // Build a long message: default m_nMaxMsgLength is 512 (g_nDefaultIOBuff);
+    // 40 repetitions of an 11-char word (+space) is ~440 bytes of body alone,
+    // comfortably forcing at least one chunk break once the "PRIVMSG #comicrig
+    // :" framing + receiving-side prefix accounting are added on top.
+    std::string longText;
+    for (int i = 0; i < 40; i++) { longText += "wordchunk"; longText += (i % 2) ? "A " : "B "; }
+
+    // modes must carry BM_SAY here (unlike the short-message selftest above,
+    // which passes 0 -- that one never reaches bChatSendToTarget's chunking
+    // switch(uModes) at all since its text fits in one shot; the chunking
+    // path's switch has no case for 0 and ASSERT(0)s in its default arm,
+    // matching the original's own contract that a real caller always passes
+    // a real BM_* mode for a message long enough to chunk).
+    cc_annotations a; memset(&a, 0, sizeof a); a.mode = 1;  // SM_SAY, no annotations content otherwise
+    CC_CHECK(cc_session_send_say(s, token, &a, longText.c_str(), BM_SAY) == 0);
+
+    // Count PRIVMSG lines and reassemble the body. nGetBreakingPoint
+    // deliberately breaks AT a space and the chunk loop then skips ALL
+    // leading whitespace on the next chunk (ircproto.cpp:672-676's
+    // "while (my_isspace(*szBody))" skip) -- so the exact separator space
+    // between the two words spanning a chunk boundary is legitimately
+    // consumed by the break itself and appears in NEITHER chunk (verified
+    // empirically: chunk 1 ends "...wordchunkB", chunk 2 starts
+    // "wordchunkA..." with zero space between). This is the original's
+    // actual, intentional word-wrap behavior, not a lift defect -- so
+    // reassembly re-inserts exactly one space between consecutive chunks
+    // (the separator the break consumed) before comparing to the original.
+    int privmsgCount = 0;
+    std::string reassembled;
+    size_t pos = 0;
+    while (pos < cap.sent.size()) {
+        size_t eol = cap.sent.find("\r\n", pos);
+        CC_CHECK(eol != std::string::npos);
+        if (eol == std::string::npos) break;
+        std::string line = cap.sent.substr(pos, eol - pos);
+        CC_CHECK(line.rfind("PRIVMSG #comicrig :", 0) == 0);
+        if (line.rfind("PRIVMSG #comicrig :", 0) == 0) {
+            privmsgCount++;
+            std::string body = line.substr(strlen("PRIVMSG #comicrig :"));
+            // EVERY chunk carries the parenthesized annotation prefix
+            // ("(#G000E000M1) "), not just the first -- verbatim original
+            // behavior (ircproto.cpp's chunk loop re-sprintfs szAnnotations
+            // into every line on the plain-IRC/non-IRCX transport, since
+            // there's no out-of-band channel to carry it once per message;
+            // every recipient needs the avatar-state prefix on every line
+            // they might see). Strip it from each line before reassembly.
+            size_t termPos = body.find(") ");
+            CC_CHECK(body.rfind("(#", 0) == 0 && termPos != std::string::npos);
+            if (termPos != std::string::npos) body = body.substr(termPos + 2);
+            if (privmsgCount > 1) reassembled += ' ';  // re-insert the consumed break separator
+            reassembled += body;
+        }
+        pos = eol + 2;
+    }
+    CC_CHECK(privmsgCount > 1);  // must actually have chunked
+    CC_CHECK(reassembled == longText);
+
+    cc_session_destroy(s);
+    return 0;
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -3296,5 +3545,9 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_annotation_addressees();       // Plan 3 Task 3 Step 8(d): T-list + clip-at-5
     cc_selftest_annotation_cooked();           // Plan 3 Task 3 Step 8(e): cooked flag
     cc_selftest_keystring();                   // Plan 3 Task 3: PROP CLIENT key-string codec
+    cc_selftest_query_correlation();            // Plan 3 Task 4: CCQuery/CQueryPtrList
+    cc_selftest_outbound_join_say();            // Plan 3 Task 4: outbound byte-compare
+    cc_selftest_outbound_ircx_probe_timer();    // Plan 3 Task 4: MODE ISIRCX + timer request
+    cc_selftest_outbound_say_chunking();        // Plan 3 Task 4: bChatSendToTarget multi-chunk path
     return g_failures;
 }

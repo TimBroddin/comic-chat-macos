@@ -574,3 +574,59 @@ LPCTSTR SzNextUTF8Char(LPCTSTR szInStr)
 					return szInStr+1;
 			}
 }
+
+
+// --- Plan 3 Task 4 addition: bExtendedNickname (ccommon.cpp:109-155) -------
+// Verbatim lift, added for ircproto.cpp's outbound builders (see header note).
+// Not in the Task 2 brief's five-function list because Task 2 had no caller
+// yet; same provenance/rule posture as the rest of this file (R1: no stdafx.h
+// dependency to begin with; pure ASCII character-class scan).
+BOOL bExtendedNickname(LPCTSTR szNickname)
+{
+	LPCTSTR szTmp = szNickname;
+
+	ASSERT(szNickname);
+
+	if (szNickname[0] == '\0')
+		return FALSE;
+
+	// the first character has to be a-z, or A-Z, or []{}_|`^
+	if (!((*szTmp >= 'a' && *szTmp <= 'z') ||
+		  (*szTmp >= 'A' && *szTmp <= 'Z') ||
+		  (*szTmp == '[') ||
+		  (*szTmp == ']') ||
+		  (*szTmp == '{') ||
+		  (*szTmp == '}') ||
+		  (*szTmp == '_') ||
+		  (*szTmp == '|') ||
+		  (*szTmp == '`') ||
+		  (*szTmp == '^')
+		 )
+	   )
+		return TRUE;
+
+	szTmp++;
+
+	// for the rest of the nickname, we need a-z, A-Z, []{}_-|`^, or 0-9
+	while (g_chEOS != *szTmp)
+	{
+		if (!((*szTmp >= 'a' && *szTmp <= 'z') ||
+			  (*szTmp >= 'A' && *szTmp <= 'Z') ||
+			  (*szTmp >= '0' && *szTmp <= '9') ||
+			  (*szTmp == '[') ||
+			  (*szTmp == ']') ||
+			  (*szTmp == '{') ||
+			  (*szTmp == '}') ||
+			  (*szTmp == '_') ||
+			  (*szTmp == '-') ||
+			  (*szTmp == '|') ||
+			  (*szTmp == '`') ||
+			  (*szTmp == '^')
+			 )
+		   )
+			return TRUE;
+		szTmp++;
+	}
+
+	return FALSE;
+}
