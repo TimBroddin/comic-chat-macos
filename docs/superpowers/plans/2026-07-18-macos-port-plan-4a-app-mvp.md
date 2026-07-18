@@ -232,6 +232,12 @@ D4 §2's hard prerequisite: no code anywhere sends `NICK`/`USER` (verified: the 
 - [ ] **Step 6: Run all tests.** `swift test` — all three scenarios + existing suite green. If scenario 2's second-800 trigger doesn't match Step 1's reading, adjust per the code, not per this plan (report it).
 - [ ] **Step 7: Commit.** `git commit -m "macos: Plan 4a Task 2 - live login sequencing (probe/451/800 -> cc_session_login)"`.
 
+**Task 2 amendments (recorded 2026-07-18, reviewer-adjudicated):**
+1. **Step 1's premise was wrong: `HrIrcLogin` was never ported** (only its trigger survived Plan 3 Task 5b). `cc_session_login` is implemented fresh in bridge code, byte-verified against the smoke-2.jsonl capture (`NICK <nick>\r\n` + `USER <user> <machine> . :<realname>\r\n`, capture lines 11-12 — the REAL client's lines; line 2 is a different client, not ground truth).
+2. **R18 site added (adjudicated (a), no new rule):** `engine/ircsock.cpp` second-800/ANON branch — original called `HrIrcXLogin(TRUE)`→`HrIrcLogin` directly (v2.5 ircsock.cpp:2889-2894, :679-680); the port emits a second `CC_EV_SERVER_CAPS` as the login edge-trigger. Joins the individually-listed R18 sites. Semantic note: the second caps event carries no new caps — it is a pure edge-trigger (commented at both emit site and Swift consumer).
+3. **Plan 3 Task 4 latent defect fixed:** `cc_session_probe_ircx` never set `m_bJustSentModeIsIrcX` (original OnConnect sets it — v2.5 ircsock.cpp:1050-1052), silently deadening the 451 fast-path guard at engine/ircsock.cpp:488. Now set when the probe sends.
+4. **Reentrancy constraint (binding on future bridge work):** `cc_session_login` is the first `cc_session_*` entry point called from inside an active engine frame (via on_event). The `g_session` activation pattern must SAVE/RESTORE, never unconditionally null on exit — any future reentrant `cc_session_*` inherits this rule.
+
 ### Task 3: CP-1252 case-fold table + escaped-byte annotation vector (the two Plan 3 must-owns)
 
 **Files:**
