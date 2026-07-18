@@ -98,6 +98,10 @@ public final class ProtocolSession: @unchecked Sendable {
     /// welcome, which carries the server-confirmed actual nick) and
     /// `CC_EV_NICK_CHANGED` with `isSelf == true` do). Read by the
     /// `own_nick` C resolver.
+    /// Own nick, updated ONLY on the server's NICK echo (see doc comment
+    /// above `refillOwnNickBuffer()` near the bottom of this type for the
+    /// persistent C-string buffer kept in sync with this property, which
+    /// backs the `own_nick` C callback's return value).
     private var _ownNick: String = ""
     private var rooms: [String: RoomState] = [:]          // channel -> state
     private var roomTokenToChannel: [UInt32: String] = [:]
@@ -135,6 +139,7 @@ public final class ProtocolSession: @unchecked Sendable {
         self.events = AsyncStream { cont in continuation = cont }
         self.eventContinuation = continuation
         self._ownNick = nick
+        self.refillOwnNickBuffer()
     }
 
     deinit {
@@ -143,6 +148,7 @@ public final class ProtocolSession: @unchecked Sendable {
             cc_session_destroy(s)
         }
         connection?.cancel()
+        ownNickStorage.deallocate()
     }
 
     /// Connect the `NWConnection`, wait for it to become ready, then create
@@ -500,8 +506,6 @@ public final class ProtocolSession: @unchecked Sendable {
 
     // MARK: own_nick / resolve_user (R19 resolvers, answer from Swift state)
 
-    private func currentOwnNick() -> String { _ownNick }
-
     private func resolveUser(nick: String, roomToken: UInt32) -> cc_user_ref {
         if let existing = userRefs[nick] { return existing }
         let ref = nextUserRef
@@ -576,11 +580,13 @@ public final class ProtocolSession: @unchecked Sendable {
             // Echo-only update rule: this IS the server's confirmation of our
             // actual nick (the 001 welcome), so (and only so) we adopt it.
             _ownNick = nick
+            refillOwnNickBuffer()
             connectionStatus = .connected
 
         case .nickChanged(let oldNick, let newNick, let isSelf):
             if isSelf {
                 _ownNick = newNick   // echo-only rule: server-confirmed rename
+                refillOwnNickBuffer()
             }
             for key in rooms.keys {
                 if var member = rooms[key]!.members.removeValue(forKey: oldNick) {
@@ -755,10 +761,12 @@ public final class ProtocolSession: @unchecked Sendable {
     private static let cOwnNick: cc_own_nick_fn = { userData in
         guard let userData else { return ownNickFallback }
         let session = Unmanaged<ProtocolSession>.fromOpaque(userData).takeUnretainedValue()
-        // Returned pointer must stay valid for the (synchronous, same-frame)
-        // duration the engine reads it: back it with a persistent per-session
-        // buffer rather than a transient String's scratch storage.
-        return session.ownNickCStringPointer()
+        // Runs synchronously on `sessionQueue` (the engine call that reaches
+        // this resolver was itself made from that queue); `ownNickPointer`
+        // reads the persistent buffer that `refillOwnNickBuffer()` (also
+        // always called on `sessionQueue`, at the point `_ownNick` changes)
+        // last wrote. No lock needed: both sides are already serialized.
+        return session.ownNickPointer()
     }
 
     private static let cResolveUser: cc_resolve_user_fn = { userData, nick, roomToken in
@@ -779,19 +787,49 @@ public final class ProtocolSession: @unchecked Sendable {
         return UnsafePointer(buf)
     }()
 
-    /// A persistent (reused, overwritten-in-place) buffer holding `_ownNick`
-    /// as a NUL-terminated C string, encoded per `encoding`. `own_nick`'s
-    /// contract (comicchat.h) is "never NULL", and the returned pointer only
-    /// needs to be valid for the engine's immediate synchronous read, which
-    /// happens before `sessionQueue`'s current block returns — a single
-    /// reused buffer (resized as needed) is sufficient and avoids leaking a
-    /// new allocation on every call.
-    private var ownNickBuffer: [CChar] = [0]
-    private func ownNickCStringPointer() -> UnsafePointer<CChar> {
+    /// Manually-allocated, NUL-terminated C-string buffer holding `_ownNick`
+    /// (encoded per `encoding`) — the storage the `own_nick` C callback's
+    /// pointer points into. Unlike a Swift `[CChar]`/`Array`, whose backing
+    /// store is copy-on-write and may be reallocated by ARC/the optimizer at
+    /// any time (making a pointer obtained via `withUnsafeBufferPointer` and
+    /// returned past the closure's end formal undefined behavior — the bug
+    /// this fixes), a manually `allocate`d buffer has a fixed address for its
+    /// lifetime: it is only ever freed by us, on our own schedule, so a
+    /// pointer into it stays valid across the synchronous C read (and,
+    /// deliberately, across calls in general — same precedent/lifetime
+    /// argument as `ownNickFallback` above). Grown (reallocated) only when
+    /// the encoded nick no longer fits; never reallocated on a mere read.
+    private var ownNickStorage: UnsafeMutablePointer<CChar> = {
+        let buf = UnsafeMutablePointer<CChar>.allocate(capacity: 1)
+        buf[0] = 0
+        return buf
+    }()
+    private var ownNickStorageCapacity: Int = 1
+
+    /// Re-encodes `_ownNick` into `ownNickStorage`, growing the allocation
+    /// first if needed. Must be called on `sessionQueue`, and ONLY at the
+    /// point `_ownNick` is mutated (construction, `.loggedIn`,
+    /// `.nickChanged(isSelf: true)`) — NOT on every `own_nick` read, which
+    /// just returns the already-current buffer via `ownNickPointer()`.
+    private func refillOwnNickBuffer() {
         var bytes = WireCodec.encode(_ownNick, encoding: encoding)
         bytes.append(0)
-        ownNickBuffer = bytes.map { CChar(bitPattern: $0) }
-        return ownNickBuffer.withUnsafeBufferPointer { $0.baseAddress! }
+        if bytes.count > ownNickStorageCapacity {
+            ownNickStorage.deallocate()
+            ownNickStorage = .allocate(capacity: bytes.count)
+            ownNickStorageCapacity = bytes.count
+        }
+        for (i, byte) in bytes.enumerated() {
+            ownNickStorage[i] = CChar(bitPattern: byte)
+        }
+    }
+
+    /// Returns the stable pointer into `ownNickStorage` for the `own_nick` C
+    /// callback. Must be called on `sessionQueue` (same queue `_ownNick`'s
+    /// mutations and `refillOwnNickBuffer()` run on), matching the engine's
+    /// synchronous same-frame read contract.
+    private func ownNickPointer() -> UnsafePointer<CChar> {
+        UnsafePointer(ownNickStorage)
     }
 }
 
