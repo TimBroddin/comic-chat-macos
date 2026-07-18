@@ -119,6 +119,39 @@ public final class Strip {
         }
     }
 
+    /// Ingest one WIRE-RECEIVED line whose pose should come from a decoded
+    /// `Annotations` block rather than text inference (Plan 3 Task 9's
+    /// `cc_strip_add_line_cooked`, the ported `SayEntry::Execute` "cooked"
+    /// path — histent.cpp:80-108). Pass `nil` (or an `Annotations` with
+    /// `cooked == false`) to fall back to exactly `addLine`'s text-inference
+    /// behavior — a plain/unannotated line still gets the original heuristic.
+    public func addLineCooked(speaker: Int32, text: String, modes: Mode,
+                              addressees: [Int32], annotations: Annotations?,
+                              encoding: WireEncoding = .cp1252) throws {
+        let h = try requireHandle()
+        let bytes = text.data(using: .windowsCP1252) ?? Data(text.utf8)
+        var cAnn = annotations?.toCAnnotations(encoding: encoding)
+        let rc: Int32 = bytes.withUnsafeBytes { rawBuf -> Int32 in
+            let cptr = rawBuf.bindMemory(to: CChar.self).baseAddress
+            func callWithAddressees(_ annPtr: UnsafePointer<cc_annotations>?) -> Int32 {
+                if addressees.isEmpty {
+                    return cc_strip_add_line_cooked(h, speaker, cptr, modes.rawValue, nil, 0, annPtr)
+                }
+                return addressees.withUnsafeBufferPointer { addrBuf in
+                    cc_strip_add_line_cooked(h, speaker, cptr, modes.rawValue,
+                                             addrBuf.baseAddress, Int32(addrBuf.count), annPtr)
+                }
+            }
+            if cAnn != nil {
+                return withUnsafePointer(to: &cAnn!) { callWithAddressees($0) }
+            }
+            return callWithAddressees(nil)
+        }
+        guard rc == 0 else {
+            throw StripError(message: "addLineCooked(speaker=\(speaker), \"\(text)\") failed")
+        }
+    }
+
     /// Number of panels laid out so far.
     public var panelCount: Int32 {
         guard let h = handle else { return 0 }

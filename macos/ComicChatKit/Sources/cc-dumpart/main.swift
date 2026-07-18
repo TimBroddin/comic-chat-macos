@@ -19,6 +19,13 @@ import ComicChatKit
 // JSON conversation to a comic-strip PNG. See StripScript.swift (ComicChatKit)
 // for the JSON schema (also printed by scriptUsage() below) and the
 // decode/validate/render pipeline; this file is a thin CLI shell around it.
+//
+// cc-dumpart --replay <capture.jsonl> <out.png> — Plan 3 Task 9's exit
+// milestone as a runnable command: replays a Wine capture rig JSONL file's
+// s2c bytes through a real ProtocolSession, bridges the resulting decoded
+// events (ProtocolStripBridge) into a cc_strip, and PNG-exports the composed
+// page. See ReplayStrip.swift for the full driver + the session/strip
+// phase-separation contract.
 
 let scriptUsage = """
 usage: cc-dumpart --script <conversation.json> <out.png>
@@ -75,12 +82,19 @@ do {
             exit(64) // EX_USAGE
         }
         try runScriptMode(jsonPath: args[2], outPath: args[3])
+    } else if args.count >= 2 && args[1] == "--replay" {
+        guard args.count == 4 else {
+            FileHandle.standardError.write(Data("usage: cc-dumpart --replay <capture.jsonl> <out.png>\n".utf8))
+            exit(64) // EX_USAGE
+        }
+        try runReplayMode(jsonlPath: args[2], outPath: args[3])
     } else {
         guard args.count > 1 else {
             FileHandle.standardError.write(Data("usage: cc-dumpart <art-dir>\n".utf8))
             FileHandle.standardError.write(Data("       cc-dumpart --png <file.avb> <poseIndex> <out.png>\n".utf8))
             FileHandle.standardError.write(Data("       cc-dumpart --strip <out.png>\n".utf8))
             FileHandle.standardError.write(Data("       cc-dumpart --script <conversation.json> <out.png>\n".utf8))
+            FileHandle.standardError.write(Data("       cc-dumpart --replay <capture.jsonl> <out.png>\n".utf8))
             exit(64) // EX_USAGE
         }
         let artDir = args[1]

@@ -184,6 +184,27 @@ void cc_set_metrics_canvas(cc_canvas* canvas);
 enum { CC_MODE_SAY = 0x0001, CC_MODE_WHISPER = 0x0002,
        CC_MODE_THINK = 0x0004, CC_MODE_ACTION = 0x0008 };
 
+/* ---- Annotation codec (Plan 3 Task 3) --------------------------------------
+ * Decoded comic annotation block ("User Display Info"). Values are indices,
+ * NOT the +'0' wire bytes. addressees are encoded nick strings (CP-1252).
+ * Wire grammar (state-and-codec.md §3.3):
+ *   #G<gp><ge><gi>E<ep><ee><ei>[R]M<m>[T<nick>[,<nick>...]]
+ * Every <x> byte is IndexToByte(value) = value + '0' (protsupp.cpp:1023).
+ * `cooked` is set only when both intensity fields have been written by the
+ * decoder (protsupp.cpp:1538-1539). Declared here (ahead of the strip API,
+ * moved up from its original spot ahead of the session API in Plan 3 Task 9)
+ * because cc_strip_add_line_cooked below also takes a `const cc_annotations*`. */
+#define CC_MAX_ADDRESSEES 5
+typedef struct cc_annotations {
+    int32_t gesture_pose, gesture_emotion, gesture_intensity;   /* G group */
+    int32_t face_pose,    face_emotion,    face_intensity;      /* E group */
+    int32_t requested;                                          /* R flag (0/1) */
+    int32_t mode;                                               /* SM_* say mode 1..5 */
+    int32_t addressee_count;
+    char    addressees[CC_MAX_ADDRESSEES][64];                  /* encoded nicks */
+    int32_t cooked;                                             /* both intensities present */
+} cc_annotations;
+
 typedef struct cc_strip cc_strip;
 
 /* Create an empty strip session. Initializes the avatar registry, resets the
@@ -242,6 +263,26 @@ int32_t   cc_strip_add_line(cc_strip* s, int32_t speaker,
                             const char* text_bytes, uint32_t modes,
                             const int32_t* addressees, int32_t n_addr); /* 0 ok */
 
+/* Ingest one WIRE-RECEIVED line whose pose/emotion is already decided by a
+ * decoded cc_annotations block (Plan 3 Task 9), instead of inferring the pose
+ * from the text via ChatPreSendText (the original's SayEntry::Execute /
+ * histent.cpp:80-108 "cooked" path, ported): when `ann->cooked` is nonzero,
+ * this sets the speaker avatar's face/gesture pose directly from
+ * `ann->face_pose`/`ann->gesture_pose` (SetIndices, for ordinary avatars) or,
+ * for an OTHERMAPPED avatar, the closest-matching emotion/intensity pair
+ * (SetEmotions, built from ann->face_emotion/face_intensity and
+ * ann->gesture_emotion/gesture_intensity via BytesToEmotion) -- and does NOT
+ * call ChatPreSendText, so an explicitly-annotated received pose is never
+ * clobbered by a re-inferred one. When `ann` is NULL or `ann->cooked` is 0,
+ * this behaves exactly like cc_strip_add_line (falls back to text inference)
+ * -- a locally-typed / unannotated line still gets the original heuristic.
+ * `modes`/`addressees`/`n_addr` behave exactly as in cc_strip_add_line.
+ * Returns 0 on success. */
+int32_t   cc_strip_add_line_cooked(cc_strip* s, int32_t speaker,
+                                   const char* text_bytes, uint32_t modes,
+                                   const int32_t* addressees, int32_t n_addr,
+                                   const cc_annotations* ann); /* 0 ok */
+
 /* Number of panels laid out so far. */
 int32_t   cc_strip_panel_count(const cc_strip* s);
 
@@ -295,25 +336,6 @@ void        cc_session_fire_timer(cc_session* s, int32_t timer_id);             
 /* Test-only hook (Task 1): drives one send("ECHO\r\n") + one on_event. Removed
  * once real parsing lands; kept behind CC_SESSION_TESTHOOK. */
 void        cc_session_test_echo(cc_session* s);
-
-/* ---- Annotation codec (Plan 3 Task 3) --------------------------------------
- * Decoded comic annotation block ("User Display Info"). Values are indices,
- * NOT the +'0' wire bytes. addressees are encoded nick strings (CP-1252).
- * Wire grammar (state-and-codec.md §3.3):
- *   #G<gp><ge><gi>E<ep><ee><ei>[R]M<m>[T<nick>[,<nick>...]]
- * Every <x> byte is IndexToByte(value) = value + '0' (protsupp.cpp:1023).
- * `cooked` is set only when both intensity fields have been written by the
- * decoder (protsupp.cpp:1538-1539). */
-#define CC_MAX_ADDRESSEES 5
-typedef struct cc_annotations {
-    int32_t gesture_pose, gesture_emotion, gesture_intensity;   /* G group */
-    int32_t face_pose,    face_emotion,    face_intensity;      /* E group */
-    int32_t requested;                                          /* R flag (0/1) */
-    int32_t mode;                                               /* SM_* say mode 1..5 */
-    int32_t addressee_count;
-    char    addressees[CC_MAX_ADDRESSEES][64];                  /* encoded nicks */
-    int32_t cooked;                                             /* both intensities present */
-} cc_annotations;
 
 /* ---- Inbound event vocabulary (Plan 3 Task 5a) -----------------------------
  * The complete set of events the engine can emit through cc_on_event_fn

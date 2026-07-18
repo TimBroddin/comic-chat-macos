@@ -55,6 +55,7 @@ void ChatPreSendText(CString &str, int avID);  // textpose.cpp:120
 int  SetBackDropAux(const char *backname, const char *pszRealName);  // backdrop.cpp:83
 void InitializeBackDrops();               // backdrop.cpp:168
 void DestroyBackDropArt();                // backdrop.cpp:318
+void BytesToEmotion(CEmotion &em, BYTE emIndex, BYTE inIndex);  // avatario.cpp:88
 
 // ============================================================================
 // cc_strip
@@ -289,6 +290,69 @@ extern "C" int32_t cc_strip_add_line(cc_strip* s, int32_t speaker,
 
     // (3) orchestrator ingestion. AddLine returns BOOL (TRUE == success).
     BOOL ok = s->page->AddLine((UINT)speaker, (const char*)text, (USHORT)modes, NULL, NULL);
+    return ok ? 0 : -1;
+}
+
+// Plan 3 Task 9: the wire-received counterpart of cc_strip_add_line -- ports
+// the original's SayEntry::Execute "cooked" branch (histent.cpp:80-108) rather
+// than ChatPreSendText's text-inference heuristic (textpose.cpp:120), so an
+// explicitly-decoded annotation block drives the speaker's rendered pose
+// directly. histent.cpp's own gate:
+//   if (m_udi.m_bbCooked) {
+//       if (!(av->m_flags & OTHERMAPPED)) av->SetIndices(m_chExpr, m_chGest, m_bbReq);
+//       else { BytesToEmotion(expr, ...); BytesToEmotion(gest, ...); av->SetEmotions(expr, gest); }
+//   }
+//   ProcessLine(...) -> if (!bbCooked) ChatPreSendText(...);   // chatdoc.cpp:451-452
+// i.e. inference (ChatPreSendText) runs ONLY when NOT cooked -- ported here as
+// an if/else between the pose-from-annotations branch and the existing
+// pose-from-text-inference branch, so uncooked/no-annotation callers still get
+// exactly cc_strip_add_line's original behavior.
+extern "C" int32_t cc_strip_add_line_cooked(cc_strip* s, int32_t speaker,
+                                            const char* text_bytes, uint32_t modes,
+                                            const int32_t* addressees, int32_t n_addr,
+                                            const cc_annotations* ann) {
+    if (!s || !s->page || !text_bytes || speaker <= 0) return -1;
+    if (!addressees && n_addr != 0) return -1;
+
+    CUserInfo* spk = ccContext().session.lookupUser((UINT)speaker);
+    if (!spk) return -1;   // unknown speaker id
+
+    // (1) rebuild the speaker's talk-to graph from the addressees (identical
+    // to cc_strip_add_line).
+    spk->m_udi.m_talkTos.RemoveAll();
+    for (int32_t i = 0; i < n_addr; i++) {
+        CUserInfo* to = ccContext().session.lookupUser((UINT)addressees[i]);
+        if (to) spk->m_udi.m_talkTos.Add((DWORD)(uintptr_t)to);
+    }
+
+    // (2) pose: explicit annotations (cooked) win over text inference.
+    CAvatarX* av = GetAvatar((USHORT)speaker);
+    if (ann && ann->cooked && av) {
+        if (!(av->m_flags & OTHERMAPPED)) {
+            // Ordinary avatar: the decoded pose indices map directly onto
+            // SetIndices' (face, torso/gesture, requested) triple -- exactly
+            // histent.cpp:97's av->SetIndices(m_chExpr, m_chGest, m_bbReq).
+            av->SetIndices((CHAR)ann->face_pose, (CHAR)ann->gesture_pose,
+                           (BYTE)ann->requested);
+        } else {
+            // OTHERMAPPED avatar: closest-matching emotion/intensity pair,
+            // mirroring histent.cpp:99-104's BytesToEmotion+SetEmotions pair
+            // (also the exact pattern cc_selftest.cpp:2934-2936 already uses
+            // for the encoder-side test avatar).
+            CEmotion faceEm, gestEm;
+            BytesToEmotion(faceEm, (BYTE)ann->face_emotion, (BYTE)ann->face_intensity);
+            BytesToEmotion(gestEm, (BYTE)ann->gesture_emotion, (BYTE)ann->gesture_intensity);
+            av->SetEmotions(faceEm, gestEm);
+        }
+    } else {
+        // Not cooked (or no annotations at all): fall back to the original
+        // text-inference path, unchanged from cc_strip_add_line.
+        CString text(text_bytes);
+        ChatPreSendText(text, speaker);
+    }
+
+    // (3) orchestrator ingestion -- identical to cc_strip_add_line.
+    BOOL ok = s->page->AddLine((UINT)speaker, text_bytes, (USHORT)modes, NULL, NULL);
     return ok ? 0 : -1;
 }
 
