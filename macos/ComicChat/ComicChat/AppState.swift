@@ -15,7 +15,7 @@ public final class AppState {
 
     public func connect() async {
         let artDir = Bundle.main.resourceURL!.appendingPathComponent("comicart").path
-        let cfg = ChatConfig(host: settings.server, port: UInt16(settings.port),
+        let cfg = ChatConfig(host: settings.server, port: UInt16(exactly: settings.port) ?? 6667,
                              nick: settings.nick, room: settings.room,
                              encoding: settings.encoding,
                              characterName: settings.character,

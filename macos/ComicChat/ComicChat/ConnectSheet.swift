@@ -17,7 +17,7 @@ struct ConnectSheet: View {
         Form {
             Section("Server") {
                 TextField("Server", text: settingsBinding(\.server))
-                TextField("Port", value: settingsBinding(\.port), format: .number)
+                TextField("Port", value: settingsBinding(\.port), format: .number.grouping(.never))
                 Picker("Encoding", selection: settingsBinding(\.encoding)) {
                     Text("Windows-1252").tag(WireEncoding.cp1252)
                     Text("UTF-8").tag(WireEncoding.utf8)
@@ -49,7 +49,8 @@ struct ConnectSheet: View {
                     }
                 }
                 .disabled(isConnecting || appState.settings.server.isEmpty
-                          || appState.settings.nick.isEmpty || appState.settings.room.isEmpty)
+                          || appState.settings.nick.isEmpty || appState.settings.room.isEmpty
+                          || !(1...65535).contains(appState.settings.port))
             }
         }
     }
