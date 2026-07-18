@@ -18,5 +18,13 @@ struct ComicChatApp: App {
         Window("Whispers", id: "whispers") {
             WhisperBox().environment(appState)
         }
+
+        // Plan 4b Task 5: the original's Options property sheet, reborn as
+        // the standard macOS Settings scene (⌘,) — see SettingsScene's own
+        // doc comment for why the character/backdrop pickers are TABS here
+        // rather than separate windows.
+        Settings {
+            SettingsScene().environment(appState)
+        }
     }
 }

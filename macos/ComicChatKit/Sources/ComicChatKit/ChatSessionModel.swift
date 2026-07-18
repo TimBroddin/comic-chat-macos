@@ -15,10 +15,27 @@ public struct ChatConfig: Sendable {
     public var characterName: String
     public var backdropName: String
     public var artDir: String
+    /// Plan 4b Task 5 (persona plumbing): the USER command's `<user>`/
+    /// `<realname>` fields, plumbed straight through to
+    /// `ProtocolSession.init`'s own same-named parameters. `nil` (default)
+    /// preserves the pre-Task-5 nick-fallback behavior.
+    public var userName: String?
+    public var realName: String?
+    /// Gates `send(_:mode:)`'s outbound cooked pose annotations: `false` ->
+    /// `annotations: nil` (peers then run text inference — the original's
+    /// ComicsData toggle semantics). `true` (default) matches every prior
+    /// task's always-annotated behavior.
+    public var sendComicsData: Bool
+    /// Seeds `ChatSessionModel`'s internal `_acceptWhispers` test seam
+    /// (Task 4) from a real setting. `true` by default, matching that seam's
+    /// existing hard-coded default.
+    public var acceptWhispers: Bool
 
     public init(host: String, port: UInt16, nick: String, room: String,
                 encoding: WireEncoding = .cp1252, characterName: String = "anna",
-                backdropName: String = "field", artDir: String) {
+                backdropName: String = "field", artDir: String,
+                userName: String? = nil, realName: String? = nil,
+                sendComicsData: Bool = true, acceptWhispers: Bool = true) {
         self.host = host
         self.port = port
         self.nick = nick
@@ -27,6 +44,10 @@ public struct ChatConfig: Sendable {
         self.characterName = characterName
         self.backdropName = backdropName
         self.artDir = artDir
+        self.userName = userName
+        self.realName = realName
+        self.sendComicsData = sendComicsData
+        self.acceptWhispers = acceptWhispers
     }
 }
 
@@ -90,7 +111,14 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// layer uses this to drive unread badges/live transcript updates.
     public var onWhisper: (@Sendable (String, WhisperLine) -> Void)?
 
-    private let config: ChatConfig
+    /// `var` (Plan 4b Task 5): `changeCharacter` updates the model's OWN
+    /// notion of `config.characterName` so a subsequent `reflowLocked()` (or
+    /// any other reader of `config`) sees the character actually in effect —
+    /// engine-queue only, like every other piece of this type's mutable
+    /// state (see `setUpStripLocked`'s own `config.characterName`/
+    /// `config.backdropName` reads, which run on the engine queue via
+    /// `start()`/`reflowLocked()`).
+    private var config: ChatConfig
     private let engineQueue = DispatchQueue(label: "com.comicchat.engine")
     private let session: ProtocolSession
 
@@ -209,24 +237,43 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// `sendWhisper` (own outbound line) -- see `whisperHistories` (the
     /// public, thread-safe snapshot reader) below.
     private var _whisperHistories: [String: [WhisperLine]] = [:]
-    /// TEST-ONLY internal seam (reachable via `@testable import`): Task 5
-    /// wires this to a real settings toggle. Hard-coded to the spec default
-    /// `true` until then -- an inbound whisper is dropped from history (and
-    /// surfaces via `onStatus` instead) while this is `false`. Engine-queue
-    /// only.
+    /// Internal seam (reachable via `@testable import` for
+    /// `WhisperRoutingTests`' drop test) now wired to `config.acceptWhispers`
+    /// at `init` (Task 5) -- an inbound whisper is dropped from history (and
+    /// surfaces via `onStatus` instead) while this is `false`. Kept as a
+    /// separate property (rather than reading `config.acceptWhispers`
+    /// directly at the point of use) so a test can still flip it after
+    /// construction without needing a full `ChatConfig` rebuild. Engine-queue
+    /// only. Default `true` matches `ChatConfig.acceptWhispers`'s own default.
     var _acceptWhispers: Bool = true
 
     public init(config: ChatConfig) {
         self.config = config
         self.currentOwnNick = config.nick
         self.session = ProtocolSession(host: config.host, port: config.port, nick: config.nick,
-                                       encoding: config.encoding, engineQueue: engineQueue)
+                                       encoding: config.encoding, engineQueue: engineQueue,
+                                       userName: config.userName, realName: config.realName)
+        // Task 4's internal test-only seam, now wired to a real setting
+        // (Task 5) — `_acceptWhispers` keeps its `true` default when
+        // `config.acceptWhispers` is left at ITS default, so
+        // `WhisperRoutingTests`' drop test (which constructs `ChatConfig`
+        // without this parameter) is unaffected.
+        self._acceptWhispers = config.acceptWhispers
     }
 
     /// Thread-safe snapshot of the event log so far (see `_transcript`'s doc
     /// comment for why the engine-queue-owned storage is private).
     public var transcript: [ProtocolEvent] {
         engineQueue.sync { _transcript }
+    }
+
+    /// Thread-safe snapshot of the strip's current panel count (`Strip.panelCount`,
+    /// 0 if no strip has been built yet — e.g. before `start()`). Exposed for
+    /// callers/tests that need to observe a recompose actually having
+    /// happened (e.g. after `changeCharacter`/`changeBackdrop` + a send) —
+    /// same `engineQueue.sync` read-through pattern as `transcript`.
+    public var panelCount: Int32 {
+        engineQueue.sync { strip?.panelCount ?? 0 }
     }
 
     // MARK: - start()
@@ -590,6 +637,70 @@ public final class ChatSessionModel: @unchecked Sendable {
         }
     }
 
+    // MARK: - character / backdrop switching (Plan 4b Task 5)
+
+    /// Switches the SELF participant's avatar to `name` (a bare comicart name,
+    /// no directory/extension — same convention as `ChatConfig.characterName`).
+    /// FUTURE-PANELS-ONLY semantics, original-faithful:
+    /// `Strip.setParticipantAvatar` only affects panels rendered AFTER this
+    /// call (histent.cpp:368-413's documented behavior) — existing panels
+    /// keep the OLD avatar, exactly like a peer's `.appearsAs` avatar switch
+    /// (`ProtocolStripBridge.apply`'s `.appearsAs` case, same contract).
+    ///
+    /// Also (per SetMyAvatar's own sequence, avatar.cpp:585-599):
+    ///   1. resets `selfAvatarFile` to `nil` so `emitSelfPoseLocked` lazily
+    ///      reopens it against the NEW character (Task 3's named obligation —
+    ///      that property's own doc comment explicitly deferred this reset
+    ///      to "Task 5's problem"; skipping it ships a stale wheel-preview
+    ///      bug: the preview would keep rendering poses from the OLD avatar
+    ///      file);
+    ///   2. calls `emitSelfPoseLocked()` so the wheel's live preview updates
+    ///      immediately to the new character's current pose;
+    ///   3. updates the model's OWN notion of `config.characterName` (so a
+    ///      later `reflowLocked()` re-adds the self participant with the
+    ///      NEW character, not the one `start()` was originally called
+    ///      with);
+    ///   4. fires `session.announceAvatar` fire-and-forget (a detached
+    ///      `Task`, same shape as `.selfJoined`'s own announce in
+    ///      `handleLocked` — SetMyAvatar's announce-on-change).
+    ///
+    /// Fire-and-forget: hops onto the engine queue and returns immediately,
+    /// same posture as `setEmotion`/`previewTyping`/`setViewport`.
+    public func changeCharacter(_ name: String) {
+        engineQueue.async { [weak self] in
+            guard let self, !self.isShutDown, let strip = self.strip,
+                  let selfParticipantID = self.selfParticipantID else { return }
+            let avbPath = self.config.artDir + "/" + name + ".avb"
+            guard (try? strip.setParticipantAvatar(selfParticipantID, avbPath: avbPath)) != nil else { return }
+            self.config.characterName = name
+            self.selfAvatarFile = nil
+            self.emitSelfPoseLocked()
+            let session = self.session
+            let channel = self.config.room
+            let announceName = name.capitalized
+            Task {
+                try? await session.announceAvatar(channel: channel, name: announceName)
+            }
+        }
+    }
+
+    /// Switches the strip's backdrop to `name` (a bare comicart name). No
+    /// reflow: `bridge.setBackdrop`/`Strip.setBackdrop`'s contract is that
+    /// SUBSEQUENT panels inherit the new backdrop (comicchat.h's
+    /// `set_backdrop` doc comment) — existing panels keep the old one,
+    /// exactly like `changeCharacter`'s future-panels-only avatar switch.
+    /// Also updates `config.backdropName` (so a later `reflowLocked()`
+    /// re-applies the NEW backdrop, matching `changeCharacter`'s same
+    /// `config` update). Fire-and-forget, same posture as `changeCharacter`.
+    public func changeBackdrop(_ name: String) {
+        engineQueue.async { [weak self] in
+            guard let self, !self.isShutDown, let bridge = self.bridge else { return }
+            let bgbPath = self.config.artDir + "/" + name + ".bgb"
+            guard (try? bridge.setBackdrop(bgbPath)) != nil else { return }
+            self.config.backdropName = name
+        }
+    }
+
     /// ENGINE QUEUE ONLY. Renders the SELF participant's CURRENT pose
     /// (`strip.selfPoseIndex()`) via a standalone `AvatarFile` handle on the
     /// self character (`selfAvatarFile`, lazily created here) and hands the
@@ -640,9 +751,14 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// Sends `text` under `mode` (default `.say`), with COOKED outbound pose
     /// annotations built from the CURRENT wheel/preview state (the original
     /// grabs the bodycam state at send time too — Task 9's `annotations: nil`
-    /// MVP scope decision is superseded by this task). `sendComicsData`
-    /// (Task 5) will let a user opt out of annotating at all; until that
-    /// lands, every send is annotated.
+    /// MVP scope decision is superseded by this task), UNLESS
+    /// `config.sendComicsData == false` (Task 5's opt-out: peers then run
+    /// text inference instead — the original's ComicsData toggle semantics).
+    /// The wheel/preview themselves are unaffected either way (they read
+    /// `strip.selfAnnotations()`/pose state directly, never this method's
+    /// `ann` value) — only what goes out over the wire (and what the own-say
+    /// local render carries, kept consistent with the wire per this method's
+    /// own OWN-SAY RENDERING note below) is gated.
     ///
     /// OWN-SAY RENDERING (Task 9's "No" answer, still honored): the original
     /// renders own says immediately by adding a local history entry at send
@@ -659,12 +775,28 @@ public final class ChatSessionModel: @unchecked Sendable {
         // context (ChatWindow's Task { try? await model.send(...) }), never
         // from inside `handleLocked`/the event consumer, so this is legal,
         // same posture as the pre-existing `session.say` call below.
+        //
+        // `config` READ HAZARD (Plan 4b Task 5): `config` became a `var`
+        // this task (`changeCharacter`/`changeBackdrop` mutate
+        // `config.characterName`/`.backdropName` ON the engine queue) — so a
+        // bare off-queue `config.room`/`config.sendComicsData` read here
+        // would race those writes (Swift's exclusivity model has no
+        // per-field granularity for a struct touched from two threads; ANY
+        // field write on one thread races ANY field read on another, even a
+        // DIFFERENT field). Both needed values are read inside this SAME
+        // `performOnEngineQueue` call (which was already here for
+        // `strip?.selfAnnotations()`) rather than via bare `config.x`
+        // accesses below.
+        let (sendComicsData, room): (Bool, String) = session.performOnEngineQueue { [self] in
+            (config.sendComicsData, config.room)
+        }
         let ann: Annotations? = session.performOnEngineQueue { [self] in
+            guard sendComicsData else { return nil }
             guard var a = try? strip?.selfAnnotations() else { return nil }
             a.mode = Self.smMode(for: mode)
             return a
         }
-        try await session.say(config.room, text: text, annotations: ann,
+        try await session.say(room, text: text, annotations: ann,
                               modes: UInt16(mode.rawValue))
         // Registered BEFORE the synthetic event is enqueued (4a carryover:
         // own-say echo dedup, `handleLocked`'s doc comment) so a server echo
@@ -673,7 +805,7 @@ public final class ChatSessionModel: @unchecked Sendable {
         // pending entry to consume, however the two async paths interleave.
         engineQueue.async { [weak self] in self?.pendingLocalEchoes.append(text) }
         let ownNick = session.ownNick
-        let synthetic = ProtocolEvent.text(nick: ownNick, ident: "", target: config.room,
+        let synthetic = ProtocolEvent.text(nick: ownNick, ident: "", target: room,
                                           text: text, kind: 0, annotations: ann)
         enqueueHandle(synthetic, fromServer: false)
     }
@@ -712,13 +844,18 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// reading it FROM INSIDE an already-on-`engineQueue` closure, which is
     /// exactly what this method's closure is.
     public func sendWhisper(to peer: String, text: String) async throws {
-        let ann: Annotations? = session.performOnEngineQueue { [self] in
-            guard var a = try? strip?.selfAnnotations() else { return nil }
+        // Same `config` read-hazard fix as `send(_:mode:)`'s own doc comment
+        // (Plan 4b Task 5: `config` is now a `var`, mutated on the engine
+        // queue by `changeCharacter`/`changeBackdrop`) — `config.room` is
+        // read inside this SAME `performOnEngineQueue` call rather than as a
+        // bare off-queue access.
+        let (ann, room): (Annotations?, String) = session.performOnEngineQueue { [self] in
+            guard var a = try? strip?.selfAnnotations() else { return (nil, config.room) }
             a.mode = Self.smMode(for: .whisper)
             a.addressees = [peer]
-            return a
+            return (a, config.room)
         }
-        try await session.whisper(to: [peer], text: text, channel: config.room, annotations: ann)
+        try await session.whisper(to: [peer], text: text, channel: room, annotations: ann)
         engineQueue.async { [weak self] in
             guard let self, !self.isShutDown else { return }
             let line = WhisperLine(nick: self.currentOwnNick, text: text, isOwn: true)

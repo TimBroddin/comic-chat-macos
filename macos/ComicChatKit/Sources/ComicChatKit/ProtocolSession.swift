@@ -98,6 +98,17 @@ public final class ProtocolSession: @unchecked Sendable {
     /// first `connect()` call since nothing reads it until then).
     public var probeTimeoutMs: Int32 = 5000
 
+    /// Plan 4b Task 5 (persona plumbing): the USER command's `<user>`/
+    /// `<realname>` fields (`cc_session_config.own_user`/`.own_realname`),
+    /// closing the real gap that `ProtocolSession` never set these before —
+    /// USER always fell back to the nick. `nil` (the default) preserves that
+    /// exact fallback behavior (`cc_session_login`'s own nullable-and-falls-
+    /// back-to-nick posture, cc_session.cpp:405-406). Construction-time only
+    /// — see `ownUserStorage`/`ownRealnameStorage` below for why these need
+    /// their own persistent C-string buffers, same as `_ownNick`'s.
+    public let userName: String?
+    public let realName: String?
+
     // MARK: Engine-owned state (mutated ONLY on sessionQueue)
 
     private var cSession: OpaquePointer?
@@ -172,19 +183,30 @@ public final class ProtocolSession: @unchecked Sendable {
     ///   run on this SAME queue rather than a queue of its own
     ///   (`performOnEngineQueue`/`enqueueEngineWork`, below, are how callers
     ///   reach it).
+    /// - Parameters:
+    ///   - userName: the USER command's `<user>` field (Plan 4b Task 5's
+    ///     persona plumbing); `nil` (default) preserves the pre-Task-5
+    ///     nick-fallback behavior.
+    ///   - realName: the USER command's `<realname>` field; same `nil`
+    ///     default/fallback posture as `userName`.
     public init(host: String, port: UInt16, nick: String,
                 encoding: WireEncoding = .cp1252,
-                engineQueue: DispatchQueue? = nil) {
+                engineQueue: DispatchQueue? = nil,
+                userName: String? = nil, realName: String? = nil) {
         self.host = host
         self.port = NWEndpoint.Port(rawValue: port) ?? 6667
         self.requestedNick = nick
         self.encoding = encoding
+        self.userName = userName
+        self.realName = realName
         self.sessionQueue = engineQueue ?? DispatchQueue(label: "com.comicchat.ProtocolSession")
         var continuation: AsyncStream<ProtocolEvent>.Continuation!
         self.events = AsyncStream { cont in continuation = cont }
         self.eventContinuation = continuation
         self._ownNick = nick
         self.refillOwnNickBuffer()
+        self.ownUserStorage = ProtocolSession.makePersistentCString(userName, encoding: encoding)
+        self.ownRealnameStorage = ProtocolSession.makePersistentCString(realName, encoding: encoding)
     }
 
     deinit {
@@ -194,6 +216,8 @@ public final class ProtocolSession: @unchecked Sendable {
         }
         connection?.cancel()
         ownNickStorage.deallocate()
+        ownUserStorage?.deallocate()
+        ownRealnameStorage?.deallocate()
     }
 
     /// Connect the `NWConnection`, wait for it to become ready, then create
@@ -262,6 +286,21 @@ public final class ProtocolSession: @unchecked Sendable {
         cfg.resolve_user = ProtocolSession.cResolveUser
         cfg.local_host = nil
         cfg.encoding = encoding.rawValue
+        // Plan 4b Task 5 (persona plumbing): `cc_session_create` COPIES the
+        // `cc_session_config` struct (`s->cfg = *cfg`, bridge/cc_session.cpp:44)
+        // but that copy is of the `const char*` POINTER VALUES only, not the
+        // pointee bytes -- and `cc_session_login` dereferences `own_user`/
+        // `own_realname` LATER, after the probe->login handshake completes
+        // (an unbounded amount of async time after this function returns),
+        // so a transient local buffer (e.g. from `withCString`) would be
+        // long since deallocated by then. `ownUserStorage`/`ownRealnameStorage`
+        // are persistent buffers allocated once in `init` (same pattern as
+        // `ownNickStorage`/`refillOwnNickBuffer`, this type's own doc comment)
+        // and freed only in `deinit`, so the pointers below stay valid for
+        // the whole session lifetime -- covering `cc_session_login`'s
+        // documented reentrant call too (its own "REENTRANCY" doc comment).
+        cfg.own_user = ownUserStorage.map { UnsafePointer($0) }
+        cfg.own_realname = ownRealnameStorage.map { UnsafePointer($0) }
 
         cSession = withUnsafePointer(to: cfg) { cc_session_create($0) }
         receiveLoop()
@@ -1056,6 +1095,38 @@ public final class ProtocolSession: @unchecked Sendable {
     /// synchronous same-frame read contract.
     private func ownNickPointer() -> UnsafePointer<CChar> {
         UnsafePointer(ownNickStorage)
+    }
+
+    // MARK: Persona (Plan 4b Task 5) -- persistent USER-command buffers
+    //
+    // `userName`/`realName` are construction-time-only (unlike `_ownNick`,
+    // which changes on rename) -- so, unlike `ownNickStorage`, these need no
+    // "refill" call; they are allocated once in `init` and never rewritten.
+    // `nil` (not `""`) when the caller passed `nil`, so `cfg.own_user`/
+    // `.own_realname` are correctly `nil` too -- preserving
+    // `cc_session_login`'s own nullable-and-falls-back-to-nick posture
+    // (cc_session.cpp:405-406) rather than sending an empty string that
+    // would ALSO satisfy that fallback (`*s->cfg.own_user` false on an empty
+    // string) but is less honest about "caller didn't supply one".
+
+    private var ownUserStorage: UnsafeMutablePointer<CChar>?
+    private var ownRealnameStorage: UnsafeMutablePointer<CChar>?
+
+    /// Allocates a persistent, NUL-terminated buffer holding `s` encoded per
+    /// `encoding` (same manual-allocation rationale as `ownNickStorage`'s doc
+    /// comment: a `[CChar]`/`Array`'s backing store is copy-on-write and may
+    /// be reallocated by ARC/the optimizer at any time, making a pointer
+    /// obtained via `withUnsafeBufferPointer` and returned past the closure's
+    /// end undefined behavior). Returns `nil` for a `nil` input.
+    private static func makePersistentCString(_ s: String?, encoding: WireEncoding) -> UnsafeMutablePointer<CChar>? {
+        guard let s else { return nil }
+        var bytes = WireCodec.encode(s, encoding: encoding)
+        bytes.append(0)
+        let buf = UnsafeMutablePointer<CChar>.allocate(capacity: bytes.count)
+        for (i, byte) in bytes.enumerated() {
+            buf[i] = CChar(bitPattern: byte)
+        }
+        return buf
     }
 }
 

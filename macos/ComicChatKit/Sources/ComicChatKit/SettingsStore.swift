@@ -60,11 +60,91 @@ public struct SettingsStore {
         nonmutating set { defaults.set(newValue, forKey: Keys.character) }
     }
 
+    /// Plan 4b Task 5: the USER command's `<realname>` field (persona
+    /// plumbing — `ProtocolSession.init`'s new `realName:` parameter reads
+    /// this via `AppState.connect`'s `ChatConfig` build). Empty by default
+    /// (falls back to nick, matching the pre-Task-5 behavior when unset).
+    public var realName: String {
+        get { defaults.string(forKey: Keys.realName) ?? "" }
+        nonmutating set { defaults.set(newValue, forKey: Keys.realName) }
+    }
+
     // MARK: Comic
 
     public var backdrop: String {
         get { defaults.string(forKey: Keys.backdrop) ?? "field" }
         nonmutating set { defaults.set(newValue, forKey: Keys.backdrop) }
+    }
+
+    public var comicMode: Bool {
+        get {
+            guard defaults.object(forKey: Keys.comicMode) != nil else { return true }
+            return defaults.bool(forKey: Keys.comicMode)
+        }
+        nonmutating set { defaults.set(newValue, forKey: Keys.comicMode) }
+    }
+
+    // MARK: Protocol (Plan 4b Task 5)
+
+    /// Gates `ChatSessionModel.send`'s outbound cooked pose annotations: when
+    /// `false`, `send(_:mode:)` passes `annotations: nil` (peers then run
+    /// text inference — the original's ComicsData toggle semantics). The
+    /// wheel/preview still work locally either way.
+    public var sendComicsData: Bool {
+        get {
+            guard defaults.object(forKey: Keys.sendComicsData) != nil else { return true }
+            return defaults.bool(forKey: Keys.sendComicsData)
+        }
+        nonmutating set { defaults.set(newValue, forKey: Keys.sendComicsData) }
+    }
+
+    /// Wires `ChatSessionModel`'s `_acceptWhispers` seam (Task 4's internal
+    /// test-only default `true`) to a real user-facing setting.
+    public var acceptWhispers: Bool {
+        get {
+            guard defaults.object(forKey: Keys.acceptWhispers) != nil else { return true }
+            return defaults.bool(forKey: Keys.acceptWhispers)
+        }
+        nonmutating set { defaults.set(newValue, forKey: Keys.acceptWhispers) }
+    }
+
+    // MARK: Sounds (Plan 4b Task 5)
+
+    public var soundsEnabled: Bool {
+        get {
+            guard defaults.object(forKey: Keys.soundsEnabled) != nil else { return true }
+            return defaults.bool(forKey: Keys.soundsEnabled)
+        }
+        nonmutating set { defaults.set(newValue, forKey: Keys.soundsEnabled) }
+    }
+
+    /// Default: the app's Application Support directory (per-app
+    /// subdirectory keyed by the bundle identifier, falling back to
+    /// "ComicChat" for a non-bundled/test context where
+    /// `Bundle.main.bundleIdentifier` is nil) — never empty, matching the
+    /// brief's "default = the App Support path" requirement.
+    public var soundsFolder: String {
+        get { defaults.string(forKey: Keys.soundsFolder) ?? Self.defaultSoundsFolder }
+        nonmutating set { defaults.set(newValue, forKey: Keys.soundsFolder) }
+    }
+
+    private static var defaultSoundsFolder: String {
+        let fm = FileManager.default
+        let base = (try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                appropriateFor: nil, create: false))
+            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
+        let appDir = Bundle.main.bundleIdentifier ?? "ComicChat"
+        return base.appendingPathComponent(appDir).appendingPathComponent("Sounds").path
+    }
+
+    // MARK: Art (Plan 4b Task 5)
+
+    public var autoDownloadAvatars: Bool {
+        get {
+            guard defaults.object(forKey: Keys.autoDownloadAvatars) != nil else { return true }
+            return defaults.bool(forKey: Keys.autoDownloadAvatars)
+        }
+        nonmutating set { defaults.set(newValue, forKey: Keys.autoDownloadAvatars) }
     }
 
     private enum Keys {
@@ -74,6 +154,13 @@ public struct SettingsStore {
         static let encoding = "connect.encoding"
         static let nick = "persona.nick"
         static let character = "persona.character"
+        static let realName = "persona.realName"
         static let backdrop = "comic.backdrop"
+        static let comicMode = "view.comicMode"
+        static let sendComicsData = "protocol.sendComicsData"
+        static let acceptWhispers = "protocol.acceptWhispers"
+        static let soundsEnabled = "sounds.enabled"
+        static let soundsFolder = "sounds.folder"
+        static let autoDownloadAvatars = "art.autoDownloadAvatars"
     }
 }

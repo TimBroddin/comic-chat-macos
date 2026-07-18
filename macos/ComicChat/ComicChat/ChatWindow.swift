@@ -81,6 +81,38 @@ struct ChatWindow: View {
                     openWindow(id: "whispers")
                 }
             }
+            // Task 5's visual-artifact demo hook: `--switch-character <name>`
+            // waits for the replay-fixture connect to actually be JOINED
+            // (`appState.members` non-empty — `model != nil` alone is not
+            // sufficient: `AppState.connect()` assigns `model` BEFORE
+            // `await m.start()` completes, so polling only for `model != nil`
+            // could fire before the strip exists or the fixture's login/join
+            // handshake has even finished, same "poll actual state, not just
+            // object existence" lesson `--open-whisper`'s own wait already
+            // follows). Once joined, drives the SAME
+            // `ChatSessionModel.changeCharacter` call the Character picker's
+            // `select(_:)` calls, sends one more line so a new (post-switch)
+            // panel actually renders, and waits for the strip image to
+            // update — again because UI automation (System Events/AX) can't
+            // drive the Settings scene's picker clicks headlessly in this
+            // sandbox (same limitation the Task 3/4 reports document).
+            if let nameIndex = ProcessInfo.processInfo.arguments.firstIndex(of: "--switch-character"),
+               nameIndex + 1 < ProcessInfo.processInfo.arguments.count {
+                let name = ProcessInfo.processInfo.arguments[nameIndex + 1]
+                for _ in 0..<200 {
+                    if appState.model != nil && !appState.members.isEmpty { break }
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                if let model = appState.model, !appState.members.isEmpty {
+                    let panelsBefore = model.panelCount
+                    model.changeCharacter(name)
+                    try? await model.send("look, a new character")
+                    for _ in 0..<200 {
+                        if model.panelCount > panelsBefore { break }
+                        try? await Task.sleep(for: .milliseconds(50))
+                    }
+                }
+            }
         }
     }
 }

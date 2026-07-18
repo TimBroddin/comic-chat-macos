@@ -77,6 +77,13 @@ public final class AppState {
     /// are torn down if this reference drops (Task 12's offline demo hook).
     private var replayServer: FixtureReplayServer?
 
+    /// The app bundle's comicart directory — also read by the Settings
+    /// scene's character/backdrop pickers (Task 5), so exposed here rather
+    /// than each call site re-deriving `Bundle.main.resourceURL`.
+    public var artDir: String {
+        Bundle.main.resourceURL!.appendingPathComponent("comicart").path
+    }
+
     public func connect() async {
         // Final review (Plan 4a): tear down any existing session FIRST. Without
         // this, ⌘N -> Connect while already connected builds a SECOND
@@ -87,12 +94,25 @@ public final class AppState {
         // active session).
         disconnect()
 
-        let artDir = Bundle.main.resourceURL!.appendingPathComponent("comicart").path
         var cfg = ChatConfig(host: settings.server, port: UInt16(exactly: settings.port) ?? 6667,
                              nick: settings.nick, room: settings.room,
                              encoding: settings.encoding,
                              characterName: settings.character,
-                             backdropName: settings.backdrop, artDir: artDir)
+                             backdropName: settings.backdrop, artDir: artDir,
+                             // Plan 4b Task 5: persona plumbing + protocol
+                             // toggles, read straight from settings. `realName`
+                             // empty -> `nil` (preserves ProtocolSession's own
+                             // nick-fallback default rather than sending an
+                             // explicit empty string); `userName` is not yet a
+                             // distinct settings field (no separate "USER
+                             // <user>" UI control exists — the persona tab
+                             // exposes nick + real name only, matching the
+                             // brief's Persona-tab field list), so it stays
+                             // `nil` (own_user falls back to nick, same as
+                             // before this task).
+                             realName: settings.realName.isEmpty ? nil : settings.realName,
+                             sendComicsData: settings.sendComicsData,
+                             acceptWhispers: settings.acceptWhispers)
 
         // Offline demo hook (Task 12): `--replay-fixture <path>` starts a
         // FixtureReplayServer over the given capture-shaped .jsonl and
