@@ -152,6 +152,31 @@ void CUnitPanelPage::DestroyFonts() {
 	m_fiTitle = NULL;
 	m_fiShout = NULL;
 
+	// Plan 4a Task 12 fix (dangling-font-pointer UB, found via the live app's
+	// setViewport reflow path -- not exercised by any prior test):
+	// ccContext().metricsDC() is ONE CDC cached and reused for the whole
+	// process (engine_context.h's own doc comment), NOT per-strip. SetFonts/
+	// UpdateTitleFonts above call pDc->SelectObject(m_fontBalloon/m_fontTitle)
+	// during measurement and restore the PREVIOUSLY selected font afterward --
+	// but on a strip's SECOND (and later) creation, that "previously selected
+	// font" is whatever the metrics DC's curFont_ was left at by the END of
+	// the PRIOR strip's life, i.e. a CFont this function is about to delete
+	// below. SetFonts's own SelectObject/restore dance then writes that STALE
+	// pointer right back into curFont_ (it round-trips "old" through
+	// SelectObject without knowing the old font is about to be freed), so by
+	// the time DestroyFonts's delete loop runs, the metrics DC may already be
+	// holding a dangling CFont* with nothing left to deselect it -- the very
+	// next unrelated measurement (WidestWord/GetFormattedTextExtent, via
+	// GetCurrentFont()) then reads freed memory (observed: garbage
+	// LOGFONT-equivalent height/face feeding CoreTextMetrics.measure, which
+	// trapped converting an astronomical width Double to Int32). Deselecting
+	// back to null HERE, before the delete loop, closes that window: whatever
+	// stale pointer the metrics DC held is dropped before the object behind it
+	// is freed, and CDC::currentFontSpec() already treats a null curFont_ as
+	// "use the default spec" (mfc_compat.h), so this is safe even if nothing
+	// re-selects a font before the next read.
+	ccContext().metricsDC()->SelectObject((CFont*)NULL);
+
 	POSITION pos = m_fonts.GetHeadPosition();
 	while (pos) {
 		CFont *font = (CFont *) m_fonts.GetNext(pos);
