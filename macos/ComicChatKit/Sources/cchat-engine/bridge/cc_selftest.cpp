@@ -3617,6 +3617,27 @@ static int cc_selftest_event_union() {
         CC_CHECK(std::string(cap.last.u.user_quit.reason) == "quit: pc off");
     }
     {
+        cc_proto_event ev{}; ev.type = CC_EV_KICKED; ev.room_token = 7;
+        ev.u.kicked.kicker = "Carl"; ev.u.kicked.kickee = "Bob";
+        ev.u.kicked.reason = "spamming"; ev.u.kicked.channel = "#comicrig";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_KICKED);
+        CC_CHECK(std::string(cap.last.u.kicked.kicker) == "Carl");
+        CC_CHECK(std::string(cap.last.u.kicked.kickee) == "Bob");
+        CC_CHECK(std::string(cap.last.u.kicked.reason) == "spamming");
+        CC_CHECK(std::string(cap.last.u.kicked.channel) == "#comicrig");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_INVITED; ev.room_token = 7;
+        ev.u.invited.by = "Carl"; ev.u.invited.ident = "carl@host";
+        ev.u.invited.channel = "#comicrig";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_INVITED);
+        CC_CHECK(std::string(cap.last.u.invited.by) == "Carl");
+        CC_CHECK(std::string(cap.last.u.invited.ident) == "carl@host");
+        CC_CHECK(std::string(cap.last.u.invited.channel) == "#comicrig");
+    }
+    {
         cc_proto_event ev{}; ev.type = CC_EV_NAMES; ev.room_token = 7;
         ev.u.names.channel = "#comicrig"; ev.u.names.nicks = "Anna Bob Carl";
         fire(ev);

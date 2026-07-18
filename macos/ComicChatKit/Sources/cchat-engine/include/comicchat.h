@@ -332,6 +332,7 @@ typedef enum cc_proto_event_type {
     /* membership */
     CC_EV_SELF_JOINED, CC_EV_SELF_PARTED,
     CC_EV_USER_JOINED, CC_EV_USER_PARTED, CC_EV_USER_QUIT,
+    CC_EV_KICKED, CC_EV_INVITED,
     CC_EV_NAMES, CC_EV_END_OF_NAMES,
     CC_EV_NICK_CHANGED,
     /* messages (the core comic events) */
@@ -367,6 +368,10 @@ typedef struct cc_proto_event {
         struct { const char* nick; const char* ident; } user_joined;   /* CC_EV_USER_JOINED */
         struct { const char* nick; const char* reason; } user_parted;  /* CC_EV_USER_PARTED */
         struct { const char* nick; const char* reason; } user_quit;    /* CC_EV_USER_QUIT */
+        struct { const char* kicker; const char* kickee; const char* reason;
+                 const char* channel; } kicked;                        /* CC_EV_KICKED */
+        struct { const char* by; const char* ident;
+                 const char* channel; } invited;                       /* CC_EV_INVITED */
         struct { const char* channel; const char* nicks; } names;      /* CC_EV_NAMES (space-joined) */
         struct { const char* channel; } end_of_names;                  /* CC_EV_END_OF_NAMES */
         struct { const char* old_nick; const char* new_nick;

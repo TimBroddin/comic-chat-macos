@@ -757,15 +757,27 @@ static void ccHandleCommand(CCSession& sess, char *szLine, PIRCPARSE pParse)
 
 		case cmdidInvite:
 		{
-			// Original: OnInvite (popup). R18: no INVITE event variant exists in
-			// the union -- the closest is a status line carrying who invited us
-			// where. Emit CC_EV_STATUS_LINE with the raw line so the invite is
-			// surfaced; Swift can present it. (Reported as a union-gap note; the
-			// brief says escalate if a needed variant is missing, but INVITE is
-			// non-core and STATUS_LINE is the union's explicit catch-all for
-			// "surface this text" -- see report §Deviations.)
+			// Original: OnInvite (popup). R18 refinement (review fix): the union
+			// now carries CC_EV_INVITED(by, ident, channel) -- emit that instead
+			// of the CC_EV_STATUS_LINE catch-all so the inviter and invited room
+			// aren't collapsed into opaque text. `by` is the message-prefix nick
+			// (pParse->nick); `ident` is that prefix's user@host if the wire gave
+			// one (same pattern as JOIN/PRIVMSG's strIdent), else "". `channel`
+			// is the room named in the INVITE's trailing param (pParse->lastString).
 			if (pParse->lastString) {
-				ccEmitStatus(szLine);
+				CString strIdent;
+				if (*pParse->user && *pParse->machine) {
+					strIdent = pParse->user;
+					strIdent += "@";
+					strIdent += pParse->machine;
+				}
+				cc_proto_event ev; memset(&ev, 0, sizeof(ev));
+				ev.type = CC_EV_INVITED;
+				ev.room_token = ccSessionRoomTokenForChannel(sess, pParse->lastString);
+				ev.u.invited.by = pParse->nick;
+				ev.u.invited.ident = strIdent;
+				ev.u.invited.channel = pParse->lastString;
+				ccEmitProtoEvent(&ev);
 			}
 			break;
 		}
@@ -824,21 +836,23 @@ static void ccHandleCommand(CCSession& sess, char *szLine, PIRCPARSE pParse)
 
 		case cmdidKick:
 		{
-			// Original: OnKick (comic action panel + part). R18: no KICK variant
-			// in the union. Emit CC_EV_USER_PARTED(kickee, reason) -- a kick IS a
-			// forced part; the reason carries the kick text. (Union-gap note in
-			// report; the kicker nick is in pParse->nick, surfaced via a status
-			// line as well so it isn't lost.)
+			// Original: OnKick (protsupp.cpp:1922 -- renders the KICKER as a
+			// comic actor performing the kick, with the kick reason, then parts
+			// the kickee). R18 refinement (review fix): the union now carries
+			// CC_EV_KICKED(kicker, kickee, reason, channel) -- emit that single
+			// event instead of CC_EV_USER_PARTED+CC_EV_STATUS_LINE, since a kick
+			// is NOT a voluntary part and the prior routing lost the kicker.
 			if (pParse->lastString && pParse->nArgs >= 3)
 			{
 				ccCSInString(&pParse->lastString, pParse->args[1]);
 				cc_proto_event ev; memset(&ev, 0, sizeof(ev));
-				ev.type = CC_EV_USER_PARTED;
+				ev.type = CC_EV_KICKED;
 				ev.room_token = ccSessionRoomTokenForChannel(sess, pParse->args[1]);
-				ev.u.user_parted.nick = pParse->args[2];      // kickee
-				ev.u.user_parted.reason = pParse->lastString; // kick reason
+				ev.u.kicked.kicker = pParse->nick;            // message prefix nick
+				ev.u.kicked.kickee = pParse->args[2];         // kicked nick arg
+				ev.u.kicked.reason = pParse->lastString;      // kick reason (trailing, may be empty)
+				ev.u.kicked.channel = pParse->args[1];
 				ccEmitProtoEvent(&ev);
-				ccEmitStatus(szLine);  // preserve the kicker/context line
 			}
 			break;
 		}
