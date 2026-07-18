@@ -149,6 +149,52 @@ extension EngineGlobalStateSelfTests {
         }
     }
 
+    // (c2) Plan 4a Task 6: an `.appearsAs` for an EXISTING participant now
+    // switches that participant's avatar (cc_strip_set_participant_avatar),
+    // rather than the old documented no-op. Sequence: .userJoined("Win")
+    // (creates the participant with the resolver's default avatar) + one
+    // .text (so a panel is laid out with the OLD avatar), then .appearsAs
+    // switching "Win" to "armando", then another .text. Asserts no throw,
+    // announcedAvatarNames reflects the switch, and the strip still composes
+    // to a non-empty render afterward (proving the switch didn't corrupt the
+    // strip/registry).
+    @Test func appearsAsSwitchesExistingParticipantAvatar() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            // comicartDir set to the Fixtures directory so the "armando"
+            // .appearsAs below resolves to the bundled armando.avb fixture
+            // (added alongside anna.avb for this task) rather than a bare
+            // "armando.avb" relative to the test process's CWD.
+            let fixturesDir = (fixture("anna.avb") as NSString).deletingLastPathComponent
+            let resolver = ProtocolStripBridge.AvatarResolver(
+                comicartDir: fixturesDir, defaultOrder: [fixture("anna.avb")])
+            let bridge = try ProtocolStripBridge(resolver: resolver)
+
+            try bridge.apply([
+                .userJoined(nick: "Win", ident: "win@host"),
+                .text(nick: "Win", ident: "win@host", target: "#comicrig",
+                      text: "before the switch", kind: 1, annotations: nil),
+            ])
+            #expect(bridge.participantOrder == ["Win"])
+
+            try bridge.apply(.appearsAs(nick: "Win", avatarName: "armando", url: ""))
+            #expect(bridge.announcedAvatarNames["Win"] == "armando")
+
+            try bridge.apply([
+                .text(nick: "Win", ident: "win@host", target: "#comicrig",
+                      text: "after the switch", kind: 1, annotations: nil),
+            ])
+
+            let recorder = RecordingCanvas()
+            try bridge.compose(onto: recorder)
+            #expect(!recorder.log.isEmpty)
+            #expect(recorder.log.contains { $0.hasPrefix("image ") })
+        }
+    }
+
     // (d) THE EXIT-MILESTONE PNG: the same annotated event stream composited
     // through CGCanvas into real pixels -- the wire-fed equivalent of Plan 2's
     // stripPNG exit proof (StripTests.swift). Written to

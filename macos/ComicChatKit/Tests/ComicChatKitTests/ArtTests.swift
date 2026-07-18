@@ -22,6 +22,13 @@ func fixture(_ name: String) -> String {
     #expect(alphas.contains(255))
 }
 
+@Test func avatarIconImageDecodes() throws {
+    let anna = try AvatarFile(path: fixture("anna.avb"))
+    let img = try anna.iconImage()
+    #expect(img.width > 0 && img.height > 0)
+    #expect(img.rgba.count == img.width * img.height * 4)
+}
+
 @Test func backdropOpensAndDecodes() throws {
     let field = try BackdropFile(path: fixture("field.bgb"))
     let img = try field.image()

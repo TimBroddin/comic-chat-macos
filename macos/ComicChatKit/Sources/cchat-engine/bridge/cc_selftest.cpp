@@ -2672,6 +2672,77 @@ extern "C" int32_t cc_run_panel_geometry_selftest(const char* avatarPath) {
     return g_failures;
 }
 
+// --- Plan 4a Task 6: avatar API (cc_avatar_icon_image + ------------------
+//     cc_strip_set_participant_avatar) ---------------------------------------
+// (a) cc_avatar_icon_image: a standalone cc_avatar (bridge_art.cpp) decoded via
+//     the icon pose (CAvatarX::GetIconPose(), avatar.h:251 -- the public
+//     wrapper around the protected GetPoseFromID(m_icon); bridge code cannot
+//     call the protected overload directly, so cc_avatar_icon_image's
+//     implementation goes through GetIconPose() for the identical result).
+// (b) cc_strip_set_participant_avatar: one strip, one participant loaded from
+//     avatarPath, one line; switch the participant to otherAvatarPath
+//     mid-strip; one more line; compose to a recording canvas and check the
+//     ops stream is still valid (>=2 panels, compose rc 0). Also: a bad
+//     participant id must be rejected (nonzero).
+static int cc_selftest_avatar_api(const char* avatarPath, const char* otherAvatarPath) {
+    int startFailures = g_failures;
+
+    // --- (a) cc_avatar_icon_image on a standalone cc_avatar.
+    {
+        cc_avatar* av = cc_avatar_open(avatarPath);
+        CC_CHECK(av != NULL);
+        if (av) {
+            cc_image img = {};
+            CC_CHECK(cc_avatar_icon_image(av, &img) == 0);
+            CC_CHECK(img.width > 0);
+            CC_CHECK(img.height > 0);
+            CC_CHECK(img.rgba != NULL);
+            cc_image_free(&img);
+            cc_avatar_close(av);
+        }
+    }
+
+    // --- (b) cc_strip_set_participant_avatar mid-strip.
+    static CCRecordingCanvas avatarApiMetrics;
+    cc_set_metrics_canvas(avatarApiMetrics.handle());
+
+    cc_strip* s = cc_strip_create();
+    CC_CHECK(s != NULL);
+    if (!s) return g_failures - startFailures;
+
+    int32_t p = cc_strip_add_participant(s, "Anna", avatarPath);
+    CC_CHECK(p == 1);
+    if (p >= 0) {
+        CC_CHECK(cc_strip_add_line(s, p, "Before the switch", CC_MODE_SAY, NULL, 0) == 0);
+
+        // Bad participant id -> nonzero, and must not disturb the real one.
+        CC_CHECK(cc_strip_set_participant_avatar(s, 999, otherAvatarPath) != 0);
+
+        CC_CHECK(cc_strip_set_participant_avatar(s, p, otherAvatarPath) == 0);
+        CC_CHECK(cc_strip_add_line(s, p, "After the switch", CC_MODE_SAY, NULL, 0) == 0);
+
+        int32_t panelCount = cc_strip_panel_count(s);
+        CC_CHECK(panelCount >= 2);
+
+        CCRecordingCanvas compose;
+        CC_CHECK(cc_strip_compose(s, compose.handle()) == 0);
+        CC_CHECK(!compose.log().empty());
+    }
+
+    cc_strip_destroy(s);
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift wrapper, which passes the anna.avb +
+// armando.avb fixture paths. Runs standalone (resets g_failures).
+extern "C" int32_t cc_run_avatar_api_selftest(const char* avatarPath,
+                                              const char* otherAvatarPath) {
+    g_failures = 0;
+    if (avatarPath == NULL || otherAvatarPath == NULL) return 1;
+    cc_selftest_avatar_api(avatarPath, otherAvatarPath);
+    return g_failures;
+}
+
 // --- Plan 3 Task 1: cc_session C boundary skeleton --------------------------
 // No parsing yet: creates a cc_session, feeds it a byte string (accumulates
 // into an internal buffer only), then drives the test-only echo hook and

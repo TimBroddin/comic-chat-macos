@@ -98,10 +98,13 @@ public final class ProtocolStripBridge {
 
     /// nick -> assigned cc_strip participant id (>=1).
     public private(set) var participantIDs: [String: Int32] = [:]
-    /// nick -> avatar name from an `.appearsAs` seen BEFORE that nick became a
-    /// participant (an `.appearsAs` arriving AFTER is recorded here too but
-    /// has no effect — cc_strip has no "change avatar" call; documented
-    /// limitation, see the class doc comment on `appearsAs` handling below).
+    /// nick -> most recently announced avatar name from an `.appearsAs`,
+    /// whether seen before OR after that nick became a participant. An
+    /// announcement arriving before participant creation is picked up by
+    /// `ensureParticipant`'s initial `addParticipant`; one arriving after
+    /// immediately switches the existing participant's avatar via
+    /// `Strip.setParticipantAvatar` (Plan 4a Task 6) — existing panels keep
+    /// the old avatar (no retro-recompose), only later lines get the new one.
     public private(set) var announcedAvatarNames: [String: String] = [:]
     /// Every participant nick this bridge has assigned an id for, in the
     /// order they were first added — exposed for tests/observability and for
@@ -145,11 +148,17 @@ public final class ProtocolStripBridge {
             try ensureParticipant(nick)
 
         case .appearsAs(let nick, let avatarName, _):
-            // Record for a not-yet-created participant; a no-op (documented)
-            // if the participant already exists, since cc_strip has no
-            // "change avatar" entry point.
-            if participantIDs[nick] == nil {
-                announcedAvatarNames[nick] = avatarName
+            // Plan 4a Task 6: cc_strip now HAS a "change avatar" entry point
+            // (cc_strip_set_participant_avatar), so an EXISTING participant's
+            // avatar is switched immediately -- resolved through the same
+            // `resolver` ensureParticipant uses, so an explicit avatarName
+            // resolves the same way it would have if seen before creation. A
+            // not-yet-created participant still just stashes the name (there
+            // is no id to switch yet); ensureParticipant picks it up as usual.
+            announcedAvatarNames[nick] = avatarName
+            if let id = participantIDs[nick] {
+                let avatarPath = resolver.resolve(avatarName: avatarName)
+                try strip.setParticipantAvatar(id, avbPath: avatarPath)
             }
 
         case .text(let nick, _, _, let text, let kind, let annotations):

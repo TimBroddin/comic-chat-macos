@@ -48,6 +48,16 @@ int32_t cc_run_strip_selftest(const char* avatar_path, const char* backdrop_path
  * GetAvatar(uID)->m_body unconditionally). */
 int32_t cc_run_panel_geometry_selftest(const char* avatar_path);
 
+/* Plan 4a Task 6: avatar API selftest (cc_avatar_icon_image +
+ * cc_strip_set_participant_avatar). Opens avatar_path as a standalone
+ * cc_avatar and checks cc_avatar_icon_image; separately drives a cc_strip with
+ * one participant loaded from avatar_path, switches that participant's avatar
+ * to other_avatar_path via cc_strip_set_participant_avatar mid-strip (with a
+ * line added on each side), and composes to a recording canvas. Returns 0 on
+ * success (failure count otherwise). Kept out of cc_run_selftests because it
+ * needs two fixture paths. */
+int32_t cc_run_avatar_api_selftest(const char* avatar_path, const char* other_avatar_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env
@@ -79,6 +89,10 @@ const char* cc_avatar_name(const cc_avatar* av); /* never NULL; "" if unknown */
 int32_t     cc_avatar_pose_count(const cc_avatar* av);
 const char* cc_avatar_pose_name(const cc_avatar* av, int32_t idx); /* never NULL */
 int32_t     cc_avatar_pose_image(const cc_avatar* av, int32_t idx, cc_image* out); /* 0 = ok */
+
+/* The member-list/picker icon pose (excluded from the pose API by design --
+ * Plan 1 handover). NULL mask plane decodes opaque. 0 = ok. */
+int32_t     cc_avatar_icon_image(const cc_avatar* av, cc_image* out);
 
 /* An opened backdrop file (.bgb or .bmp). Owns the underlying parsed
  * CChatBackdrop object for the lifetime between cc_backdrop_open and
@@ -255,6 +269,12 @@ void      cc_strip_destroy(cc_strip* s);            /* no-op if NULL */
  * (>= 1) on success, -1 on failure. */
 int32_t   cc_strip_add_participant(cc_strip* s, const char* nick,
                                    const char* avb_path);   /* >=0 id, -1 fail */
+
+/* Load the .avb at avb_path, register it, re-point participant's session user
+ * at it. Existing panels keep the old avatar (original ChangeAvatarEntry
+ * behavior); subsequent lines render with the new one. 0 = ok. */
+int32_t   cc_strip_set_participant_avatar(cc_strip* s, int32_t participant,
+                                          const char* avb_path);
 
 /* Load the .bgb at bgb_path and register it so every subsequently-created panel
  * inherits it (via ccContext().session.backdropID, read by CPanel::CPanel).

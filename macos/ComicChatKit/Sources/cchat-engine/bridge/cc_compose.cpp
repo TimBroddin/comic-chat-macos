@@ -222,6 +222,51 @@ extern "C" int32_t cc_strip_add_participant(cc_strip* s, const char* nick,
     }
 }
 
+// Plan 4a Task 6: switch an EXISTING participant to a different avatar,
+// mid-strip. Mirrors cc_strip_add_participant's load half above verbatim
+// (open via CAvatarFileStream -> LoadAvatar -> IndexAvatar, registering the
+// new avatar into avatars[] under its own fresh id so GetAvatar(newID) finds
+// it) but then, instead of addUser'ing a NEW session user, re-points the
+// PARTICIPANT'S EXISTING CUserInfo at the new avatar -- exactly the original
+// SetUserAvatarID two-liner (userinfo.cpp:38-41):
+//   pui->SetAvatarID(avID); GetAvatar(avID)->m_userInfo = pui;
+// i.e. the session user (and therefore the participant id the caller already
+// has) is unchanged; only which CAvatarX it points at moves.
+//
+// NO RETRO-RECOMPOSE (binding, matches the original): ChangeAvatarEntry::
+// Execute (histent.cpp:368-413) calls this exact SetUserAvatarID pairing and
+// nothing else -- it does NOT walk back through history and re-render
+// existing panels/bodies with the new avatar. Panels already laid out (their
+// CBody snapshots were built from the OLD CAvatarX at AddLine time) keep
+// rendering the old avatar; only lines added AFTER this call (whose
+// CPanel::FetchSpeaker does a fresh GetAvatar(uID) lookup, panel.cpp:667-668)
+// pick up the new one. This function only rewires the registry/session
+// pointers -- it deliberately does not touch s->page or any existing panel.
+extern "C" int32_t cc_strip_set_participant_avatar(cc_strip* s, int32_t participant,
+                                                   const char* avb_path) {
+    if (!s || !avb_path || participant <= 0) return -1;
+
+    CUserInfo* pui = ccContext().session.lookupUser((UINT)participant);
+    if (!pui) return -1;   // unknown participant id
+
+    try {
+        CAvatarFileStream* pStream = new CAvatarFileStream(avb_path);
+        CAvatarX* av = CAvatarX::LoadAvatar(pStream);
+        if (!av) { delete pStream; return -1; }
+        av->SetStream(pStream);        // avatar now owns the stream (Plan 1 pattern)
+        av->IndexAvatar();             // assigns m_avatarID + registers into avatars[]
+
+        UINT newID = av->m_avatarID;
+        pui->SetAvatarID((USHORT)newID);   // SetUserAvatarID's first line
+        av->m_userInfo = pui;              // SetUserAvatarID's second line
+
+        s->avatars.push_back(av);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 // Register the backdrop so every subsequently-created panel inherits it.
 // Resolution story (all lifted, live code -- no un-lifted registry, so no
 // R12/R17 escalation): CPanel::CPanel() reads ccContext().session.backdropID

@@ -70,4 +70,15 @@ struct EngineGlobalStateSelfTests {
         let avatar = fixture("anna.avb")
         #expect(cc_run_panel_geometry_selftest(avatar) == 0)
     }
+
+    // Plan 4a Task 6: the avatar API (cc_avatar_icon_image +
+    // cc_strip_set_participant_avatar). Checks the icon-pose decode on a
+    // standalone cc_avatar, then a strip with one participant whose avatar is
+    // switched mid-strip (bad participant id rejected, good one succeeds,
+    // panel count grows, and the strip still composes cleanly afterward).
+    @Test func avatarApiSelfTestPasses() {
+        let avatar = fixture("anna.avb")
+        let other = fixture("armando.avb")
+        #expect(cc_run_avatar_api_selftest(avatar, other) == 0)
+    }
 }

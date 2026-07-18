@@ -84,6 +84,19 @@ public final class Strip {
         return id
     }
 
+    /// Switch an EXISTING participant (a participant id from `addParticipant`)
+    /// to a different avatar, loaded fresh from `avbPath`. Mirrors the
+    /// original's `ChangeAvatarEntry`/`SetUserAvatarID` behavior: panels already
+    /// laid out keep rendering the OLD avatar (no retro-recompose); only
+    /// subsequent `addLine`/`addLineCooked` calls for this participant render
+    /// with the new one.
+    public func setParticipantAvatar(_ participant: Int32, avbPath: String) throws {
+        let h = try requireHandle()
+        guard cc_strip_set_participant_avatar(h, participant, avbPath) == 0 else {
+            throw StripError(message: "setParticipantAvatar(\(participant), \(avbPath)) failed")
+        }
+    }
+
     /// Load the `.bgb` at `bgbPath` and register it so every subsequently
     /// created panel inherits it. Call before `addLine` for the backdrop to
     /// appear in composed panels.

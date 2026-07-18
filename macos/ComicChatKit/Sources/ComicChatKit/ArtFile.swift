@@ -62,6 +62,18 @@ public final class AvatarFile {
         defer { cc_image_free(&image) }
         return ArtImage(image)
     }
+
+    /// The member-list/picker icon pose (excluded from `poseCount`/`poseImage`
+    /// by design — see this file's class doc comment).
+    public func iconImage() throws -> ArtImage {
+        var image = cc_image()
+        let rc = cc_avatar_icon_image(handle, &image)
+        guard rc == 0 else {
+            throw ComicChatError.artLoadFailed(path: "\(name) icon")
+        }
+        defer { cc_image_free(&image) }
+        return ArtImage(image)
+    }
 }
 
 /// Wraps an opened .bgb (or .bmp) backdrop file (cc_backdrop*). Backdrops

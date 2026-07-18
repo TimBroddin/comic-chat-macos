@@ -491,6 +491,40 @@ extern "C" int32_t cc_avatar_pose_image(const cc_avatar* av, int32_t idx, cc_ima
     }
 }
 
+// Plan 4a Task 6: the member-list/picker icon pose (protsupp.cpp:592-605's
+// icon draw path in the original -- a plain opaque CreateDIBitmap+SRCCOPY
+// blit, never composited with a mask, never iterated as part of "the
+// avatar's poses" -- see cc_avatar's own doc comment above for why it's
+// excluded from cc_avatar_pose_count/pose_image). Otherwise a ~20-line clone
+// of cc_avatar_pose_image just above: same Load/decode/error-code shape,
+// fetching the pose via CAvatarX::GetIconPose() (avatar.h:251, `return
+// GetPoseFromID(m_icon)`) instead of indexing m_arrPoses directly --
+// GetPoseFromID itself is `protected`, so GetIconPose() is the public
+// equivalent bridge code can actually call. The icon pose has no mask plane;
+// decodeDibToRgba already decodes a NULL mask as fully opaque, so this needs
+// no special-casing beyond passing mask=nullptr.
+extern "C" int32_t cc_avatar_icon_image(const cc_avatar* av, cc_image* out) {
+    if (out == nullptr) return 1;
+    out->width = 0; out->height = 0; out->rgba = nullptr;
+    if (av == nullptr || av->avatar == nullptr) return 1;
+
+    try {
+        CPose* pose = av->avatar->GetIconPose();
+        if (pose == nullptr) return 3;
+        if (!pose->Load(av->avatar->m_pStream, &av->avatar->m_palette)) return 4;
+
+        CAvatarDIB* drawing = pose->GetDrawing();
+        int32_t w = 0, h = 0;
+        uint8_t* rgba = nullptr;
+        if (!decodeDibToRgba(drawing, nullptr, &w, &h, &rgba)) return 5;
+
+        out->width = w; out->height = h; out->rgba = rgba;
+        return 0;
+    } catch (...) {
+        return 6;
+    }
+}
+
 // ============================================================================
 // cc_backdrop
 
