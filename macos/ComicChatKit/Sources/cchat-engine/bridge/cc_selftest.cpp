@@ -22,6 +22,7 @@
 #include "userinfo.h"    // Plan 3 Task 3: CUserInfo (annotation codec test rig)
 #include "query.h"       // Plan 3 Task 4: CCQuery/CQueryPtrList correlation list
 #include "ircproto.h"    // Plan 3 Task 4: outbound builders (CIrcProto/CIrcSocket)
+#include "cc_session.h"  // Plan 3 Task 5a: ccEmitProtoEvent (bridge-internal dispatcher)
 #include <unistd.h>   // mkstemp, close (testShimFileApis)
 
 // EmotionToBytes/BytesToEmotion (avatario.cpp) — declared here for the
@@ -3502,6 +3503,319 @@ static int cc_selftest_outbound_say_chunking() {
     return 0;
 }
 
+// --- Plan 3 Task 5a: cc_proto_event union completeness + round-trip ---------
+// For EVERY value in cc_proto_event_type (excluding CC_EV_NONE, which carries
+// no payload and is the union's zero/inactive state), build a cc_proto_event
+// of that variant, fill one representative field (plus room_token, to prove
+// the outer struct crosses the boundary too), send it through ccEmitProtoEvent
+// to a capturing on_event, and read the type + that field back. This is the
+// completeness proof this task's brief calls for: every enum value has a
+// usable, distinct union struct, and the union round-trips through the C
+// boundary unchanged (no aliasing/overlap corrupts a sibling variant's
+// fields). ccEmitProtoEvent requires an active session (ccSession() asserts),
+// so each case runs inside a real cc_session created solely to host the
+// dispatch -- mirroring cc_selftest_session_skeleton's on_event capture, not
+// exercising cc_session_feed_bytes/parsing (that's Task 5b's job).
+namespace {
+struct CCEventCap {
+    cc_proto_event last{};
+    int count = 0;
+};
+void ccEventCapOnEvent(void* ud, const cc_proto_event* ev) {
+    CCEventCap* cap = static_cast<CCEventCap*>(ud);
+    cap->last = *ev;
+    cap->count++;
+}
+} // namespace
+
+static int cc_selftest_event_union() {
+    CCEventCap cap;
+    cc_session_config cfg = {};
+    cfg.user_data = &cap;
+    cfg.send = [](void*, const uint8_t*, size_t) {};  // never used; on_event is what's tested
+    cfg.on_event = ccEventCapOnEvent;
+    cc_session* s = cc_session_create(&cfg);
+    CC_CHECK(s != nullptr);
+    if (!s) return g_failures;
+    ccActivateSessionForTest(s);   // ccEmitProtoEvent requires an active session
+
+    auto fire = [&](const cc_proto_event& ev) {
+        cap.count = 0;
+        ccEmitProtoEvent(&ev);
+        CC_CHECK(cap.count == 1);
+    };
+
+    // connection lifecycle
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_LOGGED_IN; ev.room_token = 0;
+        ev.u.logged_in.nick = "Anna";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_LOGGED_IN);
+        CC_CHECK(std::string(cap.last.u.logged_in.nick) == "Anna");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_SERVER_CAPS;
+        ev.u.server_caps.ircx = 1; ev.u.server_caps.max_msg_len = 512;
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_SERVER_CAPS);
+        CC_CHECK(cap.last.u.server_caps.ircx == 1 && cap.last.u.server_caps.max_msg_len == 512);
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_DISCONNECTED_HINT;
+        ev.u.disconnected_hint.text = "Connection reset by peer";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_DISCONNECTED_HINT);
+        CC_CHECK(std::string(cap.last.u.disconnected_hint.text) == "Connection reset by peer");
+    }
+
+    // membership
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_SELF_JOINED; ev.room_token = 7;
+        ev.u.self_joined.channel = "#comicrig";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_SELF_JOINED && cap.last.room_token == 7);
+        CC_CHECK(std::string(cap.last.u.self_joined.channel) == "#comicrig");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_SELF_PARTED; ev.room_token = 7;
+        ev.u.self_parted.channel = "#comicrig";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_SELF_PARTED);
+        CC_CHECK(std::string(cap.last.u.self_parted.channel) == "#comicrig");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_USER_JOINED; ev.room_token = 7;
+        ev.u.user_joined.nick = "Bob"; ev.u.user_joined.ident = "bob@host";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_USER_JOINED);
+        CC_CHECK(std::string(cap.last.u.user_joined.nick) == "Bob");
+        CC_CHECK(std::string(cap.last.u.user_joined.ident) == "bob@host");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_USER_PARTED; ev.room_token = 7;
+        ev.u.user_parted.nick = "Bob"; ev.u.user_parted.reason = "bye";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_USER_PARTED);
+        CC_CHECK(std::string(cap.last.u.user_parted.nick) == "Bob");
+        CC_CHECK(std::string(cap.last.u.user_parted.reason) == "bye");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_USER_QUIT;
+        ev.u.user_quit.nick = "Bob"; ev.u.user_quit.reason = "quit: pc off";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_USER_QUIT);
+        CC_CHECK(std::string(cap.last.u.user_quit.nick) == "Bob");
+        CC_CHECK(std::string(cap.last.u.user_quit.reason) == "quit: pc off");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_NAMES; ev.room_token = 7;
+        ev.u.names.channel = "#comicrig"; ev.u.names.nicks = "Anna Bob Carl";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_NAMES);
+        CC_CHECK(std::string(cap.last.u.names.nicks) == "Anna Bob Carl");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_END_OF_NAMES; ev.room_token = 7;
+        ev.u.end_of_names.channel = "#comicrig";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_END_OF_NAMES);
+        CC_CHECK(std::string(cap.last.u.end_of_names.channel) == "#comicrig");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_NICK_CHANGED;
+        ev.u.nick_changed.old_nick = "Bob"; ev.u.nick_changed.new_nick = "Bobby";
+        ev.u.nick_changed.is_self = 0;
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_NICK_CHANGED);
+        CC_CHECK(std::string(cap.last.u.nick_changed.old_nick) == "Bob");
+        CC_CHECK(std::string(cap.last.u.nick_changed.new_nick) == "Bobby");
+        CC_CHECK(cap.last.u.nick_changed.is_self == 0);
+    }
+
+    // messages (the core comic events)
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_TEXT; ev.room_token = 7;
+        ev.u.text.nick = "Anna"; ev.u.text.ident = "anna@host";
+        ev.u.text.target = "#comicrig"; ev.u.text.text = "hello";
+        ev.u.text.kind = 1; ev.u.text.has_annotations = 1;
+        memset(&ev.u.text.annotations, 0, sizeof(ev.u.text.annotations));
+        ev.u.text.annotations.mode = 1;
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_TEXT);
+        CC_CHECK(std::string(cap.last.u.text.text) == "hello");
+        CC_CHECK(cap.last.u.text.has_annotations == 1);
+        CC_CHECK(cap.last.u.text.annotations.mode == 1);
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_DATA; ev.room_token = 7;
+        ev.u.data.nick = "Anna";
+        memset(&ev.u.data.annotations, 0, sizeof(ev.u.data.annotations));
+        ev.u.data.annotations.mode = 2;
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_DATA);
+        CC_CHECK(std::string(cap.last.u.data.nick) == "Anna");
+        CC_CHECK(cap.last.u.data.annotations.mode == 2);
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_WHISPER;
+        ev.u.whisper.nick = "Anna"; ev.u.whisper.ident = "anna@host";
+        ev.u.whisper.text = "psst"; ev.u.whisper.has_annotations = 0;
+        memset(&ev.u.whisper.annotations, 0, sizeof(ev.u.whisper.annotations));
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_WHISPER);
+        CC_CHECK(std::string(cap.last.u.whisper.text) == "psst");
+        CC_CHECK(cap.last.u.whisper.has_annotations == 0);
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_ACTION; ev.room_token = 7;
+        ev.u.action.nick = "Anna"; ev.u.action.text = "waves";
+        ev.u.action.has_annotations = 0;
+        memset(&ev.u.action.annotations, 0, sizeof(ev.u.action.annotations));
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_ACTION);
+        CC_CHECK(std::string(cap.last.u.action.text) == "waves");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_SOUND; ev.room_token = 7;
+        ev.u.sound.nick = "Anna"; ev.u.sound.file = "boing.wav"; ev.u.sound.text = "*boing*";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_SOUND);
+        CC_CHECK(std::string(cap.last.u.sound.file) == "boing.wav");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_AWAY_PEER;
+        ev.u.away_peer.nick = "Anna"; ev.u.away_peer.message = "brb";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_AWAY_PEER);
+        CC_CHECK(std::string(cap.last.u.away_peer.message) == "brb");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_APPEARS_AS;
+        ev.u.appears_as.nick = "Anna"; ev.u.appears_as.avatar_name = "anna";
+        ev.u.appears_as.url = "http://example.com/anna.avb";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_APPEARS_AS);
+        CC_CHECK(std::string(cap.last.u.appears_as.avatar_name) == "anna");
+        CC_CHECK(std::string(cap.last.u.appears_as.url) == "http://example.com/anna.avb");
+    }
+
+    // room state
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_TOPIC_CHANGED; ev.room_token = 7;
+        ev.u.topic_changed.channel = "#comicrig"; ev.u.topic_changed.topic = "Welcome!";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_TOPIC_CHANGED);
+        CC_CHECK(std::string(cap.last.u.topic_changed.topic) == "Welcome!");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_CHANNEL_MODE; ev.room_token = 7;
+        ev.u.channel_mode.channel = "#comicrig"; ev.u.channel_mode.modes = "+m";
+        ev.u.channel_mode.arg = "";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_CHANNEL_MODE);
+        CC_CHECK(std::string(cap.last.u.channel_mode.modes) == "+m");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_USER_MODE;
+        ev.u.user_mode.nick = "Anna"; ev.u.user_mode.modes = "+o";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_USER_MODE);
+        CC_CHECK(std::string(cap.last.u.user_mode.modes) == "+o");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_ROOM_PROP; ev.room_token = 7;
+        ev.u.room_prop.key = "bk"; ev.u.room_prop.value = "backdrop.bgb";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_ROOM_PROP);
+        CC_CHECK(std::string(cap.last.u.room_prop.key) == "bk");
+        CC_CHECK(std::string(cap.last.u.room_prop.value) == "backdrop.bgb");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_ROOM_LIST_BEGIN;
+        ev.u.room_list_begin.truncated = 0;
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_ROOM_LIST_BEGIN);
+        CC_CHECK(cap.last.u.room_list_begin.truncated == 0);
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_ROOM_LIST_ITEM;
+        ev.u.room_list_item.name = "#comicrig"; ev.u.room_list_item.users = 3;
+        ev.u.room_list_item.topic = "Welcome!";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_ROOM_LIST_ITEM);
+        CC_CHECK(std::string(cap.last.u.room_list_item.name) == "#comicrig");
+        CC_CHECK(cap.last.u.room_list_item.users == 3);
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_ROOM_LIST_END;
+        ev.u.room_list_end.truncated = 1;
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_ROOM_LIST_END);
+        CC_CHECK(cap.last.u.room_list_end.truncated == 1);
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_WHOIS_RESULT;
+        ev.u.whois_result.nick = "Anna"; ev.u.whois_result.user = "anna";
+        ev.u.whois_result.host = "host.example.com"; ev.u.whois_result.real = "Anna Real";
+        ev.u.whois_result.purpose = 0;
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_WHOIS_RESULT);
+        CC_CHECK(std::string(cap.last.u.whois_result.real) == "Anna Real");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_WHO_RESULT; ev.room_token = 7;
+        ev.u.who_result.nick = "Anna"; ev.u.who_result.user = "anna";
+        ev.u.who_result.host = "host.example.com"; ev.u.who_result.channel = "#comicrig";
+        ev.u.who_result.purpose = 0;
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_WHO_RESULT);
+        CC_CHECK(std::string(cap.last.u.who_result.channel) == "#comicrig");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_MOTD;
+        ev.u.motd.luser = "1 user"; ev.u.motd.motd = "Welcome to comicrig";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_MOTD);
+        CC_CHECK(std::string(cap.last.u.motd.motd) == "Welcome to comicrig");
+    }
+
+    // errors & prompts
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_ERROR;
+        ev.u.error.code = 1; ev.u.error.text = "generic failure";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_ERROR);
+        CC_CHECK(cap.last.u.error.code == 1);
+        CC_CHECK(std::string(cap.last.u.error.text) == "generic failure");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_NICK_REJECTED;
+        ev.u.nick_rejected.kind = 433; ev.u.nick_rejected.bad_nick = "Anna";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_NICK_REJECTED);
+        CC_CHECK(cap.last.u.nick_rejected.kind == 433);
+        CC_CHECK(std::string(cap.last.u.nick_rejected.bad_nick) == "Anna");
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_AUTH_UNSUPPORTED;
+        ev.u.auth_unsupported.dummy = 1;
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_AUTH_UNSUPPORTED);
+        CC_CHECK(cap.last.u.auth_unsupported.dummy == 1);
+    }
+    {
+        cc_proto_event ev{}; ev.type = CC_EV_STATUS_LINE;
+        ev.u.status_line.text = "372 :- some status text";
+        fire(ev);
+        CC_CHECK(cap.last.type == CC_EV_STATUS_LINE);
+        CC_CHECK(std::string(cap.last.u.status_line.text) == "372 :- some status text");
+    }
+
+    ccDeactivateSessionForTest();
+    cc_session_destroy(s);
+    return 0;
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -3549,5 +3863,6 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_outbound_join_say();            // Plan 3 Task 4: outbound byte-compare
     cc_selftest_outbound_ircx_probe_timer();    // Plan 3 Task 4: MODE ISIRCX + timer request
     cc_selftest_outbound_say_chunking();        // Plan 3 Task 4: bChatSendToTarget multi-chunk path
+    cc_selftest_event_union();                  // Plan 3 Task 5a: cc_proto_event union completeness
     return g_failures;
 }

@@ -1,13 +1,6 @@
 #include "cc_session.h"
 
-#ifndef CC_PROTO_EVENT_DEFINED
-// Temporary forward declaration (Task 1): the real union lands in Task 5a.
-// This lets cc_session.cpp compile ahead of that definition; Task 5a removes
-// this block.
-struct cc_proto_event { int32_t type; };
-#endif
-
-#include "comicchat.h"     // cc_proto_event (Task 5 fills it; Task 1 forward-uses type=0)
+#include "comicchat.h"     // cc_proto_event (real union + enum, Plan 3 Task 5a)
 #include "defines.h"       // BM_*/CGESTUREPREFIX/CEXPRESSIONPREFIX/CMODEPREFIX (Plan 3 Task 4)
 #include "protsupp.h"      // IndexToByte (Plan 3 Task 4 outbound wiring)
 #include <cassert>
@@ -20,6 +13,15 @@ CCSession* ccSession() { assert(g_session && "no active cc_session"); return g_s
 void ccEmitProtoEvent(const cc_proto_event* ev) {
     CCSession* s = ccSession();
     if (s->cfg.on_event) s->cfg.on_event(s->cfg.user_data, ev);
+}
+
+void ccActivateSessionForTest(cc_session* h) {
+    CCSession* s = reinterpret_cast<CCSession*>(h);
+    if (!s) return;
+    g_session = s;
+}
+void ccDeactivateSessionForTest() {
+    g_session = nullptr;
 }
 
 cc_session* cc_session_create(const cc_session_config* cfg) {

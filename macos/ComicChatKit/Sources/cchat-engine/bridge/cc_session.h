@@ -61,4 +61,15 @@ CCSession* ccSession();
 // cc_session.cpp; declared here so lifted files can call it.
 void ccEmitProtoEvent(const struct cc_proto_event* ev);
 
+// Test-only activation hook (Plan 3 Task 5a): every public cc_session_* entry
+// point activates g_session on entry and clears it on exit (see
+// cc_session.cpp), but ccEmitProtoEvent has no public entry point of its own
+// yet (Task 5b's parser will call it from inside an already-activated
+// context). The event-union completeness selftest calls ccEmitProtoEvent
+// directly, so it needs the same activate/deactivate bracketing without a
+// parse to hang it on. no-op if h is NULL, same convention as the public
+// cc_session_* entry points.
+void ccActivateSessionForTest(cc_session* h);
+void ccDeactivateSessionForTest();
+
 #endif

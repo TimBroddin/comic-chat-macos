@@ -315,6 +315,98 @@ typedef struct cc_annotations {
     int32_t cooked;                                             /* both intensities present */
 } cc_annotations;
 
+/* ---- Inbound event vocabulary (Plan 3 Task 5a) -----------------------------
+ * The complete set of events the engine can emit through cc_on_event_fn
+ * (see cc_session_config above). Every enum value has a matching union
+ * member below -- this is a strict 1:1, completeness-is-the-deliverable
+ * contract; later tasks (5b's parser, 6's payload stage) fill these at
+ * parse sites and Swift (Task 7) mirrors them 1:1. All `const char*`
+ * fields are CP-1252 bytes valid only for the duration of the on_event
+ * callback -- copy them if you need to keep them. */
+typedef enum cc_proto_event_type {
+    CC_EV_NONE = 0,
+    /* connection lifecycle */
+    CC_EV_LOGGED_IN,          /* 001 -> own actual nick */
+    CC_EV_SERVER_CAPS,        /* 800 -> ircx?, max_msg_len */
+    CC_EV_DISCONNECTED_HINT,  /* fatal ERROR text */
+    /* membership */
+    CC_EV_SELF_JOINED, CC_EV_SELF_PARTED,
+    CC_EV_USER_JOINED, CC_EV_USER_PARTED, CC_EV_USER_QUIT,
+    CC_EV_NAMES, CC_EV_END_OF_NAMES,
+    CC_EV_NICK_CHANGED,
+    /* messages (the core comic events) */
+    CC_EV_TEXT,               /* PRIVMSG/NOTICE: nick, target, text, kind, annotations? */
+    CC_EV_DATA,               /* IRCX DATA CCUDI1: annotations */
+    CC_EV_WHISPER,
+    CC_EV_ACTION, CC_EV_SOUND, CC_EV_AWAY_PEER,   /* CTCP-derived */
+    CC_EV_APPEARS_AS,         /* "# Appears as name.url" avatar announce */
+    /* room state */
+    CC_EV_TOPIC_CHANGED, CC_EV_CHANNEL_MODE, CC_EV_USER_MODE,
+    CC_EV_ROOM_PROP,          /* PROP CLIENT (bk backdrop etc.) */
+    CC_EV_ROOM_LIST_BEGIN, CC_EV_ROOM_LIST_ITEM, CC_EV_ROOM_LIST_END,
+    CC_EV_WHOIS_RESULT, CC_EV_WHO_RESULT,
+    CC_EV_MOTD,
+    /* errors & prompts (Swift owns retry/prompt) */
+    CC_EV_ERROR,              /* typed error + human text (from numerics/AfxMessageBox) */
+    CC_EV_NICK_REJECTED,      /* 431/432/433 -> Swift retries */
+    CC_EV_AUTH_UNSUPPORTED,   /* SSPI path dropped (R21) */
+    CC_EV_STATUS_LINE,        /* catch-all status text (permissive: unknown numerics) */
+} cc_proto_event_type;
+
+typedef struct cc_proto_event {
+    cc_proto_event_type type;
+    uint32_t room_token;          /* 0 if not room-scoped */
+    union {
+        /* connection lifecycle */
+        struct { const char* nick; } logged_in;                        /* CC_EV_LOGGED_IN */
+        struct { int32_t ircx; int32_t max_msg_len; } server_caps;     /* CC_EV_SERVER_CAPS */
+        struct { const char* text; } disconnected_hint;                /* CC_EV_DISCONNECTED_HINT */
+        /* membership */
+        struct { const char* channel; } self_joined;                   /* CC_EV_SELF_JOINED */
+        struct { const char* channel; } self_parted;                   /* CC_EV_SELF_PARTED */
+        struct { const char* nick; const char* ident; } user_joined;   /* CC_EV_USER_JOINED */
+        struct { const char* nick; const char* reason; } user_parted;  /* CC_EV_USER_PARTED */
+        struct { const char* nick; const char* reason; } user_quit;    /* CC_EV_USER_QUIT */
+        struct { const char* channel; const char* nicks; } names;      /* CC_EV_NAMES (space-joined) */
+        struct { const char* channel; } end_of_names;                  /* CC_EV_END_OF_NAMES */
+        struct { const char* old_nick; const char* new_nick;
+                 int32_t is_self; } nick_changed;                      /* CC_EV_NICK_CHANGED */
+        /* messages (the core comic events) */
+        struct { const char* nick; const char* ident; const char* target;
+                 const char* text; int32_t kind;      /* MT_* */
+                 int32_t has_annotations; cc_annotations annotations; } text;   /* CC_EV_TEXT */
+        struct { const char* nick; cc_annotations annotations; } data; /* CC_EV_DATA */
+        struct { const char* nick; const char* ident; const char* text;
+                 int32_t has_annotations; cc_annotations annotations; } whisper; /* CC_EV_WHISPER */
+        struct { const char* nick; const char* text;
+                 int32_t has_annotations; cc_annotations annotations; } action;  /* CC_EV_ACTION */
+        struct { const char* nick; const char* file; const char* text; } sound;  /* CC_EV_SOUND */
+        struct { const char* nick; const char* message; } away_peer;   /* CC_EV_AWAY_PEER */
+        struct { const char* nick; const char* avatar_name;
+                 const char* url; } appears_as;                        /* CC_EV_APPEARS_AS (url may be "" or "?") */
+        /* room state */
+        struct { const char* channel; const char* topic; } topic_changed;   /* CC_EV_TOPIC_CHANGED */
+        struct { const char* channel; const char* modes;
+                 const char* arg; } channel_mode;                      /* CC_EV_CHANNEL_MODE (delta) */
+        struct { const char* nick; const char* modes; } user_mode;     /* CC_EV_USER_MODE */
+        struct { const char* key; const char* value; } room_prop;      /* CC_EV_ROOM_PROP */
+        struct { int32_t truncated; } room_list_begin;                 /* CC_EV_ROOM_LIST_BEGIN */
+        struct { const char* name; int32_t users;
+                 const char* topic; } room_list_item;                  /* CC_EV_ROOM_LIST_ITEM */
+        struct { int32_t truncated; } room_list_end;                   /* CC_EV_ROOM_LIST_END */
+        struct { const char* nick; const char* user; const char* host;
+                 const char* real; int32_t purpose; } whois_result;    /* CC_EV_WHOIS_RESULT */
+        struct { const char* nick; const char* user; const char* host;
+                 const char* channel; int32_t purpose; } who_result;   /* CC_EV_WHO_RESULT */
+        struct { const char* luser; const char* motd; } motd;          /* CC_EV_MOTD */
+        /* errors & prompts (Swift owns retry/prompt) */
+        struct { int32_t code; const char* text; } error;              /* CC_EV_ERROR */
+        struct { int32_t kind; const char* bad_nick; } nick_rejected;  /* CC_EV_NICK_REJECTED */
+        struct { int32_t dummy; } auth_unsupported;                    /* CC_EV_AUTH_UNSUPPORTED */
+        struct { const char* text; } status_line;                      /* CC_EV_STATUS_LINE */
+    } u;
+} cc_proto_event;
+
 /* ---- Outbound command builders (Plan 3 Task 4) -----------------------------
  * Thin wrappers over ircproto.cpp's CIrcProto builders (engine/ircproto.{h,cpp}).
  * Every one of these ultimately calls CIrcProto::SendMessageText, which
