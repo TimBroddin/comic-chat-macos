@@ -287,6 +287,51 @@ static void testShimStringApis2() {
     CC_CHECK(lstrcmpi("abc", "abd") != 0);
 }
 
+// Plan 4a Task 3 Step 1: CharUpperBuff's CP-1252 case fold, table-driven over
+// all 256 bytes. Builds the expected fold per the brief's rule set:
+//   - 'a'..'z' (0x61-0x7A) -> -0x20 (ASCII uppercase, already covered pre-Task-3)
+//   - 0x9A (s-caron) -> 0x8A (S-caron), 0x9C (oe) -> 0x8C (OE),
+//     0x9E (z-caron) -> 0x8E (Z-caron) (CP-1252's three out-of-band Latin
+//     Extended-A pairs, not in the 0xE0-0xFE run)
+//   - 0xFF (y-diaeresis) -> 0x9F (Y-diaeresis, the ONE uppercase pair that
+//     crosses the C0/C1-vs-Latin-1-Supplement block boundary)
+//   - 0xE0-0xFE (Latin-1 Supplement lowercase accented run) -> -0x20, EXCEPT
+//     0xF7 (division sign, not a letter -- unchanged)
+//   - 0xDF (sharp s) unchanged: CP-1252 has no uppercase eszett, matches real
+//     Win32 CharUpperBuffA
+//   - 0xB5 (micro sign) unchanged: not a cased letter
+//   - everything else: identity
+static void cc_selftest_cp1252_fold() {
+    unsigned char expected[256];
+    for (int i = 0; i < 256; i++) expected[i] = (unsigned char)i;
+
+    for (int c = 'a'; c <= 'z'; c++) expected[c] = (unsigned char)(c - 0x20);
+
+    for (int c = 0xE0; c <= 0xFE; c++) {
+        if (c == 0xF7) continue;  // division sign, unchanged
+        expected[c] = (unsigned char)(c - 0x20);
+    }
+
+    expected[0x9A] = 0x8A;  // s-caron -> S-caron
+    expected[0x9C] = 0x8C;  // oe -> OE
+    expected[0x9E] = 0x8E;  // z-caron -> Z-caron
+    expected[0xFF] = 0x9F;  // y-diaeresis -> Y-diaeresis
+
+    // no-change exceptions (already identity above, asserted explicitly so a
+    // future edit that accidentally folds them trips this test):
+    expected[0xF7] = 0xF7;  // division sign
+    expected[0xDF] = 0xDF;  // sharp s (no CP-1252 uppercase eszett)
+    expected[0xB5] = 0xB5;  // micro sign
+
+    char buf[256];
+    for (int i = 0; i < 256; i++) buf[i] = (char)(unsigned char)i;
+    CharUpperBuff(buf, 256);
+
+    for (int i = 0; i < 256; i++) {
+        CC_CHECK((unsigned char)buf[i] == expected[i]);
+    }
+}
+
 static void testMapWordToPtr() {
     // CMapWordToPtr + POSITION (backdrop.cpp backMapS/backMapP,
     // GetBackDropArtFromID/FlushBackDropFromID/FlushBackDropCache).
@@ -4178,6 +4223,108 @@ static int cc_selftest_pv_data_vs_inline() {
     return 0;
 }
 
+// Plan 4a Task 3 Step 3: escaped-byte annotation vector (the second Plan-3
+// must-own debt item: Task 8's "unquoting ran as a no-op" gap, made
+// falsifiable here). Two parts:
+//
+// (a) Direct pair test over bLowLevelQuoting/bLowLevelUnquoting themselves,
+//     confirming the discovered escape alphabet against the lifted code (read
+//     FIRST, ccommon_str.cpp:75-245, before writing this): the quoting char
+//     is g_chLLQuoteCTCP (0x10); only THREE input bytes are ever escaped --
+//     LF (0x0A) -> <Q>'n', CR (0x0D) -> <Q>'r', and the quote char itself
+//     (0x10) -> <Q><Q> (doubled). This is a narrow, targeted 3-symbol scheme,
+//     NOT a general CTCP low/high-bit quoting table and NOT a byte-oblivious
+//     escaper -- 0x00 and every other byte pass through unescaped. The
+//     brief's {0x0A, 0x0D, 0x10} triple is exactly this alphabet (confirmed
+//     against the 1998 source, not assumed).
+//
+// (b) End-to-end decode: a hand-authored inbound PRIVMSG whose line carries
+//     the quoted form of LF/CR/quote-char in the trailing (post-annotation)
+//     say text. bLowLevelUnquoting runs over the WHOLE szMesg line
+//     (ccProcessSay, protsupp.cpp:1058) BEFORE the "(#...)" annotation
+//     parenthetical is even located -- so this one call unquotes both the
+//     annotation-adjacent framing and the trailing text in a single pass.
+//     Feeding this through the real session (cc_session_feed_bytes) and
+//     capturing CC_EV_TEXT's has_annotations + decoded text bytes falsifies
+//     Task 8's suspected "unquoting ran as a no-op" gap: if unquoting were a
+//     no-op, ev.u.text.text would still contain the LITERAL "<0x10>n<0x10>r"
+//     bytes instead of real LF/CR.
+/* HAND-AUTHORED -- promote a real captured escaped-byte exchange during the 4b live acceptance */
+static int cc_selftest_annotation_escaped_bytes() {
+    const char Q = (char)0x10;
+
+    // --- (a) direct pair test -------------------------------------------
+    {
+        // Buffer containing LF, CR, and the quote char itself, plus printable
+        // padding on both sides.
+        char src[] = { 'a', 0x0A, 'b', 0x0D, 'c', Q, 'd', 0 };
+        char* dst = nullptr; BOOL freeit = FALSE;
+        BOOL changed = bLowLevelQuoting(Q, TRUE /*bTreatAsByteArray*/, src, &dst, &freeit, FALSE);
+        CC_CHECK(changed == TRUE);
+        // Expected quoted form: a <Q>n b <Q>r c <Q><Q> d
+        const char expectedQuoted[] = { 'a', Q, 'n', 'b', Q, 'r', 'c', Q, Q, 'd', 0 };
+        CC_CHECK(dst != nullptr);
+        CC_CHECK(memcmp(dst, expectedQuoted, sizeof(expectedQuoted)) == 0);
+
+        // Round-trip through bLowLevelUnquoting: byte-identical to src.
+        char buf[16];
+        BOOL ok = bLowLevelUnquoting(Q, TRUE /*bTreatAsByteArray*/, dst, buf);
+        CC_CHECK(ok == TRUE);
+        CC_CHECK(memcmp(buf, src, sizeof(src)) == 0);
+
+        if (freeit) free(dst);
+    }
+
+    // --- (b) end-to-end decode through the real session -----------------
+    {
+        cc_session_config cfg; memset(&cfg, 0, sizeof(cfg));
+        cfg.send = [](void*, const uint8_t*, size_t) {};
+        cfg.own_nick = pvOwnNick;
+        // full-capture on_event (same shape as cc_selftest_pv_data_vs_inline's
+        // DCap) so both has_annotations AND the decoded annotation fields AND
+        // the decoded text bytes are all inspectable, not just the PVCap
+        // pa/pb summary fields.
+        struct ECap { int haveText=0; int textHasAnn=-1; cc_annotations textAnn{}; std::string textBody; } ec;
+        cfg.user_data = &ec;
+        cfg.on_event = [](void* ud, const cc_proto_event* ev){
+            ECap* c = static_cast<ECap*>(ud);
+            if (ev->type==CC_EV_TEXT){ c->haveText=1; c->textHasAnn=ev->u.text.has_annotations; c->textAnn=ev->u.text.annotations; c->textBody=ev->u.text.text; }
+        };
+        cc_session* s = cc_session_create(&cfg);
+
+        // Wire line: inline annotation "(#G295E193M1) " (same grammar as
+        // cc_selftest_pv_data_vs_inline: gesture 2,9,5 / expr 1,9,3 / mode 1),
+        // followed by say text whose bytes are the QUOTED forms of LF, CR,
+        // and the quote char itself -- exercised end-to-end through the
+        // real IRC line framer (cc_session_feed_bytes), which splits wire
+        // input on literal \r\n only; these quoted sequences are ordinary
+        // in-line payload bytes to the framer and only become real LF/CR/Q
+        // after bLowLevelUnquoting runs inside ccProcessSay.
+        char wire[128];
+        int n = 0;
+        const char* head = ":Win!u@h PRIVMSG #comicrig :(#G295E193M1) hello";
+        memcpy(wire + n, head, strlen(head)); n += (int)strlen(head);
+        wire[n++] = Q; wire[n++] = 'n';   // quoted LF
+        wire[n++] = Q; wire[n++] = 'r';   // quoted CR
+        wire[n++] = Q; wire[n++] = Q;     // quoted quote-char itself
+        wire[n++] = '!';
+        wire[n++] = '\r'; wire[n++] = '\n';  // real wire line terminator
+
+        cc_session_feed_bytes(s, (const uint8_t*)wire, (size_t)n);
+
+        CC_CHECK(ec.haveText == 1);
+        CC_CHECK(ec.textHasAnn == 1);
+        CC_CHECK(ec.textAnn.gesture_pose == 2 && ec.textAnn.mode == 1);
+        // Decoded LF, CR, quote-char, literal '!' -- byte-identical proof
+        // that unquoting actually ran (a no-op would leave the literal
+        // "<0x10>n<0x10>r<0x10><0x10>" bytes in place instead).
+        CC_CHECK(ec.textBody == "hello\x0A\x0D\x10!");
+        cc_session_destroy(s);
+    }
+
+    return 0;
+}
+
 // VECTOR 6: WHISPER inbound (HandleCommand cmdidWhisper, ircsock.cpp:1832-1844).
 // "WHISPER #comicrig Anon :psst" -> CC_EV_WHISPER(nick=Bob, text="psst").
 static int cc_selftest_pv_whisper() {
@@ -4591,6 +4738,7 @@ extern "C" int32_t cc_run_selftests(void) {
     testShimCollections2();
     testShimMacros();
     testShimStringApis2();
+    cc_selftest_cp1252_fold();    // Plan 4a Task 3 Step 1: CP-1252 CharUpperBuff fold
     testMapWordToPtr();
     testMapWordToPtrRemoveDuringIteration();
     testMapStringToPtr();
@@ -4631,6 +4779,7 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_pv_topic_set();                 // TOPIC set
     cc_selftest_pv_channel_mode_delta();        // channel MODE +o delta
     cc_selftest_pv_data_vs_inline();            // IRCX DATA CCUDI1 vs inline (# annotations)
+    cc_selftest_annotation_escaped_bytes();     // Plan 4a Task 3 Step 3: escaped-byte annotation vector
     cc_selftest_pv_whisper();                   // WHISPER inbound
     cc_selftest_pv_appears_as_seam();           // "# Appears as" (Task-6 seam: raw CC_EV_TEXT)
     cc_selftest_pv_room_list();                 // room LIST 321/322/323
