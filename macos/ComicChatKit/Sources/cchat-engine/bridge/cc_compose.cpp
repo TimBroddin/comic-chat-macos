@@ -142,6 +142,16 @@ extern "C" cc_strip* cc_strip_create(void) {
     // exactly as the panel selftest does (cc_selftest.cpp:1589-1590).
     CUnitPanelPage::SetUnitPanelWidth(MINUNITPANELWIDTH);
     CUnitPanelPage::SetUnitPanelHeight(MINUNITPANELHEIGHT);
+    // Plan 4a Task 5 fix: panels-per-row is ALSO process-global static state
+    // (panel.cpp:70, default 2), and cc_strip_set_panel_geometry can now change
+    // it. Re-seed it here too so a fresh strip always starts from the
+    // documented default (2/row) regardless of what a PRIOR strip's geometry
+    // call left the static at -- otherwise cc_strip_create's "fresh strip"
+    // guarantee would hold for width/height but silently leak panels-per-row
+    // across strips (caught by cross-test contamination: a geometry test
+    // running before the strip snapshot test broke its golden log, which
+    // assumes 2/row).
+    CUnitPanelPage::SetUnitPanelsPerRow(2);
 
     // The page. m_doc == nullptr is safe headless -- it is only dereferenced in
     // the R11-wrapped RefreshPanelN (a no-op under CC_NO_UI); see the panel
@@ -376,6 +386,49 @@ extern "C" void cc_strip_get_size(const cc_strip* s, int32_t* out_w, int32_t* ou
     }
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
+}
+
+// Plan 4a Task 5: panel geometry API. Thin wrappers over
+// CUnitPanelPage::SetUnitPanelWidth/SetUnitPanelHeight/SetUnitPanelsPerRow
+// (engine/panel.h:156-158 -- note SetUnitPanelWidth cascades UpdateTitleFonts,
+// exactly as the original CPageView::SetPanelsWide's caller-visible behavior;
+// that's expected, not worked around) and the interstice statics (engine/
+// panel.cpp:70-76, read-only here -- the original exposes no setter for them
+// either). FRESH STRIP ONLY: rejects once a line has been added (panel count
+// > 0), mirroring the original's always-reflow-via-ResetExistingPanels design
+// (pageview.cpp:1110-1125) without a headless equivalent of that reflow.
+extern "C" int32_t cc_strip_set_panel_geometry(cc_strip* s, int32_t unit_w_twips,
+                                               int32_t unit_h_twips,
+                                               int32_t panels_per_row) {
+    if (!s || !s->page) return -1;
+    if (s->page->m_panels.GetCount() > 0) return 1;  // lines already added -- reject
+    CUnitPanelPage::SetUnitPanelWidth(unit_w_twips);   // cascades UpdateTitleFonts
+    CUnitPanelPage::SetUnitPanelHeight(unit_h_twips);
+    CUnitPanelPage::SetUnitPanelsPerRow(panels_per_row);
+    return 0;
+}
+
+extern "C" void cc_strip_get_panel_geometry(const cc_strip* s, int32_t* unit_w,
+                                            int32_t* unit_h, int32_t* per_row,
+                                            int32_t* h_interstice,
+                                            int32_t* v_interstice) {
+    // Consistent with cc_strip_get_size: a NULL/destroyed handle reads as all
+    // zeros rather than silently exposing whatever the process-global statics
+    // (there is only ever one live strip, per the ONE STRIP AT A TIME contract,
+    // but a caller passing NULL/a stale handle shouldn't see live state anyway).
+    int32_t w = 0, h = 0, pr = 0, hi = 0, vi = 0;
+    if (s && s->page) {
+        w = CUnitPanelPage::m_unitWidth;
+        h = CUnitPanelPage::m_unitHeight;
+        pr = CUnitPanelPage::m_panelsPerRow;
+        hi = CUnitPanelPage::m_hInterstice;
+        vi = CUnitPanelPage::m_vInterstice;
+    }
+    if (unit_w) *unit_w = w;
+    if (unit_h) *unit_h = h;
+    if (per_row) *per_row = pr;
+    if (h_interstice) *h_interstice = hi;
+    if (v_interstice) *v_interstice = vi;
 }
 
 // ============================================================================

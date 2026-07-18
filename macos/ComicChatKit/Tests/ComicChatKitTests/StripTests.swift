@@ -87,6 +87,50 @@ extension EngineGlobalStateSelfTests {
         }
     }
 
+    // Plan 4a Task 5: the Strip.setPanelGeometry/panelGeometry Swift wrapper
+    // (not just the underlying C API, which cc_run_panel_geometry_selftest
+    // already covers in BodyDrawTests.swift). Checks the create-time default,
+    // a set-then-get round trip, and the FRESH STRIP ONLY reject surfacing as
+    // a thrown StripError once a line has been added.
+    @Test func panelGeometryRoundTripsAndRejectsAfterLine() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            let strip = try Strip()
+
+            // Create-time default: MINUNITPANELWIDTH/HEIGHT (2300), 2/row.
+            var geo = strip.panelGeometry
+            #expect(geo.unitW == 2300)
+            #expect(geo.unitH == 2300)
+            #expect(geo.perRow == 2)
+            #expect(geo.hInter == 144)
+            #expect(geo.vInter == 144)
+
+            // Set-then-get round trip on the fresh strip.
+            try strip.setPanelGeometry(unitTwips: 3200, panelsPerRow: 3)
+            geo = strip.panelGeometry
+            #expect(geo.unitW == 3200)
+            #expect(geo.unitH == 3200)
+            #expect(geo.perRow == 3)
+
+            // Add one real line (needs a participant), then confirm the
+            // FRESH STRIP ONLY gate rejects a further geometry change.
+            let avatar = fixture("anna.avb")
+            let a = try strip.addParticipant(nick: "Anna", avbPath: avatar)
+            try strip.addLine(speaker: a, text: "Hello there", modes: .say, addressees: [])
+            #expect(strip.panelCount > 0)
+            #expect(throws: Strip.StripError.self) {
+                try strip.setPanelGeometry(unitTwips: 4000, panelsPerRow: 4)
+            }
+            // Geometry unchanged by the rejected call.
+            geo = strip.panelGeometry
+            #expect(geo.unitW == 3200)
+            #expect(geo.perRow == 3)
+        }
+    }
+
     // (b) THE EXIT MILESTONE: the same conversation composited through CGCanvas
     // into real pixels. Asserts non-empty PNG data, expected pixel dimensions
     // (page size in twips / 20 points, at 2x scale), and >1% non-white pixels

@@ -2578,6 +2578,100 @@ extern "C" int32_t cc_run_strip_selftest(const char* avatarPath,
     return g_failures;
 }
 
+// --- Plan 4a Task 5: panel geometry API --------------------------------------
+// cc_strip_set_panel_geometry/get_panel_geometry are thin wrappers over
+// CUnitPanelPage::SetUnitPanelWidth/SetUnitPanelHeight/SetUnitPanelsPerRow
+// (engine/panel.h:156-158) and the interstice statics (engine/panel.cpp:70-76),
+// so this only needs cc_strip_* -- no cc_session. It DOES need one real
+// participant to exercise the "reject after a line was added" gate though:
+// CPanel::FetchSpeaker (panel.cpp:667-668) dereferences GetAvatar(uID)->m_body
+// unconditionally, so AddLine with an unregistered speaker id would crash
+// rather than merely fail -- hence this selftest takes the same avatarPath
+// fixture argument as cc_run_strip_selftest/cc_run_panel_selftest/
+// cc_run_bodydraw_selftest and is likewise kept OUT of the parameterless
+// cc_run_selftests.
+static int cc_selftest_panel_geometry(const char* avatarPath) {
+    int startFailures = g_failures;
+
+    // Balloon layout measures text via the shared metrics canvas (see
+    // cc_selftest_strip's identical setup); adding real lines below needs one.
+    static CCRecordingCanvas panelGeometryMetrics;
+    cc_set_metrics_canvas(panelGeometryMetrics.handle());
+
+    cc_strip* s = cc_strip_create();
+    CC_CHECK(s != NULL);
+    if (!s) return g_failures - startFailures;
+
+    // --- create-time default: MINUNITPANELWIDTH/HEIGHT (2300), 2/row, per the
+    //     cc_strip_create hard-seed (cc_compose.cpp:143-144) -- unchanged by
+    //     this task, still the default for a freshly-created strip.
+    {
+        int32_t w = 0, h = 0, perRow = 0, hInt = 0, vInt = 0;
+        cc_strip_get_panel_geometry(s, &w, &h, &perRow, &hInt, &vInt);
+        CC_CHECK(w == 2300);
+        CC_CHECK(h == 2300);
+        CC_CHECK(perRow == 2);
+        CC_CHECK(hInt == 144);   // engine/panel.cpp:75
+        CC_CHECK(vInt == 144);  // engine/panel.cpp:76
+    }
+
+    // --- set (3200, 3200, 3) on the fresh strip -> succeeds, getter round-trips.
+    CC_CHECK(cc_strip_set_panel_geometry(s, 3200, 3200, 3) == 0);
+    {
+        int32_t w = 0, h = 0, perRow = 0, hInt = 0, vInt = 0;
+        cc_strip_get_panel_geometry(s, &w, &h, &perRow, &hInt, &vInt);
+        CC_CHECK(w == 3200);
+        CC_CHECK(h == 3200);
+        CC_CHECK(perRow == 3);
+        CC_CHECK(hInt == 144);   // interstices are read-only, unaffected by the set
+        CC_CHECK(vInt == 144);
+    }
+
+    // --- cc_strip_get_size of a 3-line strip reflects the new arithmetic:
+    //     cols*W + (cols-1)*vInterstice, D2 section 1.3's table -- one participant,
+    //     three lines each starting a fresh panel (StartNewPanel forced by
+    //     AvatarInPanel(uID) being true every time, since there's only one
+    //     speaker) so 3 panels laid out 3-per-row: one row, 3 columns.
+    int32_t p = cc_strip_add_participant(s, "Anna", avatarPath);
+    CC_CHECK(p == 1);
+    if (p >= 0) {
+        CC_CHECK(cc_strip_add_line(s, p, "Line one", CC_MODE_SAY, NULL, 0) == 0);
+        CC_CHECK(cc_strip_add_line(s, p, "Line two", CC_MODE_SAY, NULL, 0) == 0);
+        CC_CHECK(cc_strip_add_line(s, p, "Line three", CC_MODE_SAY, NULL, 0) == 0);
+        int32_t panelCount = cc_strip_panel_count(s);
+        CC_CHECK(panelCount == 3);
+
+        int32_t w = 0, h = 0;
+        cc_strip_get_size(s, &w, &h);
+        // 3 columns, 1 row: width = 3*3200 + 2*144 = 9888; height = 1*3200 (no
+        // row interstice added for a single row).
+        CC_CHECK(w == 3 * 3200 + 2 * 144);
+        CC_CHECK(h == 3200);
+
+        // --- FRESH STRIP ONLY: a line has now been added (panel_count > 0) ->
+        //     set_panel_geometry must reject (nonzero), and geometry must be
+        //     UNCHANGED by the rejected call.
+        CC_CHECK(cc_strip_set_panel_geometry(s, 4000, 4000, 4) != 0);
+        int32_t w2 = 0, h2 = 0, perRow2 = 0, hInt2 = 0, vInt2 = 0;
+        cc_strip_get_panel_geometry(s, &w2, &h2, &perRow2, &hInt2, &vInt2);
+        CC_CHECK(w2 == 3200);
+        CC_CHECK(h2 == 3200);
+        CC_CHECK(perRow2 == 3);
+    }
+
+    cc_strip_destroy(s);
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift wrapper, which passes the anna.avb fixture path.
+// Runs standalone (resets g_failures) -- same pattern as cc_run_strip_selftest.
+extern "C" int32_t cc_run_panel_geometry_selftest(const char* avatarPath) {
+    g_failures = 0;
+    if (avatarPath == NULL) return 1;
+    cc_selftest_panel_geometry(avatarPath);
+    return g_failures;
+}
+
 // --- Plan 3 Task 1: cc_session C boundary skeleton --------------------------
 // No parsing yet: creates a cc_session, feeds it a byte string (accumulates
 // into an internal buffer only), then drives the test-only echo hook and

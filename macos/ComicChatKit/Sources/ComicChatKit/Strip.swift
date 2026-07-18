@@ -152,6 +152,33 @@ public final class Strip {
         }
     }
 
+    /// Panel geometry: unit width/height (twips), panels per row, and the
+    /// horizontal/vertical interstice constants (not settable). Returns the
+    /// create-time default (`(2300, 2300, 2, 144, 144)`) until overridden by
+    /// `setPanelGeometry`.
+    public var panelGeometry: (unitW: Int32, unitH: Int32, perRow: Int32, hInter: Int32, vInter: Int32) {
+        guard let h = handle else { return (0, 0, 0, 0, 0) }
+        var w: Int32 = 0, ht: Int32 = 0, perRow: Int32 = 0, hInt: Int32 = 0, vInt: Int32 = 0
+        cc_strip_get_panel_geometry(h, &w, &ht, &perRow, &hInt, &vInt)
+        return (w, ht, perRow, hInt, vInt)
+    }
+
+    /// Set the unit panel size (`unitTwips` for both width and height -- panels
+    /// are square, mirroring the original's `SetPanelsWide`) and panels-per-row.
+    ///
+    /// FRESH STRIP ONLY: mirrors the original `CPageView::SetPanelsWide`, which
+    /// always reflows via `ResetExistingPanels(TRUE)` (destroy all panels +
+    /// recreate + replay the history log, pageview.cpp:1110-1125) -- something
+    /// the headless engine has no history log to do. Call this BEFORE the first
+    /// `addLine`/`addLineCooked`; once any line has been added, the underlying
+    /// `cc_strip_set_panel_geometry` rejects the call and this throws.
+    public func setPanelGeometry(unitTwips: Int32, panelsPerRow: Int32) throws {
+        let h = try requireHandle()
+        guard cc_strip_set_panel_geometry(h, unitTwips, unitTwips, panelsPerRow) == 0 else {
+            throw StripError(message: "setPanelGeometry(unitTwips: \(unitTwips), panelsPerRow: \(panelsPerRow)) failed -- a line has already been added")
+        }
+    }
+
     /// Number of panels laid out so far.
     public var panelCount: Int32 {
         guard let h = handle else { return 0 }

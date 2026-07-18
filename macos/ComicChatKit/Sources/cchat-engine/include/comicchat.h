@@ -37,6 +37,17 @@ int32_t cc_run_panel_selftest(const char* avatar_path);
  * cc_run_selftests because it needs fixture paths. */
 int32_t cc_run_strip_selftest(const char* avatar_path, const char* backdrop_path);
 
+/* Plan 4a Task 5: panel geometry API selftest. Opens the avatar at avatar_path
+ * (one participant) and exercises cc_strip_set_panel_geometry/
+ * get_panel_geometry: the create-time default (2300/2300/2, interstices 144),
+ * an explicit set-then-get round trip, cc_strip_get_size reflecting the new
+ * arithmetic after real lines are added, and the FRESH STRIP ONLY reject once
+ * a line has been added. Returns 0 on success (failure count otherwise). Kept
+ * out of cc_run_selftests because it needs the fixture path (adding a real
+ * line requires a registered avatar; CPanel::FetchSpeaker dereferences
+ * GetAvatar(uID)->m_body unconditionally). */
+int32_t cc_run_panel_geometry_selftest(const char* avatar_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env
@@ -289,6 +300,31 @@ int32_t   cc_strip_panel_count(const cc_strip* s);
 /* Bounding box of the finished page in twips (width, height >= 0). Matches
  * CUnitPanelPage::GetBBox's row/column arithmetic. */
 void      cc_strip_get_size(const cc_strip* s, int32_t* out_w, int32_t* out_h);
+
+/* Plan 4a Task 5: panel geometry API. Thin wrappers over
+ * CUnitPanelPage::SetUnitPanelWidth/SetUnitPanelHeight/SetUnitPanelsPerRow
+ * (engine/panel.h:156-158) and the interstice statics (engine/panel.cpp:70-76).
+ * cc_strip_create's hard-seed (MINUNITPANELWIDTH/HEIGHT, 2/row) remains the
+ * default for a freshly-created strip; these let a caller override it.
+ *
+ * FRESH STRIP ONLY: mirrors the original CPageView::SetPanelsWide, which always
+ * reflows via ResetExistingPanels(TRUE) -- FreeRetainedPanelS + DestroyPages +
+ * re-add + ExecuteHistory(HM_RELOAD) (pageview.cpp:1110-1125). The headless
+ * engine has no history log to replay from, so reflow-after-lines is out of
+ * scope for this task (by design, not an oversight): cc_strip_set_panel_geometry
+ * REJECTS the call (returns nonzero) once any line has been added -- i.e. once
+ * cc_strip_panel_count(s) > 0, since CUnitPanelPage::AddLine always produces at
+ * least one panel. Call it before the first cc_strip_add_line/add_line_cooked. */
+int32_t   cc_strip_set_panel_geometry(cc_strip* s, int32_t unit_w_twips,
+                                      int32_t unit_h_twips, int32_t panels_per_row);
+                                      /* 0 ok, nonzero if a line has been added */
+
+/* Current panel geometry: unit width/height (twips), panels per row, and the
+ * horizontal/vertical interstice constants (engine/panel.cpp:75-76; not
+ * settable -- the original never exposes a setter for them either). */
+void      cc_strip_get_panel_geometry(const cc_strip* s, int32_t* unit_w,
+                                      int32_t* unit_h, int32_t* per_row,
+                                      int32_t* h_interstice, int32_t* v_interstice);
 
 /* Composite the finished page onto `canvas` (the R16 headless replacement for
  * CUnitPanelPage::Draw). Returns 0 on success. */

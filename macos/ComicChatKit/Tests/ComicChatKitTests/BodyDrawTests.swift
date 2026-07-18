@@ -57,4 +57,17 @@ struct EngineGlobalStateSelfTests {
         let backdrop = fixture("field.bgb")
         #expect(cc_run_strip_selftest(avatar, backdrop) == 0)
     }
+
+    // Plan 4a Task 5: the panel geometry API (cc_strip_set_panel_geometry /
+    // cc_strip_get_panel_geometry) -- thin wrappers over
+    // CUnitPanelPage::SetUnitPanelWidth/SetUnitPanelHeight/SetUnitPanelsPerRow +
+    // the interstice statics. Exercises the create-time default, a set-then-get
+    // round trip, cc_strip_get_size reflecting the new arithmetic once real
+    // lines are added, and the FRESH STRIP ONLY reject once a line exists.
+    // Needs the fixture path (one real participant, so AddLine's
+    // FetchSpeaker->GetAvatar->m_body chain doesn't dereference null).
+    @Test func panelGeometrySelfTestPasses() {
+        let avatar = fixture("anna.avb")
+        #expect(cc_run_panel_geometry_selftest(avatar) == 0)
+    }
 }
