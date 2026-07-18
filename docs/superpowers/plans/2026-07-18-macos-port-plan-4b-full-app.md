@@ -12,7 +12,7 @@
 
 - **Edit Rules R1–R21 + all amendments are carried forward verbatim and binding** (incl. Plan 4a's Task 2 amendments — the R18 second-800 site, the fresh `cc_session_login`, the **`g_session` SAVE/RESTORE rule for every reentrant `cc_session_*`** — and the Task 12 fonts.cpp R13-clarification instance). Any *new* pattern in lifted code → escalate (BLOCKED/NEEDS_CONTEXT); rulings become amendments **R22+**. Never improvise.
 - `v2.5-beta-1-modern/` and `artifacts*/` are **read-only reference — never edit**. Copy (build-phase copy for resources), never reference at runtime.
-- **Engine threading/lifetime rules (all bit people in 4a; all documented in code):** ALL `cc_*` calls on ONE serial queue (the model's `engineQueue`); **never call `cc_strip_*` from inside the `on_event` callback stack**; `performOnEngineQueue` traps on-queue misuse; metrics canvas installed BEFORE `cc_strip_create` and kept alive (`metricsCanvasBox` retained); `cc_session_config` extensions are **append-only**; `session.room(_:)` does its own `sync` — never call it on-queue (use the detached-Task pattern); strip geometry set on FRESH strips only; **ONE STRIP AT A TIME process-wide** (comicchat.h's binding rule — this constrains Task 9's viewer and Task 4's whisper rendering; see those tasks).
+- **Engine threading/lifetime rules (all bit people in 4a; all documented in code):** ALL `cc_*` calls on ONE serial queue (the model's `engineQueue`); **never call `cc_strip_*` from inside the `on_event` callback stack**; `performOnEngineQueue` traps on-queue misuse; metrics canvas installed BEFORE `cc_strip_create` and kept alive (`metricsCanvasBox` retained); `cc_session_config` extensions are **append-only**; `session.room(_:)` does its own `sync` — never call it on-queue (use the detached-Task pattern); strip geometry set on FRESH strips only; **ONE STRIP AT A TIME process-wide** (comicchat.h's binding rule — this constrains Task 10's viewer, Task 4's whisper rendering, and dictates Task 7's multi-room strip-swap design; see those tasks).
 - **`ComicStripView` parameter-passing contract (binding):** construct `ComicStripView(image:sizePoints:model:)` from observed reads in the parent `body`. Never revert to `@Environment` reads inside it.
 - New engine-global-state test suites nest inside the `.serialized` ancestor `EngineGlobalStateSelfTests` (see `StripTests.swift:15-24`). App-side logic lives in ComicChatKit so `swift test` from `macos/ComicChatKit/` stays the headless truth. SourceKit "No such module: cchat_engine / Testing" diagnostics are FALSE; the command line is the truth.
 - **Real-metrics rule (D3):** never freeze byte-exact goldens under real CoreText metrics — real-metrics tests use tolerances/invariants only; byte-exact goldens stay on the fake-metrics `RecordingCanvas` forever.
@@ -36,23 +36,25 @@ macos/ComicChatKit/
   Sources/ComicChatKit/
     ProtocolSession.swift        MODIFY  encoded-text alignment say/whisper/setTopic (Task 1);
                                           userName/realName -> own_user/own_realname (Task 5);
+                                          room-scoped ScopedEvent stream (Task 7);
                                           room-ops wrappers createRoom/kick/invite/ban/
-                                          setRoomMode/setAway (Task 7)
+                                          setRoomMode/setAway (Task 8)
     ChatSessionModel.swift       MODIFY  echo dedup + members ordering (Task 1); wheel state,
                                           send(text:mode:) + cooked echo, typing preview (Task 3);
                                           whisper routing (Task 4); character/backdrop switching
-                                          (Task 5); avatar download hook (Task 6); room list
-                                          accumulation (Task 7); sound events (Task 8)
+                                          (Task 5); avatar download hook (Task 6); multi-room
+                                          per-room state + active-strip swap (Task 7); room list
+                                          accumulation (Task 8); sound events (Task 9)
     SettingsStore.swift          MODIFY  + realName, sendComicsData, acceptWhispers, soundsEnabled,
                                           comicMode, autoDownloadAvatars, soundsFolder (Task 5/8)
     Strip.swift                  MODIFY  setSelfEmotion/previewSelfText/selfPoseIndex/
                                           selfAnnotations wrappers (Task 2)
     ProtocolStripBridge.swift    MODIFY  AvatarResolver extraDirs (App Support Characters) (Task 6)
     AvatarDownloader.swift       CREATE  URLSession fetch, 2MB cap, one retry, validate (Task 6)
-    SoundLibrary.swift           CREATE  name->URL resolution over the user sounds folder (Task 8)
-    ConversationFile.swift       CREATE  Codable transcript envelope + read/write (Task 9)
-    TranscriptRenderer.swift     CREATE  offline ConversationFile -> CGImage replay (Task 9)
-    TranscriptTextBuilder.swift  CREATE  [ProtocolEvent] -> AttributedString (Task 10)
+    SoundLibrary.swift           CREATE  name->URL resolution over the user sounds folder (Task 9)
+    ConversationFile.swift       CREATE  Codable transcript envelope + read/write (Task 10)
+    TranscriptRenderer.swift     CREATE  offline ConversationFile -> CGImage replay (Task 10)
+    TranscriptTextBuilder.swift  CREATE  [ProtocolEvent] -> AttributedString (Task 11)
   Tests/ComicChatKitTests/       MODIFY/CREATE per task (engine-state suites in the .serialized tree)
 macos/ComicChat/ComicChat/
     BodyCamView.swift            CREATE  the emotion wheel control (Task 3)
@@ -61,26 +63,26 @@ macos/ComicChat/ComicChat/
     SettingsScene.swift          CREATE  Settings tabs: Persona/Character/Backdrop/Sounds/Advanced (Task 5)
     CharacterPickerView.swift    CREATE  icon-thumbnail grid (Task 5)
     BackdropPickerView.swift     CREATE  backdrop-thumbnail grid (Task 5)
-    RoomListWindow.swift         CREATE  LIST results + filters + Go To (Task 7)
-    TranscriptTextView.swift     CREATE  NSTextView-backed text toggle (Task 10)
+    RoomTabBar.swift             CREATE  room tabs + unread badges + join/close (Task 7)
+    RoomListWindow.swift         CREATE  LIST results + filters + Go To (Task 8)
+    TranscriptTextView.swift     CREATE  NSTextView-backed text toggle (Task 11)
     ChatWindow.swift             MODIFY  compose-bar swap, view toggle, member context menu
     AppState.swift               MODIFY  per-task wiring (wheel image, whispers, sounds, save/open)
     AppCommands.swift            MODIFY  File Save/Open/Export/Print, View toggle, Room/Member menus
     ComicStripView.swift         MODIFY  [weak co] debounce fix (Task 1)
     res/wheel/fc_*_l.bmp         CREATE  build-phase copy of the 8 face BMPs (Task 3)
 .superpowers/rig/
-    probe-servers.sh             CREATE  2-line nc reachability probes (Task 11)
-    run-topology-a.sh            CREATE  local ngircd + dual capture proxies (Task 11)
-    run-topology-b.sh            CREATE  dual proxies -> crypthome.com (Task 11)
+    probe-servers.sh             CREATE  2-line nc reachability probes (Task 12)
+    run-topology-a.sh            CREATE  local ngircd + dual capture proxies (Task 12)
+    run-topology-b.sh            CREATE  dual proxies -> crypthome.com (Task 12)
 docs/superpowers/plans/
-    2026-07-18-plan-4b-acceptance-runbook.md  CREATE  the §8 checklist runbook (Task 11)
+    2026-07-18-plan-4b-acceptance-runbook.md  CREATE  the §8 checklist runbook (Task 12)
 ```
 
-**Explicitly NOT in 4b (recorded decisions, flagged for Tim at plan review):**
+**Explicitly NOT in 4b (recorded decisions — reviewed and approved by Tim 2026-07-18):**
 - **CTCP auto-replies** — DEFER (D4 §5 verdict: cosmetic, nothing in §8 depends on them; inbound probes are R20-suppressed with no event, so wiring them needs new engine events; the acceptance runbook documents the expected silence instead).
 - **Custom-avatar publishing** (`# GetCharInfo` answering + HTTP hosting) — DEFER (D4 §4b: `# GetCharInfo` is swallowed eventlessly in the engine; bundled-name announce satisfies §8's avatar interop; we fetch THEIR custom avatars one-way in Task 6). This is the explicit defer-or-event decision the carryover demanded: **defer, no new event.**
 - **`cc_strip_hit_test_avatar`** — DEFER (D2 §6d.2: optional; the member list covers the same actions).
-- **True multi-room** — DEFER; one-room-per-connection-window stands (D1 R7, engine is single-`CIrcProto`).
 - **Per-panel tiles / DIB decode cache / panel cap** — DEFER until panel counts demand (D2 §4.3 verdict).
 - **User-editable comic titles** — the title stays the room name (set once on a fresh strip), so `cc_strip_set_title`-after-lines stays a documented-not-guarded precondition; the runtime guard is owed WHEN titles become user-settable (carryover recorded, not triggered by 4b).
 - **Outbound sound send** (`#SOUND` composition) — DEFER (D4 §6 step 9: not an acceptance gate; inbound playback is Task 8).
@@ -430,7 +432,7 @@ struct BodyCamView: View {
 
 ### Task 4: Whisper UI — ONE tabbed box (D1 §0 correction to spec §5)
 
-The original is ONE floating dialog with a tab per correspondent (`CWhisperBox` + `CWhisperLeaf`, whisprbx.cpp:35-72), NOT spec §5's "separate small windows" — this task implements the original's model (spec amendment flagged for Tim). **Rendering decision (constrained by ONE-STRIP-AT-A-TIME):** whisper leaves render as a TEXT transcript in 4b — a second live comic strip per whisper peer would need a second concurrent `cc_strip`, which comicchat.h forbids (use-after-free, not just a race). Room-scoped whispers ALSO keep rendering in the main strip as whisper balloons (existing 4a behavior — the model already routes `.whisper` through `bridge.apply`). Flagged for Tim at plan review as a recorded deviation.
+The original is ONE floating dialog with a tab per correspondent (`CWhisperBox` + `CWhisperLeaf`, whisprbx.cpp:35-72), NOT spec §5's "separate small windows" — this task implements the original's model (spec amendment APPROVED by Tim at plan review). **Rendering decision (constrained by ONE-STRIP-AT-A-TIME, approved):** whisper leaves render as a TEXT transcript in 4b — a second live comic strip per whisper peer would need a second concurrent `cc_strip`, which comicchat.h forbids (use-after-free, not just a race). Room-scoped whispers ALSO keep rendering in the main strip as whisper balloons (existing 4a behavior — the model already routes `.whisper` through `bridge.apply`). (Task 7 later threads the active-room context through `sendWhisper`'s `channel:` — the box itself is room-agnostic, whispers are nick-scoped.)
 
 **Files:**
 - Modify: `macos/ComicChatKit/Sources/ComicChatKit/ChatSessionModel.swift`
@@ -536,14 +538,59 @@ D4 §4: unknown-name-WITH-URL announces enter the download path; 2 MB cap + one 
 
 ---
 
-### Task 7: Room list + room ops + member-list upgrades
+### Task 7: True multi-room (one connection, N rooms, one live strip) ★ scope added at plan review
 
-D1 §1.6 + backlog item 5: `CRoomList`'s LIST browser with client-side filters + a Go To that joins; plus the ops menu (create/kick/invite/ban/mode/away). One-room-per-connection stands: **Go To = part current room, reset the comic state, join the new room in the SAME session** (cheaper than reconnect and exercises `part`; the strip/transcript reset is exactly `reflowLocked`'s teardown with an empty transcript).
+**Tim's plan-review directive (2026-07-18): do true multi-room** — overriding D1 R7's defer recommendation. Design honors the engine's hard rules instead of fighting them:
+
+- **One connection, N joined rooms.** IRC/IRCX allows it; the OUTBOUND surface is already multi-room (`cc_session_send_say(s, token, …)`, `cc_session_register_room` dense token scheme, `ProtocolSession.RoomState` is already per-channel with `room(_ channel:)`). What's missing is (a) room scope on the Swift EVENT stream and (b) a multi-room model + UI.
+- **ONE live strip, owned by the ACTIVE room** (ONE-STRIP-AT-A-TIME is engine UB territory, not a preference). Every room keeps its own event-log transcript (the canonical-transcript doctrine, unchanged); activating a room = destroy the current strip → rebuild from that room's transcript → recompose — EXACTLY the proven reflow-replay machinery (`reflowLocked`), just parameterized by room. Background rooms show their last composed image (cached) + unread badges; they re-render on activation. No second strip ever exists.
+- **UI: a room tab bar in the one chat window** (the original's MDI tab bar, tabbar.cpp, reborn) — tabs with unread badges; member sidebar/compose/strip all follow the active tab. Whisper box and sounds stay session-level.
+
+**The event-scope gap (found at plan amendment):** `ProtocolEvent.from` returns `(event, roomToken)` (ProtocolEvents.swift:170) but `ProtocolSession.events: AsyncStream<ProtocolEvent>` DROPS the token — fine for one room, fatal for N. Membership/mode events (`.userJoined`, `.names`, …) carry no channel in their payloads; the token is the only scope carrier.
+
+**Files:**
+- Modify: `macos/ComicChatKit/Sources/ComicChatKit/ProtocolSession.swift` (scoped event stream), `ProtocolEvents.swift` (no shape change — the token already exists at the C boundary)
+- Modify: `macos/ComicChatKit/Sources/ComicChatKit/ChatSessionModel.swift` (per-room state, active-strip ownership, join/leave/activate)
+- Create: `macos/ComicChat/ComicChat/RoomTabBar.swift`
+- Modify: `macos/ComicChat/ComicChat/ChatWindow.swift`, `AppState.swift`, `AppCommands.swift` (Room > Enter Room… joins an ADDITIONAL room)
+- Create: `macos/ComicChatKit/Tests/ComicChatKitTests/MultiRoomTests.swift`
+
+**Interfaces:**
+- Consumes: `cc_session_room_channel(s, token)` (comicchat.h:575), the `(event, roomToken)` pair `ProtocolEvent.from` already returns, `reflowLocked`'s teardown/rebuild sequence, Task 3's send path.
+- Produces:
+  - `public struct ScopedEvent: Sendable { public let event: ProtocolEvent; public let channel: String? }` — `channel` nil for session-scoped events (token 0); resolved ON the engine queue at emit time via `cc_session_room_channel` + `WireCodec.decode`,
+  - `ProtocolSession.events` becomes `AsyncStream<ScopedEvent>` (mechanical update of every existing consumer: `ChatSessionModel.startEventConsumer`, any test iterating `events` — grep `for await ev in`; single-room tests just use `.event`),
+  - `ChatSessionModel`: `private struct RoomBox { var transcript: [ProtocolEvent] = []; var lastImage: CGImage?; var lastSizePoints: CGSize = .zero; var unread: Int = 0 }`, engine-queue-owned `private var rooms: [String: RoomBox]` + `private var activeRoom: String` (seeded from `config.room`); `public struct RoomInfo: Sendable, Equatable, Identifiable { public var id: String { name }; public let name: String; public let unread: Int; public let isActive: Bool }`; `onRoomsChanged: (@Sendable ([RoomInfo]) -> Void)?`; `joinRoom(_ room: String) async throws` (session.join; the `.selfJoined` handler creates the box + announces IN THAT CHANNEL — generalize the handler's `config.room` uses to the event's channel); `leaveRoom(_ room: String) async throws` (session.part; if it was active, activate another surviving room or clear the strip); `setActiveRoom(_ room: String)` (engine-queue: stash current image into the old box, tear down strip/bridge exactly as `reflowLocked` does, rebuild from the new room's transcript — title = NEW room name — recompose, zero its unread, fire callbacks); `send`/`sendWhisper` gain an explicit `room:`/keep `channel:` parameter (the compose bar passes its tab's room; `sendWhisper`'s annotations context uses the active room),
+  - routing change in `handleLocked` (now `handleLocked(_ ev: ProtocolEvent, channel: String?, fromServer: Bool)`): channel-scoped events append to THAT room's transcript; if it's the active room → existing bridge.apply/recompose path; else → `unread += 1` (messages only) + `onRoomsChanged`. Session-scoped events (whisper/sound/status/login/appearsAs) behave as today — EXCEPT `.appearsAs`, which is channel-scoped on the wire (it rides room PRIVMSG/DATA): apply to the active strip only if its channel matches, but record the nick→avatar mapping session-wide so a later `setActiveRoom` rebuild resolves it (the transcript replay already does this — the event is IN the room's transcript),
+  - `AppState.rooms: [RoomInfo]`, `AppState.activeRoom: String?`, `AppState.setActiveRoom/joinRoom/leaveRoom` passthroughs; `RoomTabBar` (a horizontal bar of tab buttons: room name + unread badge + close ×; a "+" button opening the Enter Room sheet); `ChatWindow` mounts it above the strip.
+- **NOT produced (recorded):** per-room simultaneous live rendering (needs N strips — engine UB); background rooms update their comic only on activation. Reads as instant because rebuild-from-transcript is the same fast path resize already uses.
+
+- [ ] **Step 1: READ FIRST — the engine's multi-room posture (record findings).** (a) `bridge/cc_session.h`'s token↔channel scheme comment (the "single-CIrcProto-per-session simplification" — confirm what it actually simplifies and that N registered tokens are supported); (b) grep the lifted `engine/ircproto.cpp`/`ircsock.cpp` for single-room state that would corrupt across two joined channels (a "current channel" member read by INBOUND parsing or the outbound builders we use — `cc_session_join/part/send_say/send_whisper/set_topic` all take explicit channel/token, so the suspects are parser-side); (c) confirm how `ProtocolSession` today tracks `RoomState` per channel (it does — `room(_:)`) and where the roomToken is dropped before the stream. If (b) finds load-bearing single-room engine state, STOP → NEEDS_CONTEXT with the exact member and call sites — the fallback (one `cc_session` per room sharing ONE engine queue) is a plan amendment, not an improvisation.
+
+- [ ] **Step 2: Write the failing scoped-stream test.** In `MultiRoomTests.swift` (serialized, loopback scaffold): login → join `#a` AND `#b` (server confirms both) → server sends `:Bob!u@h JOIN #b` and a PRIVMSG to each channel → iterate `session.events` collecting `ScopedEvent`s → assert the `.userJoined` for Bob carries `channel == "#b"` and each `.text` carries its own channel. Run → compile FAIL (`events` yields bare `ProtocolEvent`).
+
+- [ ] **Step 3: Implement the scoped stream.** In `ProtocolSession`: where `ProtocolEvent.from(ev, encoding:)` is consumed (the C `on_event` trampoline path), resolve `roomToken != 0 ? WireCodec.decode(cc_session_room_channel(s, token), encoding:) : nil` and yield `ScopedEvent(event:channel:)`. Update every consumer mechanically. Full `swift test` → green (this step touches many tests; keep the diff mechanical — `.event` unwraps).
+
+- [ ] **Step 4: Write the failing multi-room model test.** Same suite: model start → join `#a` (initial) → `joinRoom("#b")` → server: 3 messages to `#a`, 2 to `#b` → assert: active room `#a` strip `panelCount` == title + 3; `rooms` info shows `#b` unread == 2; `setActiveRoom("#b")` → strip rebuilds (panelCount == title + 2), `#b` unread == 0, `onStripImage` fired with a fresh image; messages to now-background `#a` bump ITS unread without touching the live strip's panelCount; `leaveRoom("#b")` → active falls back to `#a` with its full 3-message strip. Run → FAIL.
+
+- [ ] **Step 5: Implement the model** per Produces. Key mechanics: `_transcript` becomes `rooms[channel].transcript` (the SESSION-scoped events — whisper/sound/status — go into a session log kept for Task 10/11's save/text view: `private var sessionTranscript: [ProtocolEvent]`; the active room's SAVE payload in Task 10 = its room transcript; whispers are already separately stored); `reflowLocked` generalizes to `rebuildStripLocked(for room: String)` (same body, parameterized title/transcript; `setViewport`'s reflow calls it with `activeRoom`); `pendingLocalEchoes`/`announcedBackTo` stay session-level.
+
+- [ ] **Step 6: Tests green; then UI.** `RoomTabBar` + `ChatWindow` mount + `AppCommands` "Enter Room… ⌘J" → `joinRoom`. Build → SUCCEEDED. Replay-fixture launch still works (single room, tab bar shows one tab).
+
+- [ ] **Step 7: Visual artifact.** Two-room live proof needs a local server: `.superpowers/rig/run-rig.sh proxy` gives ngircd on 127.0.0.1:6667 — connect the app, `⌘J` join a second room, send in both, screenshot the tab switch (both strips correct). Coordinator eyeballs.
+
+- [ ] **Step 8: Commit.** `git commit -m "macos: Plan 4b Task 7 - true multi-room (scoped events, per-room transcripts, active-strip swap, room tabs)"`
+
+---
+
+### Task 8: Room list + room ops + member-list upgrades
+
+D1 §1.6 + backlog item 5: `CRoomList`'s LIST browser with client-side filters + a Go To that joins; plus the ops menu (create/kick/invite/ban/mode/away). With Task 7's multi-room landed: **Go To = `joinRoom` + `setActiveRoom`** (a new tab; no part-first — leaving rooms is the tab's close button).
 
 Also the spec-§5 member-list items the 4a backlog skeleton didn't name (self-review catch, spec-honest): **avatar thumbnails + op badges** on the member rows, the **user-info popover** (Get Info → `whois` → `.whoisResult` popover), and **selection-as-addressee** (D1 §1.5: the member list's selection is the original's canonical talk-to state — selected nicks fill `Annotations.addressees` on Task 3's `send`, which drives the camera's facing/order AND §8 step 7's multi-addressee whisper variant).
 
 **Files:**
-- Modify: `macos/ComicChatKit/Sources/ComicChatKit/ProtocolSession.swift` (6 wrappers), `ChatSessionModel.swift` (room list accumulation + `switchRoom`)
+- Modify: `macos/ComicChatKit/Sources/ComicChatKit/ProtocolSession.swift` (6 wrappers), `ChatSessionModel.swift` (room list accumulation, `getInfo`, member rows)
 - Create: `macos/ComicChat/ComicChat/RoomListWindow.swift`
 - Modify: `macos/ComicChat/ComicChat/AppCommands.swift` (Room menu: Room List…, Create Room…, Away toggle), `ChatWindow.swift` (member context menu: Kick/Ban, op-gated), `AppState.swift`, `ComicChatApp.swift` (Window scene)
 - Create: `macos/ComicChatKit/Tests/ComicChatKitTests/RoomOpsTests.swift`
@@ -554,22 +601,21 @@ Also the spec-§5 member-list items the 4a backlog skeleton didn't name (self-re
   - `ProtocolSession` wrappers, all `onQueueGated` + `withEncodedCString` for user text, mirroring `setTopic`'s exact shape: `createRoom(_ channel: String, modes: String? = nil, maxUsers: UInt32 = 0, key: String? = nil)`, `kick(_ channel: String, nick: String, reason: String? = nil)`, `invite(_ channel: String, nick: String)`, `ban(_ channel: String, pattern: String, banning: Bool)`, `setRoomMode(_ channel: String, mode: UInt32, maxUsers: UInt32, password: String? = nil)`, `setAway(_ isAway: Bool, message: String? = nil)` (away is session-scoped — no token),
   - `public struct RoomListItem: Sendable, Equatable { public let name: String; public let users: Int32; public let topic: String }`,
   - `ChatSessionModel.requestRoomList() async throws` + `onRoomList: (@Sendable ([RoomListItem]) -> Void)?` (accumulate `.roomListBegin` → items → `.roomListEnd`, then fire once with the full array),
-  - `ChatSessionModel.switchRoom(_ newRoom: String) async throws` — `session.part(config.room)`, engine-queue: clear `_transcript`/`_whisperHistories`/`announcedBackTo`/`pendingLocalEchoes`, `reflowLocked()`-style strip rebuild (empty transcript → fresh title panel for the NEW room name — update `config.room` first), then `session.join(newRoom)` (the `.selfJoined` handler re-announces, existing behavior),
   - `AppState.roomList: [RoomListItem]`, `AppState.requestRoomList()`, `AppState.goToRoom(_ name: String)`,
   - member-list upgrades: `ChatSessionModel.onMembers` payload widens to `[MemberRow]` where `public struct MemberRow: Sendable, Equatable, Identifiable { public var id: String { nick }; public let nick: String; public let isOp: Bool; public let avatarName: String }` (built inside the existing `emitMembers` detached-Task from `RoomMember` — same snapshot, richer rows; `AppState.members` becomes `[MemberRow]` and `ChatWindow`'s `List` shows a small icon thumbnail resolved via the avatar name → `AvatarFile.iconImage()` with an AppState-level `[String: CGImage]` cache + an op badge),
   - `AppState.selectedMembers: Set<String>` (the `List` selection) — `ChatSessionModel.send` (Task 3's) gains `addressees: [String] = []`; `ChatWindow` passes the selection; the model puts them into `ann.addressees` AND the wire `T<nick>` list rides for free,
   - `ChatSessionModel.getInfo(_ nick: String)` + `onUserInfo: (@Sendable (String, String) -> Void)?` (nick, formatted result) backing a member-row "Get Info" popover — implemented over the EXISTING `ProtocolSession.who(_ mask:)` + `.whoResult` events (there is NO `cc_session_whois` builder in the outbound surface — comicchat.h:600 has `who` only; do not invent one, WHO-by-nick returns the user/host/real info the popover needs).
 
-- [ ] **Step 1: Write the failing tests.** `RoomOpsTests.swift` (serialized, loopback scaffold): (1) each wrapper emits its expected wire verb (assert server-received bytes contain `KICK`, `INVITE`, `MODE` +b / room modes, `AWAY`, and create-room's join-with-modes shape — assert on the VERBS, not exact grammar: the engine builders own the grammar, the test pins that the wrapper reaches the right builder); (2) room-list accumulation: server replies `321`/`322`×3/`323` → `onRoomList` fires once with 3 items; (3) `switchRoom`: after login/join + one message, switch to `#other` → server sees `PART` then `JOIN #other`, transcript is empty, `panelCount` == 1 (fresh title panel only). Run → FAIL.
+- [ ] **Step 1: Write the failing tests.** `RoomOpsTests.swift` (serialized, loopback scaffold): (1) each wrapper emits its expected wire verb (assert server-received bytes contain `KICK`, `INVITE`, `MODE` +b / room modes, `AWAY`, and create-room's join-with-modes shape — assert on the VERBS, not exact grammar: the engine builders own the grammar, the test pins that the wrapper reaches the right builder); (2) room-list accumulation: server replies `321`/`322`×3/`323` → `onRoomList` fires once with 3 items; (3) Go To semantics: `goToRoom("#other")` → server sees `JOIN #other` (NO `PART`), `rooms` gains a tab, active room is `#other` with a fresh title-only strip. Run → FAIL.
 
 - [ ] **Step 2: Implement** per Produces. `RoomListWindow.swift`: `Table` of `RoomListItem` (Name/Users/Topic), a filter `TextField` (name/topic substring, case-insensitive — client-side like the original roomlist.cpp:27-60), min-users `Stepper`, Refresh button (`requestRoomList`), Go To button (`goToRoom` + close). Room menu gains "Room List…" (opens the window), "Create Room…" (an alert-with-textfield sheet → `createRoom` + `goToRoom`), "Away" toggle (`setAway`). Member context menu gains Kick/Ban…, `.disabled(!selfIsOp)` where `selfIsOp` comes from `session.room(config.room)?.members[ownNick]?.isOp == true` surfaced via a model accessor (`ChatSessionModel.selfIsOp` — detached-Task-read into AppState on membership changes, same pattern as `emitMembers`; simplest: extend `emitMembers` to also push `selfIsOp` through a new `onSelfOp: ((Bool) -> Void)?`).
-- [ ] **Step 3: Tests + build green; commit.** `git commit -m "macos: Plan 4b Task 7 - room list window + room ops surface (create/kick/invite/ban/mode/away)"`
+- [ ] **Step 3: Tests + build green; commit.** `git commit -m "macos: Plan 4b Task 8 - room list window + room ops surface + member-list upgrades"`
 
 ---
 
-### Task 8: Sounds — inbound playback over a user sounds folder
+### Task 9: Sounds — inbound playback over a user sounds folder
 
-D1 §4.2 finding (binding): **NO WAV files exist in any tree** — the original played from the Windows media directory by filename; sounds were never downloaded (plan3 command-surface.md:288). So: empty Application Support sounds folder + playback of inbound `.sound` events when a matching file exists; silent-with-status-note otherwise. **Open Q for Tim (plan review): supply period WAVs out of band, or ship the empty folder?** Either way the spec-§5 "original WAV assets bundled" line gets amended. Outbound `#SOUND` send: deferred (header).
+D1 §4.2 finding (binding): **NO WAV files exist in any tree** — the original played from the Windows media directory by filename; sounds were never downloaded (plan3 command-surface.md:288). So: empty Application Support sounds folder + playback of inbound `.sound` events when a matching file exists; silent-with-status-note otherwise. **DECIDED (Tim, plan review): ship the empty folder** — the spec-§5 "original WAV assets bundled" line is amended. Outbound `#SOUND` send: deferred (header).
 
 **Files:**
 - Create: `macos/ComicChatKit/Sources/ComicChatKit/SoundLibrary.swift`
@@ -586,13 +632,13 @@ D1 §4.2 finding (binding): **NO WAV files exist in any tree** — the original 
 
 - [ ] **Step 1: Failing tests.** `SoundLibraryTests.swift` (not serialized): temp dir with `Boing.wav` → `resolve("boing")`, `resolve("BOING.WAV")` hit; `resolve("../etc/passwd")` → nil-or-inside-folder; `resolve("missing")` → nil; a `.mid` file present → NOT resolved. Plus in `ChatSessionModelTests`: a replayed `.sound` event fires `onSound` and lands in the transcript.
 - [ ] **Step 2: Implement; tests green; build green.**
-- [ ] **Step 3: Commit.** `git commit -m "macos: Plan 4b Task 8 - inbound sound playback (user sounds folder, wav-only)"`
+- [ ] **Step 3: Commit.** `git commit -m "macos: Plan 4b Task 9 - inbound sound playback (user sounds folder, wav-only)"`
 
 ---
 
-### Task 9: Save/reopen JSON transcript + PNG/PDF export + print
+### Task 10: Save/reopen JSON transcript + PNG/PDF export + print
 
-Spec §5's deliberate deviation: conversations save as JSON transcripts (messages/annotations/participants) and reopen re-renders identically — the transcript IS already the event log (`ChatSessionModel.transcript`), so save = encode, reopen = replay through a fresh strip. Includes the carryover **reflow byte-compare determinism test**. **ONE-STRIP-AT-A-TIME consequence (recorded decision, flag for Tim):** the reopen viewer renders via the same process-global engine, so opening a saved conversation while connected is refused with an alert ("Disconnect first") — a second concurrent strip is engine UB, not a UI choice.
+Spec §5's deliberate deviation: conversations save as JSON transcripts (messages/annotations/participants) and reopen re-renders identically — the transcript IS already the event log (`ChatSessionModel.transcript`), so save = encode, reopen = replay through a fresh strip. Includes the carryover **reflow byte-compare determinism test**. **ONE-STRIP-AT-A-TIME consequence (APPROVED by Tim at plan review):** the reopen viewer renders via the same process-global engine, so opening a saved conversation while connected is refused with an alert ("Disconnect first") — a second concurrent strip is engine UB, not a UI choice.
 
 **Files:**
 - Create: `macos/ComicChatKit/Sources/ComicChatKit/ConversationFile.swift`, `TranscriptRenderer.swift`
@@ -605,7 +651,7 @@ Spec §5's deliberate deviation: conversations save as JSON transcripts (message
 - Produces:
   - `Annotations: Codable`, `ProtocolEvent: Codable` (both synthesized — enums with associated values synthesize since Swift 5.5; add the conformance clauses and fix any member that resists),
   - `public struct ConversationFile: Codable, Sendable { public var formatVersion: Int; public var host: String; public var room: String; public var nick: String; public var characterName: String; public var backdropName: String; public var encodingRaw: Int32; public var events: [ProtocolEvent]; public static func read(from url: URL) throws -> ConversationFile; public func write(to url: URL) throws }` (`formatVersion` 1; write pretty-printed JSON),
-  - `ChatSessionModel.conversationFile() -> ConversationFile` (snapshot of config + transcript),
+  - `ChatSessionModel.conversationFile() -> ConversationFile` (snapshot of config + the ACTIVE room's transcript — post-Task-7 the save unit is one room's conversation, matching the original's per-doc save),
   - `public final class TranscriptRenderer` — `init(file: ConversationFile, artDir: String)`, `func render(columns: Int32, unitTwips: Int32, scale: CGFloat) throws -> (image: CGImage, pngData: Data)` — its OWN serial queue, installs a metrics canvas, fresh `Strip` (geometry → title → backdrop → self participant → bridge → apply all events → compose), tears everything down (strip close + `cc_set_metrics_canvas(nil)`) BEFORE returning — the whole call is one atomic engine occupation, honoring one-strip-at-a-time as long as no live session exists (documented; the App gates it),
   - App: File menu **Save Transcript… ⌘S** (`NSSavePanel`, `.json`), **Open Transcript…** (`NSOpenPanel` → refuse if `appState.model != nil` → render via `TranscriptRenderer` at the current window width → present in a plain viewer sheet/window reusing `ComicStripView(image:sizePoints:model: nil)` — the view already tolerates a nil model), **Export as PNG…** (current live strip: reuse the last composed image → `NSSavePanel` + `pngData`), **Export as PDF… / Print… ⌘P** (`NSPrintOperation` over a `ComicPrintView: NSView` that draws the composed `CGImage` scaled to fit page width; vertical pagination free via `NSPrintInfo` — PDF export = the print panel's PDF button, plus a direct `dataWithPDF(inside:)` save for Export as PDF).
 
@@ -614,11 +660,11 @@ Spec §5's deliberate deviation: conversations save as JSON transcripts (message
 - [ ] **Step 3: Failing determinism test.** `ReflowDeterminismTests.swift` (serialized): a fixed `ConversationFile` (reuse the fixture-derived transcript: run `FixtureReplayServer`+model once and snapshot, or hand-build 6 events) rendered TWICE through separate `TranscriptRenderer` instances at identical geometry → `#expect(png1 == png2)` (byte-equal — legal under the real-metrics rule because it compares real-vs-real within one run, not against a frozen golden; note this in the test's doc comment).
 - [ ] **Step 4: Implement `TranscriptRenderer`; determinism green.** (This test also pays the 4a carryover: same transcript + geometry ⇒ identical PNG.)
 - [ ] **Step 5: App wiring** per Produces; build green; screenshot the reopened-transcript viewer next to a saved session; coordinator eyeballs.
-- [ ] **Step 6: Commit.** `git commit -m "macos: Plan 4b Task 9 - JSON transcript save/reopen + PNG/PDF export + print + reflow determinism test"`
+- [ ] **Step 6: Commit.** `git commit -m "macos: Plan 4b Task 10 - JSON transcript save/reopen + PNG/PDF export + print + reflow determinism test"`
 
 ---
 
-### Task 10: Plain-text view toggle
+### Task 11: Plain-text view toggle
 
 D1 §1.2: `NSTextView` transcript from the same event log; View menu toggles comic/text per spec §5 (persisted `view.comicMode`).
 
@@ -632,11 +678,13 @@ D1 §1.2: `NSTextView` transcript from the same event log; View menu toggles com
 - Consumes: `[ProtocolEvent]`, `SettingsStore.comicMode`.
 - Produces: `public enum TranscriptTextBuilder { public static func attributedString(for events: [ProtocolEvent], showArrivals: Bool = true) -> AttributedString }` — per-kind styling: `nick: text` plain; whisper `nick whispers: text` italic secondary; action `• nick text` italic; sound `♪ nick played file`; arrivals `→ nick joined` / `← nick left` secondary (only when `showArrivals`); status/errors secondary. App: `TranscriptTextView` (`NSViewRepresentable` wrapping a non-editable `NSTextView` in a scroll view, stick-to-bottom on append — set the attributed string from `AppState.transcriptText`); `ChatWindow` shows it instead of `ComicStripView` when `!appState.comicMode`; View menu "Comic Strip view ⌘1"/"Plain Text view ⌘2"; `AppState.transcriptText` recomputed from `model.transcript` on each strip/status update it already observes (cheap at chat scale; a `.text`-count-gated cache if it ever isn't).
 
-- [ ] **Step 1: Failing builder tests** (content assertions on the produced string for one event of each styled kind; arrivals suppressed when `showArrivals: false`). **Step 2: Implement; green.** **Step 3: App wiring + build; screenshot both views of the same replayed session; coordinator eyeballs.** **Step 4: Commit.** `git commit -m "macos: Plan 4b Task 10 - plain-text transcript view + view toggle"`
+(Post-Task-7 note: the text view shows the ACTIVE room's transcript — `AppState.transcriptText` recomputes on tab switch too.)
+
+- [ ] **Step 1: Failing builder tests** (content assertions on the produced string for one event of each styled kind; arrivals suppressed when `showArrivals: false`). **Step 2: Implement; green.** **Step 3: App wiring + build; screenshot both views of the same replayed session; coordinator eyeballs.** **Step 4: Commit.** `git commit -m "macos: Plan 4b Task 11 - plain-text transcript view + view toggle"`
 
 ---
 
-### Task 11: §8 acceptance prep — rig scripts + runbook (agent-runnable half)
+### Task 12: §8 acceptance prep — rig scripts + runbook (agent-runnable half)
 
 Everything the acceptance needs staged so the human session is pure driving. No public-server traffic in this task beyond the sanctioned 2-line probes.
 
@@ -651,13 +699,13 @@ Everything the acceptance needs staged so the human session is pure driving. No 
 - [ ] **Step 1: `probe-servers.sh`** — the 2-line checks (exactly what 4b planning ran): `printf 'MODE ISIRCX\r\nQUIT\r\n' | nc -w 6 www.crypthome.com 6667` (expect `800 * 0 0 ANON 512 *`) and same for `comic.dedoky.com` (expect `451`). Prints PASS/FAIL per server. Run it: both PASS today.
 - [ ] **Step 2: `run-topology-a.sh`** — starts `./run-rig.sh` (ngircd + win-side proxy :6668 + Wine client into `#comicrig`) PLUS the Mac-side proxy: `bun capture-proxy.ts 6669 127.0.0.1 6667 captures/p4b-a-mac.jsonl`. Echoes the Mac app connect instructions (`127.0.0.1:6669`, `#comicrig`). `stop` argument kills everything (mirror run-rig.sh's own stop).
 - [ ] **Step 3: `run-topology-b.sh`** — dual proxies at crypthome: `bun capture-proxy.ts 6668 www.crypthome.com 6667 captures/p4b-b-win.jsonl` + `bun capture-proxy.ts 6669 www.crypthome.com 6667 captures/p4b-b-mac.jsonl`, then launches Wine `cchat.exe "irc://127.0.0.1:6668/#cctest"`. Prints the etiquette preamble (scratch room `#cctest`, say hello in `#Crypt` if people are present, keep it short, 10-user memorial box).
-- [ ] **Step 4: The runbook** — D4 §6's ordered checklist **verbatim** (steps 1-11), once per topology, with: the P1-P4 prerequisites marked DELIVERED (P1/P3 = 4a Tasks 2/8; P2 = 4a Task 6; P4 = 4a Task 3 — accented text now additionally SAFE outbound via 4b Task 1, but keep acceptance text ASCII per D4 risk 7 anyway); the expected-silence notes (CTCP Get Version/Ping/Profile/Get Character → no reply; custom-avatar publishing deferred); artifact locations (`.superpowers/rig/captures/p4b-*`, `.superpowers/sdd/p4b-acceptance/` for screenshots); the `cc-dumpart --replay` reproduction step; the fixture-promotion step (an annotated + an escaped-byte + a real captured announce exchange → `Tests/ComicChatKitTests/Fixtures/captures/`, with the HAND-AUTHORED marker retired where a real capture replaces one); the IRC7-in-Docker contingency (ONLY if crypthome probe fails on the day: build from `github.com/irc7-com/irc7` Dockerfile, smoke-test that pre-registration `MODE ISIRCX` answers 800/451 — D4 risk 4 — before substituting it as Topology B); dedoky fallback (`NICKLEN=9` — pick short nicks).
+- [ ] **Step 4: The runbook** — D4 §6's ordered checklist **verbatim** (steps 1-11), once per topology, with: the P1-P4 prerequisites marked DELIVERED (P1/P3 = 4a Tasks 2/8; P2 = 4a Task 6; P4 = 4a Task 3 — accented text now additionally SAFE outbound via 4b Task 1, but keep acceptance text ASCII per D4 risk 7 anyway); the expected-silence notes (CTCP Get Version/Ping/Profile/Get Character → no reply; custom-avatar publishing deferred); artifact locations (`.superpowers/rig/captures/p4b-*`, `.superpowers/sdd/p4b-acceptance/` for screenshots); the `cc-dumpart --replay` reproduction step; the fixture-promotion step (an annotated + an escaped-byte + a real captured announce exchange → `Tests/ComicChatKitTests/Fixtures/captures/`, with the HAND-AUTHORED marker retired where a real capture replaces one); the IRC7-in-Docker contingency (ONLY if crypthome probe fails on the day: build from `github.com/irc7-com/irc7` Dockerfile, smoke-test that pre-registration `MODE ISIRCX` answers 800/451 — D4 risk 4 — before substituting it as Topology B); dedoky fallback (`NICKLEN=9` — pick short nicks); a **local multi-room sanity step appended to Topology A** (Tim joins two rooms on the local rig, verifies tab switch renders both correctly — Task 7's live validation; LOCAL ONLY, never on the public boxes).
 - [ ] **Step 5: Dry-run Topology A end-to-end without Tim** (agent-legal: local only): scripts up, Mac app connects through the proxy, Wine client visible, one say from the Mac side typed by… nobody — verify everything EXCEPT typed input (app connects, joins, strip renders the Wine client's presence). Screenshot both windows side by side; coordinator eyeballs. Fix script bugs now, not during Tim's session.
-- [ ] **Step 6: Commit.** `git commit -m "macos: Plan 4b Task 11 - acceptance rig scripts + runbook (topology A dry-run verified)"`
+- [ ] **Step 6: Commit.** `git commit -m "macos: Plan 4b Task 12 - acceptance rig scripts + runbook (topology A dry-run verified)"`
 
 ---
 
-### Task 12: THE spec-§8 LIVE ACCEPTANCE ★ (human-driven — Tim at the keyboard)
+### Task 13: THE spec-§8 LIVE ACCEPTANCE ★ (human-driven — Tim at the keyboard)
 
 The project's exit milestone. The agent runs rigs and captures artifacts; **Tim drives both compose bars** (Mac app + Wine 1998 client). Etiquette rules from D4 §1.1 are binding on the Topology B session.
 
@@ -669,7 +717,7 @@ The project's exit milestone. The agent runs rigs and captures artifacts; **Tim 
 - [ ] **Step 4: Replay reproduction.** `swift run cc-dumpart --replay` over the Mac-side s2c capture from each topology; compare the reproduced strip against the live screenshots (coordinator + Tim eyeball).
 - [ ] **Step 5: Fixture promotion.** Promote from the captures into the corpus: (a) an annotated cooked-pose exchange, (b) an escaped-byte annotation line (the Plan-3 must-own finally captured for real — retire the HAND-AUTHORED marker note in the Task 3 vector's comment, keeping the hand-authored vector itself), (c) a real `# Appears as` announce (4a Task 8's brief-premise correction wanted one). Add/adjust replay tests referencing them; `swift test` green.
 - [ ] **Step 6: Ledger + exit artifacts.** Progress-ledger entry with both topologies' outcomes, artifact paths, any deviations observed (own-say echo behavior of each server — the Task 1 dedup's live validation; DATA re-pairing under real interleaving — D4 risk 5). Any FAILURE at any step becomes a replayable fixture + a fix task — do not paper over (the 4a fonts.cpp lesson: live runs find what selftests mask).
-- [ ] **Step 7: Commit** (fixtures + runbook copies + ledger). `git commit -m "macos: Plan 4b Task 12 - spec-§8 live acceptance (topology A+B) + fixture promotion"`
+- [ ] **Step 7: Commit** (fixtures + runbook copies + ledger). `git commit -m "macos: Plan 4b Task 13 - spec-§8 live acceptance (topology A+B) + fixture promotion"`
 
 ---
 
@@ -677,13 +725,13 @@ The project's exit milestone. The agent runs rigs and captures artifacts; **Tim 
 
 **The spec-§8 manual acceptance passes on both topologies** — poses, avatars, whispers in both directions against the genuine 1998 client; artifacts captured (dual JSONL + screenshots + replay reproduction); fixture corpus refreshed with real annotated/escaped/announce captures. With that, the port's spec is delivered end-to-end: engine (Plans 1-2), protocol (Plan 3), app (4a), features + live interop (4b).
 
-## Open questions for Tim (answer at plan review — the plan proceeds on the recommendations if unopposed)
+## Plan-review decisions (Tim, 2026-07-18 — all recorded, binding)
 
-1. **Sounds source (Task 8, spec §5 amendment either way):** ship the empty Application Support sounds folder (recommendation — playback works the moment WAVs are dropped in), or you supply period WAVs from a Windows install out of band?
-2. **Whisper UI (Task 4, spec §5 amendment):** ONE tabbed box matching the original (recommendation, and what this plan implements) — confirm the spec's "separate small windows" phrasing is amended. Sub-decision: whisper leaves render as TEXT transcripts (comic-whisper would need a second concurrent strip — engine UB); room whispers still render as whisper balloons in the main strip. OK?
-3. **Multi-room:** one-room-per-connection-window, true multi-room deferred (recommendation stands from D1 R7) — confirm.
-4. **New in 4b — auto-download default (Task 6):** the ORIGINAL defaults auto-download OFF (chat.cpp:208); this plan defaults it ON (modern context: the community art servers are gone, announces with URLs are rare and human-scale). Flip to off-by-default if you prefer strict fidelity.
-5. **New in 4b — saved-transcript viewer gating (Task 9):** opening a saved conversation refuses while connected (one-strip-at-a-time). Acceptable? (Alternative — viewer replaces the live session — felt worse.)
+1. **Sounds source (Task 9):** APPROVED — empty Application Support sounds folder; playback works the moment WAVs are dropped in. Spec §5's "original WAV assets bundled" is amended accordingly.
+2. **Whisper UI (Task 4):** APPROVED — ONE tabbed box (spec §5 "separate small windows" amended), TEXT leaves, room whispers still balloon in the main strip.
+3. **Multi-room:** **TIM OVERRODE THE RECOMMENDATION — true multi-room is IN SCOPE** → Task 7 (one connection, N rooms, one live strip, room tabs). D1 R7's defer is retired.
+4. **Auto-download default (Task 6):** APPROVED — ON by default (deviation from the original's OFF, chat.cpp:208, recorded).
+5. **Saved-transcript viewer gating (Task 10):** APPROVED — refuses to open while connected (one-strip-at-a-time).
 
 ## Merge preconditions (standing, Tim-gated — unchanged by 4b)
 
@@ -693,13 +741,13 @@ The project's exit milestone. The agent runs rigs and captures artifacts; **Tim 
 
 ## Self-review (against the handoff, the spec, and the four reports)
 
-- **14-item backlog coverage:** 1→T2+T3; 2→T4 (+think/action in T3); 3→T5; 4→T6; 5→T7; 6→T8; 7→T9; 8→T10; 9→DEFERRED (recorded decision, header); 10→DEFERRED (one-room-per-window, T7's switchRoom); 11→DEFERRED (perf, until demanded); 12→DEFERRED (hit-test); 13→T11+T12; 14→Merge preconditions.
+- **14-item backlog coverage:** 1→T2+T3; 2→T4 (+think/action in T3); 3→T5; 4→T6; 5→T8; 6→T9; 7→T10; 8→T11; 9→DEFERRED (recorded decision, header); 10→**T7 (true multi-room — Tim's plan-review override of the defer recommendation)**; 11→DEFERRED (perf, until demanded); 12→DEFERRED (hit-test); 13→T12+T13; 14→Merge preconditions.
 - **8 named carryovers:** say-encoding §8 prerequisite → T1 (incl. whisper/setTopic, found wider than named); NUL-truncation doc → T1 S3; `s->avatars` accumulation comment → T6; GetCharInfo defer-or-event → DECIDED defer, header + T6; set_title-after-lines guard → not triggered (title stays room name; recorded); own-say double-render → T1 dedup + T12 S6 live validation; reflow byte-compare → T9 S3; emitMembers ordering → T1 S7-8; `[weak co]` → T1 S9; replay-fixture sheet → T1 S9.
-- **Spec-§5 features:** wheel ✓T3, whisper boxes ✓T4 (amended one-window), room list ✓T7, member list incl. thumbnails/op badges/user-info popover/selection-as-addressee ✓T7 (self-review catch — these were in spec §5 but NOT in the 14-item backlog skeleton), pickers ✓T5, text view ✓T10, sounds ✓T8 (amended no-bundle), save/print/export ✓T9, connect/say/think/action ✓ (4a+T3). §8 ✓T11-12. NOTE: T1's members-ordering test is written against the `[String]` payload; T7 widens `onMembers` to `[MemberRow]` and updates that test in the same task.
+- **Spec-§5 features:** wheel ✓T3, whisper boxes ✓T4 (amended one-window), multi-room ✓T7, room list ✓T8, member list incl. thumbnails/op badges/user-info popover/selection-as-addressee ✓T8 (self-review catch — these were in spec §5 but NOT in the 14-item backlog skeleton), pickers ✓T5, text view ✓T11, sounds ✓T9 (amended no-bundle), save/print/export ✓T10, connect/say/think/action ✓ (4a+T3). §8 ✓T12-13. NOTE: T1's members-ordering test is written against the `[String]` payload; T8 widens `onMembers` to `[MemberRow]` and updates that test in the same task. Signature evolution is deliberate and ordered: T3 defines `send(_:mode:)`; T7 adds `room:`; T8 adds `addressees:` — final shape `send(room:text:mode:addressees:)`, each task updating the compose-bar call site it owns.
 - **Type consistency spot checks:** `send(_:mode:)` (T3) used by ComposeBar (T3) and unchanged by later tasks; `smMode(for:)` defined T3, reused T4's sendWhisper; `WhisperLine` defined T4 Produces, used in its tests/UI; `fromServer:` handleLocked param defined T1, used by T3's synthetic send; `selfAnnotations()` defined T2, consumed T3/T4; `changeCharacter` (T5) resets T3's `selfAvatarFile`; `extraDirs` (T6) feeds T5's picker search-order note; `ConversationFile` (T9) standalone; `TranscriptTextBuilder` (T10) standalone.
-- **Read-first discipline:** T2 S1 (the one engine task) carries the mandatory read+escalate step with exact citations; T4 S1 and T5 (config-string lifetime) name their read-first questions inline. No task edits original files beyond `cc_compose.cpp`/`cc_selftest.cpp` bridge code — Edit Rules bite nowhere new; if T2's Step 1 finds otherwise, escalation is mandatory.
+- **Read-first discipline:** T2 S1 (the one engine task) and T7 S1 (the engine's multi-room posture) carry mandatory read+escalate steps with exact citations; T4 S1 and T5 (config-string lifetime) name their read-first questions inline. No task edits original files beyond `cc_compose.cpp`/`cc_selftest.cpp` bridge code — Edit Rules bite nowhere new; if T2/T7 Step 1 finds otherwise, escalation is mandatory.
 - **Placeholder scan:** the deliberate not-shown code (scaffold copies from named existing suites, Step-1-dependent C internals) is always accompanied by the exact source file to copy from or the exact escalation path — discovery steps, not TODOs.
-- **Risk honesty:** T2 S1 (builder entanglement), T9 (one-strip gating), T12 S1 (server availability) carry explicit STOP/contingency outcomes.
+- **Risk honesty:** T2 S1 (builder entanglement), T7 S1 (single-room engine state — the one place multi-room could hit an engine wall; explicit NEEDS_CONTEXT escalation with a named fallback that itself requires a ruling), T10 (one-strip gating), T13 S1 (server availability) carry explicit STOP/contingency outcomes.
 
 
 
