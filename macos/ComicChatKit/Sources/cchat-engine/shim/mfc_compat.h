@@ -44,6 +44,17 @@ typedef const char*    LPCSTR;
 typedef char*          LPSTR;
 typedef const char*    LPCTSTR;
 typedef char*          LPTSTR;
+// R9 (Plan 3 Task 2): WCHAR is Win32's UTF-16 code-unit width (16-bit), used
+// by ccommon_str.cpp's bConvertWideStringToUTF8/bConvertUTF8StringToWide (the
+// only lifted callers). Deliberately NOT wchar_t -- wchar_t is 32-bit on this
+// platform (Darwin), which would silently double every wide-string buffer's
+// byte layout relative to the original Win32 UCS-2 assumption these functions
+// were written against (their `new WCHAR[]` allocation math, and the BMP-only
+// 1-to-3-byte UTF-8 encode/decode, both assume a 16-bit code unit). uint16_t
+// matches Win32's actual WCHAR exactly.
+typedef uint16_t       WCHAR;
+typedef const WCHAR*   LPCWSTR;
+typedef WCHAR*         LPWSTR;
 typedef void*          LPVOID;
 typedef BYTE*          LPBYTE;   // R9: avatar.h CPose constructor params
 typedef DWORD*         LPDWORD;  // R9: avatar.h CPose constructor params
@@ -244,6 +255,53 @@ int  ccLogWouldEmit(int level);
 #endif
 #define VERIFY(e) do { if (!(e)) ccLogError("VERIFY failed: %s (%s:%d)", #e, __FILE__, __LINE__); } while (0)
 #define TRACE(...) ccLog(__VA_ARGS__)
+
+// --- Win32 NLS surface for balloon.cpp's Capitalize (rule R9; Plan 3 Task 2,
+//     restoring Capitalize verbatim -- see balloon.cpp for the full history).
+//     Capitalize's reachable branch on this port is exclusively the `default:`
+//     one (ccContext().session.charSet has no setter anywhere in the engine;
+//     it is permanently 0 == ANSI_CHARSET, the CP-1252 posture Task 2 Step 1
+//     makes permanent) -- CharUpperBuff below is the only one of these that
+//     ever actually executes. MAKELCID/MAKELANGID/LANG_*/SUBLANG_NEUTRAL/
+//     SORT_DEFAULT/LCMapString/LCMAP_UPPERCASE exist ONLY so the GREEK_CHARSET/
+//     RUSSIAN_CHARSET/TURKISH_CHARSET branches (dead code under this port's
+//     fixed CP-1252 posture, but part of Capitalize's ORIGINAL body, which the
+//     brief requires restoring verbatim rather than re-forking) still compile;
+//     they are unreachable and intentionally unimplemented placeholders (each
+//     ASSERTs if ever actually called -- a real Far-East/Cyrillic build would
+//     need to implement them for real, at which point this comment is stale).
+#define LANG_GREEK       0x08
+#define LANG_RUSSIAN     0x19
+#define LANG_TURKISH     0x1f
+#define SUBLANG_NEUTRAL  0x00
+#define SORT_DEFAULT     0x00
+inline DWORD MAKELANGID(int primary, int sub) { return (DWORD)((sub << 10) | primary); }
+inline DWORD MAKELCID(DWORD langid, int /*sort*/) { return langid; }
+#define LCMAP_UPPERCASE  0x00000200
+inline int LCMapString(DWORD /*lcid*/, DWORD /*mapFlags*/, const char* /*src*/, int /*cchSrc*/, char* /*dst*/, int /*cchDst*/) {
+    ASSERT(0);  // unreachable: charSet is permanently ANSI_CHARSET on this port (see above)
+    return 0;
+}
+// R9 (Plan 3 Task 2): CharUpperBuff -- Capitalize's actually-reachable
+// default-branch call (theApp.m_charSet == ANSI_CHARSET, i.e. CP-1252). Real
+// Win32 CharUpperBuffA under codepage 1252 uppercases the ASCII range exactly
+// like the "C" locale's toupper AND additionally case-folds the accented
+// Latin-1-supplement bytes (0x80-0xFF) per the CP-1252 codepage's own case
+// table. This port has no authoritative source for that accented-byte table
+// (no captured reference exercises it, and guessing it would be exactly the
+// kind of unattributable fabrication the port's fidelity discipline forbids) --
+// so only the ASCII range (0x00-0x7F) is uppercased, matching real
+// CharUpperBuffA exactly for plain-ASCII balloon text (every existing
+// selftest's input domain); bytes >= 0x80 pass through UNCHANGED rather than
+// risk a wrong case-fold. Flagged here as a known gap: verify against a real
+// captured accented-text sample before Task 8/9's byte-for-byte replay work,
+// and extend this table if a mismatch surfaces.
+inline void CharUpperBuff(char* s, int len) {
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c <= 0x7F) s[i] = (char)toupper(c);
+    }
+}
 
 // --- MFC exception-handling macros (rule R9; used by lifted avbfile.cpp /
 //     avatario.cpp around `new` calls that could throw). MFC's TRY/CATCH_ALL
@@ -490,8 +548,8 @@ struct TEXTMETRIC {
 };
 
 // R9 (Plan 2 Task 6): Win32 <wingdi.h> charset constants used by fonts.cpp's
-// SetFonts (Far-East-italic test) and balloon.cpp's Capitalize (R11-wrapped,
-// but must still parse). Values are Win32's exact <wingdi.h> definitions.
+// SetFonts (Far-East-italic test) and balloon.cpp's Capitalize (live since
+// Plan 3 Task 2 -- see that function). Values are Win32's exact <wingdi.h> definitions.
 // DEFAULT_CHARSET (1) is already defined further down for EnumFontFamiliesEx.
 #define ANSI_CHARSET        0
 #define GREEK_CHARSET       161
@@ -1253,6 +1311,17 @@ public:
     void* RemoveTail() {
         void* value = m_v.back();
         m_v.pop_back();
+        return value;
+    }
+
+    // R9 (Plan 3 Task 2): RemoveHead -- the parser's query list (a CPtrList-
+    // derived CCQuery, Task 4) is an AddTail-append / RemoveHead-dequeue FIFO
+    // (the original's "queue outstanding queries, service the oldest first"
+    // idiom -- ircproto-map.md Sec8). MFC's RemoveHead returns the removed
+    // element pointer, same contract as RemoveTail above.
+    void* RemoveHead() {
+        void* value = m_v.front();
+        m_v.erase(m_v.begin());
         return value;
     }
 

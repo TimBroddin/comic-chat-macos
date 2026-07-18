@@ -17,9 +17,12 @@
 // that lived here are gone, replaced by their real (now LIVE) bodies. Task 8
 // lifted panel.cpp: CPanelElement::SetBBox (the last original Plan-1 stub) is
 // gone too — all thirteen Plan-1 link stubs are now retired. What remains here
-// is later-plan debt: the intl.c CP-1252/MIME stubs (Plan 3) and, added by
-// Task 8, the CUserInfo::GetQualifiedName vtable-completeness trap (Plan 3,
-// paired with the CUserInfo ctor/GetScreenName R12a singles in
+// is: the intl.c CP-1252/MIME stubs, now the PERMANENT implementation of that
+// seam (Plan 3 Task 2 Step 1 decision — CP-1252 is this port's permanent
+// posture, not a placeholder awaiting an intl.c lift; see the comment at
+// their definition below) and, added by Task 8, the
+// CUserInfo::GetQualifiedName vtable-completeness trap (Plan 3, paired with
+// the CUserInfo ctor/GetScreenName R12a singles in
 // lifted_singles.cpp — the R17 session user table made CUserInfo linkable).
 
 #include "mfc_compat.h"
@@ -70,28 +73,36 @@ const char* GetMyNickName() { return ""; }
 //     trap stubs that lived here (Task 4) are gone -- Task 6 lifted arc.cpp
 //     (R1 only), which now defines both symbols. --------------------------
 
-// --- INTL/MIME free functions (intl.c) — Plan 2 Task 6, R12(b) variant.
+// --- INTL/MIME free functions (intl.c) — permanent CP-1252 implementation
+//     (decision recorded Plan 3 Task 2 Step 1; originally landed Plan 2 Task 6
+//     as an R12(b) stub pending an intl.c lift that this decision retires).
 //     balloon.cpp's word-wrap path (ForceLineBreak / FindFurthestLineBreak /
 //     BreakIntoLines) calls GetMime()/iBytesofChar()/FindSubStringForINTL-
 //     ThatFits(). Their real bodies live in intl.c, which is NOT scheduled
 //     for any lift in this roadmap (it is the East-Asian MIME/DBCS layer,
-//     out of the engine-port scope, spec §"CP-1252 by default").
+//     out of the engine-port scope, spec §4.5 "CP-1252 by default").
+//
+//     Plan 3 Task 2 makes CP-1252 the PERMANENT posture for this port (spec
+//     §4.5; wire text stays bytes end-to-end, the engine never transcodes) --
+//     these three are no longer "delete when intl.c lifts" placeholders, they
+//     are the permanent CP-1252 implementation of this seam. No code changed
+//     below, only this comment (the task brief's Step 1(b) is comment-only).
 //
 //     This port runs a single-byte CP-1252 codepage, so GetMime() returns
 //     NULL exactly as intl.c's `void *GetMime() { return g_pMime; }` does
 //     when no Far-East codepage is active (g_pMime stays NULL). That is the
 //     SAME already-reviewed "no DBCS/MIME on this port" posture the shim
-//     codified for IsDBCSLeadByte()->FALSE / CharNext() (Task 5). So these
-//     are R12(b) stubs, but two return their CP-1252-correct live values
-//     rather than trapping, because balloon.cpp genuinely calls them on the
-//     load/layout path and NULL/1 is the honest single-byte answer:
+//     codified for IsDBCSLeadByte()->FALSE / CharNext() (Task 5). Two of the
+//     three return their CP-1252-correct live values rather than trapping,
+//     because balloon.cpp genuinely calls them on the load/layout path and
+//     NULL/1 is the honest single-byte answer:
 //       * GetMime()      -> NULL : reproduces g_pMime==NULL (no MIME active).
 //       * iBytesofChar() -> 1    : intl.c's own `if (!g_pMime) return 1;`
 //                                  branch value under the NULL-MIME state.
 //     FindSubStringForINTLThatFits() is only ever reached when GetMime()!=NULL
 //     (guarded at balloon.cpp:289 `if (GetMime())`), so on this port it is
-//     genuinely unreachable -> a true ASSERT(0) trap. If a future Far-East
-//     build lands, intl.c must be lifted and these three stubs deleted.
+//     genuinely unreachable -> a true ASSERT(0) trap; that stays permanent
+//     too (no Far-East build is in scope for this port).
 //     NOTE (reviewer): the non-trapping return values are a documented
 //     judgment call at the R12(a)/R12(b) boundary -- lifting GetMime's
 //     verbatim body would drag in the whole MIME machinery (g_pMime/SetMime/

@@ -30,8 +30,8 @@
 #include <math.h>
 // R8+R9: <tchar.h>/<winnls.h> deleted. mfc_compat.h provides _T/_tcslen/
 // _tcscpy (the tchar.h names used here). The winnls.h NLS symbols
-// (CharUpperBuff/LCMapString/MAKELCID/... in Capitalize) are handled by the
-// R11 wrap of Capitalize below -- see that function.
+// (CharUpperBuff/LCMapString/MAKELCID/... in Capitalize) are R9 shim additions
+// in mfc_compat.h (Plan 3 Task 2) -- see that header and Capitalize below.
 
 // R2: "extern CChatApp theApp;" deleted; theApp reads are R17-rerouted to
 // ccContext().session (theApp.m_charSet in Capitalize).
@@ -124,20 +124,26 @@ void DrawPoints(CDC *pdc, POINT *p, int nPts)
 }
 #endif
 
-// R11 (Plan 2 Task 6, session/NLS layer): Capitalize uppercases balloon text
-// for the comic look, driven by theApp.m_charSet (R17: session.charSet) and
-// implemented entirely with Win32 NLS APIs the shim does not provide
-// (CharUpperBuff/LCMapString/MAKELCID/MAKELANGID + the LANG_*/SUBLANG_*/SORT_*/
-// LCMAP_* constants). It is a session-layer text transform, not part of the
-// load/parse or layout-geometry path -- the recording canvas measures every
-// byte at 120 twips regardless of case, so a no-op leaves all balloon
-// geometry identical. The entire original body is preserved under CC_NO_UI so
-// Plan 3's real NLS layer can restore it verbatim; the #else no-op leaves the
-// string unchanged (theApp.m_charSet -> ccContext().session.charSet is the R17
-// reroute inside the wrapped body).
+// Restored verbatim (Plan 3 Task 2, Step 8; was R11-wrapped no-op in Plan 2
+// Task 6 -- see git history a93d81c..d1da855 for the original wrap rationale).
+// Plan 2 Task 6 wrapped this function's body behind CC_NO_UI as a no-op: the
+// recording canvas measures every byte at 120 twips regardless of case, so
+// the wrap was layout-invisible THEN -- but it was flagged as a "latent
+// real-metrics layout divergence" handover debt, because protocol-driven
+// balloon text (this plan) must match the original's actual capitalized
+// glyphs, not a case-preserved stand-in, once real font metrics matter.
+// Restored here per the brief: theApp.m_charSet -> ccContext().session.charSet
+// (R17, already wired by Plan 2 Task 6) is the only reroute; every other line
+// is byte-identical to the original (balloon.cpp:107-150 in the read-only
+// v2.5-beta-1-modern/ reference). ccContext().session.charSet has no setter
+// anywhere in this port (see engine_context.h) -- it is permanently 0 ==
+// ANSI_CHARSET, so only the `default:` branch (CharUpperBuff) is reachable;
+// the GREEK_CHARSET/RUSSIAN_CHARSET/TURKISH_CHARSET branches are preserved
+// verbatim as dead code, compiling against the minimal R9 NLS shim surface
+// added in mfc_compat.h (MAKELCID/MAKELANGID/LANG_*/LCMapString) -- see that
+// header's comment for why they're unreachable placeholders on this port.
 void Capitalize(char *str)
 {
-#ifndef CC_NO_UI
 	DWORD lcid;
 	unsigned char *cptr;
 	switch (ccContext().session.charSet) {  // R17 (was theApp.m_charSet)
@@ -172,16 +178,13 @@ void Capitalize(char *str)
 				else if (*cptr == 105) *cptr = 221;
 				cptr++;
 			}
-			break;			
+			break;
 		}
 	}
 	char *src = strdup(str);
 	int len = _tcslen(str)+1;
 	VERIFY(LCMapString(lcid, LCMAP_UPPERCASE, src, len, str, len));
 	free(src);
-#else
-	(void)str;  // session/NLS uppercase omitted headlessly (no layout effect)
-#endif
 }
 
 

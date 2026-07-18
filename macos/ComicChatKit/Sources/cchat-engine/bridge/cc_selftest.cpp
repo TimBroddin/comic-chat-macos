@@ -17,12 +17,18 @@
 #include "backdrop.h"
 #include "panel.h"      // Task 6: CUnitPanelPage (SetFonts + font statics)
 #include "bridge_art.h" // Task 7 review fix: bridge_decode_aura_to_white_alpha
+#include "ccommon_str.h" // Plan 3 Task 2: bLowLevelQuoting/Unquoting + UTF-8 codec
 #include <unistd.h>   // mkstemp, close (testShimFileApis)
 
 // ::BreakIntoLines free function (balloon.cpp) — declared here for the
 // characterization test (balloon.h declares only the CLabel:: method wrapper).
 int BreakIntoLines(CDC *pdc, int iMaxWidth, char *szString, CDWordArray *prgdwFormatting,
                    char *rgszStarts[], int rgiLengths[], int rgiWidths[]);
+
+// ::Capitalize free function (balloon.cpp) — declared here for the Task 2
+// selftest; balloon.h does not declare it (same situation as BreakIntoLines
+// above).
+void Capitalize(char *str);
 
 static int g_failures;
 #define CC_CHECK(e) do { if (!(e)) { g_failures++; ccLog("SELFTEST FAIL: %s (%s:%d)", #e, __FILE__, __LINE__); } } while (0)
@@ -2413,6 +2419,16 @@ static int cc_selftest_strip(const char* avatarPath, const char* backdropPath) {
     //   "Hello there" (panel 1), "Hi yourself" (panel 2), "How are you" (panel 3),
     //   "Doing great" (panel 4) -- confirming speaker->panel->balloon threading.
     // No line was inexplicable; the snapshot is frozen verbatim from that run.
+    // UPPERCASE (Plan 3 Task 2, Step 8): CBWoodringNormal's constructor calls
+    // Capitalize(m_str) unconditionally (balloon.cpp) -- restoring Capitalize
+    // from its Plan 2 R11 no-op to its real CP-1252 body means every balloon's
+    // text is now genuinely uppercased before layout/measurement, matching the
+    // original client's actual on-screen behavior. This snapshot is re-frozen
+    // to the new (correct) output; the geometry (positions/widths) is
+    // UNCHANGED because the recording metrics canvas measures every byte at a
+    // fixed per-byte width regardless of case (uppercase and lowercase ASCII
+    // are the same byte count) -- only the "text ..." lines' string payload
+    // changed case.
     static const char* kExpected[] = {
         "clip+ 0,0,2300,-2300",
         "clip+ 0,0,2300,-2300",
@@ -2426,7 +2442,7 @@ static int cc_selftest_strip(const char* avatarPath, const char* backdropPath) {
         "image 1884,-1309,1355,-2301 src=0,0,198,372",
         "image 1892,-1090,1387,-1451 src=0,0,189,135",
         "path n=53 fill=1 fillc=FFFFFF stroke=1 strokec=000000 w=28 dashed=0 [M 1474,-373 C 1474,-373 1474,-373 1483,-376 C 1492,-379 1531,-392 1575,-386 C 1618,-381 1779,-344 1851,-335 C 1923,-327 2084,-327 2119,-295 C 2155,-265 2155,-124 2119,-84 C 2083,-43 1922,-6 1851,-6 C 1779,-6 1618,-43 1547,-43 C 1475,-44 1314,-7 1243,-7 C 1171,-6 1010,-43 939,-51 C 867,-60 706,-60 671,-92 C 635,-122 635,-263 671,-303 C 707,-344 868,-381 939,-381 C 1011,-381 1172,-344 1216,-338 C 1260,-332 1297,-344 1305,-347 C 1314,-349 1314,-349 1314,-349 C 1145,-574 932,-758 689,-890 C 983,-768 1249,-592 1474,-373 Z]",
-        "text 735,-80 color=000000 \"Hello there\"",
+        "text 735,-80 color=000000 \"HELLO THERE\"",
         "path n=5 fill=0 fillc=000000 stroke=1 strokec=000000 w=120 dashed=0 [M 0,-2300 L 0,0 L 2300,0 L 2300,-2300 Z]",
         "clip-",
         "clip+ -268435456,268435456,268435456,-268435456",
@@ -2442,7 +2458,7 @@ static int cc_selftest_strip(const char* avatarPath, const char* backdropPath) {
         "image 4296,-1319,3802,-2301 src=0,0,185,368",
         "image 4347,-1090,3842,-1451 src=0,0,189,135",
         "path n=53 fill=1 fillc=FFFFFF stroke=1 strokec=000000 w=28 dashed=0 [M 3734,-373 C 3734,-373 3734,-373 3743,-376 C 3752,-379 3791,-392 3835,-386 C 3878,-381 4039,-344 4111,-335 C 4183,-327 4344,-327 4379,-295 C 4415,-265 4415,-124 4379,-84 C 4343,-43 4182,-6 4111,-6 C 4039,-6 3878,-43 3807,-43 C 3735,-44 3574,-7 3503,-7 C 3431,-6 3270,-43 3199,-51 C 3127,-60 2966,-60 2931,-92 C 2895,-122 2895,-263 2931,-303 C 2967,-344 3128,-381 3199,-381 C 3271,-381 3432,-344 3476,-338 C 3520,-332 3557,-344 3565,-347 C 3574,-349 3574,-349 3574,-349 C 3704,-558 3870,-741 4064,-890 C 3917,-743 3805,-567 3734,-373 Z]",
-        "text 2995,-80 color=000000 \"Hi yourself\"",
+        "text 2995,-80 color=000000 \"HI YOURSELF\"",
         "path n=5 fill=0 fillc=000000 stroke=1 strokec=000000 w=120 dashed=0 [M 2444,-2300 L 2444,0 L 4744,0 L 4744,-2300 Z]",
         "clip-",
         "clip+ -268435456,268435456,268435456,-268435456",
@@ -2458,7 +2474,7 @@ static int cc_selftest_strip(const char* avatarPath, const char* backdropPath) {
         "image 2233,-3918,1176,-5924 src=0,0,206,391",
         "image 2300,-3534,1330,-4227 src=0,0,189,135",
         "path n=53 fill=1 fillc=FFFFFF stroke=1 strokec=000000 w=28 dashed=0 [M 899,-2817 C 899,-2817 899,-2817 908,-2820 C 917,-2823 956,-2836 1000,-2830 C 1043,-2825 1204,-2788 1276,-2779 C 1348,-2771 1509,-2771 1544,-2739 C 1580,-2709 1580,-2568 1544,-2528 C 1508,-2487 1347,-2450 1276,-2450 C 1204,-2450 1043,-2487 972,-2487 C 900,-2488 739,-2451 668,-2451 C 596,-2450 435,-2487 364,-2495 C 292,-2504 131,-2504 96,-2536 C 60,-2566 60,-2707 96,-2747 C 132,-2788 293,-2825 364,-2825 C 436,-2825 597,-2788 641,-2782 C 685,-2776 722,-2788 730,-2791 C 739,-2793 739,-2793 739,-2793 C 709,-2985 641,-3169 539,-3334 C 691,-3184 813,-3009 899,-2817 Z]",
-        "text 160,-2524 color=000000 \"How are you\"",
+        "text 160,-2524 color=000000 \"HOW ARE YOU\"",
         "path n=5 fill=0 fillc=000000 stroke=1 strokec=000000 w=120 dashed=0 [M 0,-4744 L 0,-2444 L 2300,-2444 L 2300,-4744 Z]",
         "clip-",
         "clip+ -268435456,268435456,268435456,-268435456",
@@ -2474,7 +2490,7 @@ static int cc_selftest_strip(const char* avatarPath, const char* backdropPath) {
         "image 4674,-3953,3563,-6061 src=0,0,206,391",
         "image 4744,-3533,3725,-4278 src=0,0,189,138",
         "path n=50 fill=1 fillc=FFFFFF stroke=1 strokec=000000 w=28 dashed=0 [M 3920,-2817 C 3920,-2817 3920,-2817 3946,-2812 C 3972,-2807 4091,-2783 4153,-2777 C 4216,-2771 4377,-2771 4413,-2739 C 4449,-2709 4449,-2568 4413,-2528 C 4377,-2487 4216,-2450 4145,-2450 C 4073,-2450 3912,-2487 3841,-2487 C 3769,-2488 3608,-2451 3537,-2451 C 3465,-2450 3304,-2487 3233,-2495 C 3161,-2504 3000,-2504 2965,-2536 C 2929,-2566 2929,-2707 2965,-2747 C 3001,-2788 3162,-2825 3233,-2825 C 3305,-2825 3466,-2788 3528,-2785 C 3589,-2782 3707,-2806 3733,-2811 C 3759,-2816 3759,-2816 3759,-2816 C 3869,-3014 4015,-3189 4189,-3334 C 4064,-3183 3972,-3007 3920,-2817 Z]",
-        "text 3029,-2524 color=000000 \"Doing great\"",
+        "text 3029,-2524 color=000000 \"DOING GREAT\"",
         "path n=5 fill=0 fillc=000000 stroke=1 strokec=000000 w=120 dashed=0 [M 2444,-4744 L 2444,-2444 L 4744,-2444 L 4744,-4744 Z]",
         "clip-",
         "clip+ -268435456,268435456,268435456,-268435456",
@@ -2541,6 +2557,242 @@ static int cc_selftest_session_skeleton() {
     return 0;
 }
 
+// --- Plan 3 Task 2: ccommon_str codec core -----------------------------------
+// Step 2's hand-verified low-level-quoting vectors, verbatim from the task
+// brief (ircproto-map.md Sec5): escape set {0x0A -> Qn, 0x0D -> Qr, Q -> QQ},
+// Q = g_chLLQuoteCTCP (0x10); decode is the tolerant all-or-nothing heuristic
+// (a stray naked Q not followed by n/r/Q means the WHOLE string is treated as
+// unquoted, not just that one byte).
+static int cc_selftest_llquote() {
+    const char Q = (char)0x10;
+    char* dst = nullptr; BOOL freeit = FALSE;
+    // "a\nb" -> "a" Q 'n' "b"
+    BOOL changed = bLowLevelQuoting(Q, TRUE, "a\nb", &dst, &freeit, FALSE);
+    CC_CHECK(changed && dst[0]=='a' && dst[1]==Q && dst[2]=='n' && dst[3]=='b' && dst[4]==0);
+    if (freeit) free(dst);
+    // decode round-trips
+    char buf[16]; strcpy(buf, "a\x10n" "b");
+    bLowLevelUnquoting(Q, TRUE, buf, buf);   // in-place
+    CC_CHECK(strcmp(buf, "a\nb") == 0);
+    // tolerant: stray naked Q not followed by n/r/Q => whole string verbatim
+    char buf2[16]; strcpy(buf2, "a\x10z" "b");
+    bLowLevelUnquoting(Q, TRUE, buf2, buf2);
+    CC_CHECK(strcmp(buf2, "a\x10z" "b") == 0);
+    return 0;
+}
+
+// Additional bLowLevelQuoting/Unquoting coverage beyond the brief's minimum
+// vectors: the zero-copy fast path (nothing to quote -> *pszDst == szSrc,
+// *pbFree == FALSE, ircproto-map.md Sec5's "Zero-copy fast path" note), CR
+// quoting + bRemoveCarriageReturns dropping CR entirely, and the QQ escape.
+static int cc_selftest_llquote_extra() {
+    const char Q = (char)0x10;
+
+    // Zero-copy fast path: no LF/CR/Q in the input -> same pointer back, no
+    // free needed.
+    {
+        char* dst = nullptr; BOOL freeit = TRUE;  // pre-set to catch a missed write
+        const char* src = "plain text";
+        BOOL changed = bLowLevelQuoting(Q, TRUE, src, &dst, &freeit, FALSE);
+        CC_CHECK(changed == TRUE);
+        CC_CHECK(dst == src);       // exact same pointer (ccommon.cpp:967)
+        CC_CHECK(freeit == FALSE);
+    }
+
+    // CR -> Q 'r' when bRemoveCarriageReturns is FALSE.
+    {
+        char* dst = nullptr; BOOL freeit = FALSE;
+        BOOL changed = bLowLevelQuoting(Q, TRUE, "a\rb", &dst, &freeit, FALSE);
+        CC_CHECK(changed && dst[0]=='a' && dst[1]==Q && dst[2]=='r' && dst[3]=='b' && dst[4]==0);
+        if (freeit) free(dst);
+    }
+
+    // CR dropped entirely when bRemoveCarriageReturns is TRUE.
+    {
+        char* dst = nullptr; BOOL freeit = FALSE;
+        BOOL changed = bLowLevelQuoting(Q, TRUE, "a\rb", &dst, &freeit, TRUE);
+        CC_CHECK(changed && dst[0]=='a' && dst[1]=='b' && dst[2]==0);
+        if (freeit) free(dst);
+    }
+
+    // Q -> QQ, and decodes back to a single Q.
+    {
+        char src[2] = { Q, 0 };
+        char* dst = nullptr; BOOL freeit = FALSE;
+        BOOL changed = bLowLevelQuoting(Q, TRUE, src, &dst, &freeit, FALSE);
+        CC_CHECK(changed && dst[0]==Q && dst[1]==Q && dst[2]==0);
+        char buf[4];
+        bLowLevelUnquoting(Q, TRUE, dst, buf);
+        CC_CHECK(buf[0]==Q && buf[1]==0);
+        if (freeit) free(dst);
+    }
+
+    return 0;
+}
+
+// bConvertWideStringToUTF8 / bConvertUTF8StringToWide round-trip + boundary
+// coverage: ASCII passthrough, 2-byte UTF-8 (0x80-0x7FF range), 3-byte UTF-8
+// (>0x7FF), and SzNextUTF8Char's per-class advance (backslash-escape,
+// 1-byte, 2-byte, 3-byte).
+static int cc_selftest_utf8codec() {
+    // ASCII round-trip.
+    {
+        WCHAR wide[] = { 'h', 'i', 0 };
+        LPTSTR out = nullptr; INT outLen = 0;
+        CC_CHECK(bConvertWideStringToUTF8(wide, 2, &out, &outLen));
+        CC_CHECK(outLen == 2 && strcmp(out, "hi") == 0);
+        delete[] out;
+    }
+
+    // 2-byte UTF-8 range: U+00E9 (e-acute) -> 0xC3 0xA9.
+    {
+        WCHAR wide[] = { 0x00E9, 0 };
+        LPTSTR out = nullptr; INT outLen = 0;
+        CC_CHECK(bConvertWideStringToUTF8(wide, 1, &out, &outLen));
+        CC_CHECK(outLen == 2);
+        CC_CHECK((unsigned char)out[0] == 0xC3 && (unsigned char)out[1] == 0xA9);
+
+        // Round-trip back to wide (out is still live -- freed once, below).
+        LPWSTR wout = nullptr; INT wOutLen = 0;
+        CC_CHECK(bConvertUTF8StringToWide(out, 2, &wout, &wOutLen));
+        CC_CHECK(wOutLen == 1 && wout[0] == 0x00E9);
+        delete[] out;
+        delete[] wout;
+    }
+
+    // 3-byte UTF-8 range: U+20AC (Euro sign) -> 0xE2 0x82 0xAC.
+    {
+        WCHAR wide[] = { 0x20AC, 0 };
+        LPTSTR out = nullptr; INT outLen = 0;
+        CC_CHECK(bConvertWideStringToUTF8(wide, 1, &out, &outLen));
+        CC_CHECK(outLen == 3);
+        CC_CHECK((unsigned char)out[0] == 0xE2 && (unsigned char)out[1] == 0x82 && (unsigned char)out[2] == 0xAC);
+
+        // SzNextUTF8Char advances over the full 3-byte sequence.
+        LPCTSTR next = SzNextUTF8Char(out);
+        CC_CHECK(next == out + 3);
+        delete[] out;
+    }
+
+    // SzNextUTF8Char: 1-byte ASCII advances by 1.
+    CC_CHECK(SzNextUTF8Char("a") == (LPCTSTR)"a" + 1);
+    // SzNextUTF8Char: backslash-escape pairs advance by 2 (n/r/t/b/c/\\),
+    // except \0 which advances by 1 (the original's documented special case).
+    CC_CHECK(SzNextUTF8Char("\\n") == (LPCTSTR)"\\n" + 2);
+    CC_CHECK(SzNextUTF8Char("\\0") == (LPCTSTR)"\\0" + 1);
+    // SzNextUTF8Char: end of string returns the same pointer.
+    CC_CHECK(SzNextUTF8Char("") == (LPCTSTR)"");
+
+    return 0;
+}
+
+// --- Plan 3 Task 2 Step 6: CPtrList::RemoveHead (R9 addition) ----------------
+// CPtrList already existed (Plan 2 Tasks 6/8) with the AddTail/AddHead/
+// RemoveAll/GetHeadPosition/GetNext/GetCount/IsEmpty/GetHead/GetTail/
+// GetTailPosition/GetPrev/RemoveTail/GetAt/SetAt/FindIndex surface exercised
+// in cc_selftest_format/cc_selftest_panel. RemoveHead was the one member of
+// the brief's named surface (AddTail/RemoveHead/GetNext/RemoveAll/IsEmpty/
+// GetCount) missing -- the parser's query list (CCQuery, Task 4) is an
+// AddTail-append / RemoveHead-dequeue FIFO. Exercises the full append-then-
+// drain idiom (append 1,2,3; dequeue in FIFO order 1,2,3; empty after).
+static int cc_selftest_cptrlist_fifo() {
+    int a = 1, b = 2, c = 3;
+    CPtrList q;
+    CC_CHECK(q.IsEmpty());
+    q.AddTail(&a);
+    q.AddTail(&b);
+    q.AddTail(&c);
+    CC_CHECK(q.GetCount() == 3);
+    CC_CHECK(!q.IsEmpty());
+
+    CC_CHECK(q.RemoveHead() == &a);
+    CC_CHECK(q.GetCount() == 2);
+    CC_CHECK(q.RemoveHead() == &b);
+    CC_CHECK(q.GetCount() == 1);
+    CC_CHECK(q.RemoveHead() == &c);
+    CC_CHECK(q.GetCount() == 0);
+    CC_CHECK(q.IsEmpty());
+    return 0;
+}
+
+// --- Plan 3 Task 2 Step 7: CharNext selftest (Plan 2 Task 5 R9 debt) --------
+// CharNext was added live (not compiled out -- see the task report's fidelity
+// note) in Plan 2 Task 5 (format.cpp) and is already exercised transitively
+// through cc_selftest_format/cc_selftest_balloon, but R9's own mandate ("add a
+// selftest exercising it") was never fulfilled directly. Exercises: ASCII
+// single-byte advance, advance stops at (never past) the terminating NUL, and
+// -- the "single-byte behavior under CP-1252" the brief asks for -- a byte
+// that WOULD be a DBCS lead byte under a real East-Asian codepage (e.g. 0x81,
+// a Shift-JIS lead byte) still advances by exactly one byte here, because
+// IsDBCSLeadByte always reports FALSE on this single-byte-codepage port.
+static int cc_selftest_charnext() {
+    // ASCII: advances one byte at a time.
+    char ascii[] = "abc";
+    char* p = ascii;
+    p = CharNext(p);
+    CC_CHECK(p == ascii + 1 && *p == 'b');
+    p = CharNext(p);
+    CC_CHECK(p == ascii + 2 && *p == 'c');
+
+    // End of string: CharNext(p) at the NUL terminator stays put (never
+    // advances past it).
+    char* end = ascii + 3;
+    CC_CHECK(*end == '\0');
+    CC_CHECK(CharNext(end) == end);
+
+    // "Two-byte sequence" under a real DBCS codepage (0x81 0x40 is a valid
+    // Shift-JIS lead+trail pair) -- this port has no DBCS codepage active
+    // (IsDBCSLeadByte always FALSE), so CharNext advances by exactly ONE byte
+    // here, landing ON the second byte rather than past it. This is the
+    // deliberate single-byte CP-1252 behavior Task 2 Step 1 makes permanent.
+    unsigned char dbcsLike[] = { 0x81, 0x40, 0x00 };
+    CC_CHECK(IsDBCSLeadByte(dbcsLike[0]) == FALSE);
+    char* q = (char*)dbcsLike;
+    char* q2 = CharNext(q);
+    CC_CHECK(q2 == q + 1);                 // single-byte advance, not +2
+    CC_CHECK((unsigned char)*q2 == 0x40);  // lands on the would-be trail byte
+
+    return 0;
+}
+
+// --- Plan 3 Task 2 Step 8: Capitalize restored verbatim ----------------------
+// Capitalize was R11-wrapped to a no-op in Plan 2 Task 6 (a documented latent
+// real-metrics layout divergence). Restored here: session.charSet is
+// permanently ANSI_CHARSET (0) on this port (no setter exists anywhere in the
+// engine -- see engine_context.h), so the reachable branch is exclusively
+// CharUpperBuff's ASCII-range uppercase. Exercises: a plain-ASCII string
+// (every existing balloon/panel call site's real input domain) uppercases
+// correctly, and -- the brief's "first-letter-of-line behavior" ask -- the
+// CBWoodringNormal constructor's real call site (balloon.cpp) capitalizes the
+// WHOLE string in one call (Capitalize has no line-boundary logic itself; the
+// original always uppercases its entire input buffer), confirmed here via a
+// multi-line (embedded '\n') string to show every line's content is
+// capitalized, not just the first.
+static int cc_selftest_capitalize() {
+    char s1[] = "hello world";
+    Capitalize(s1);
+    CC_CHECK(strcmp(s1, "HELLO WORLD") == 0);
+
+    // Already-uppercase / mixed / digits / punctuation: idempotent on
+    // uppercase, digits/punctuation pass through unchanged.
+    char s2[] = "Hi There! 123";
+    Capitalize(s2);
+    CC_CHECK(strcmp(s2, "HI THERE! 123") == 0);
+
+    // Multi-line input: the whole buffer capitalizes, embedded '\n' preserved
+    // (Capitalize never touches non-letter bytes).
+    char s3[] = "first line\nsecond line";
+    Capitalize(s3);
+    CC_CHECK(strcmp(s3, "FIRST LINE\nSECOND LINE") == 0);
+
+    // Empty string: no-op, does not crash (CharUpperBuff(str, 0)).
+    char s4[] = "";
+    Capitalize(s4);
+    CC_CHECK(strcmp(s4, "") == 0);
+
+    return 0;
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -2572,5 +2824,11 @@ extern "C" int32_t cc_run_selftests(void) {
     testLoadStringResource();     // Task 9 R9 shim: CString::LoadString
     cc_selftest_textpose();       // Task 9: text -> emotion rule tables
     cc_selftest_session_skeleton();  // Plan 3 Task 1: cc_session C boundary
+    cc_selftest_llquote();           // Plan 3 Task 2: low-level quoting (brief vectors)
+    cc_selftest_llquote_extra();     // Plan 3 Task 2: zero-copy fast path, CR, QQ
+    cc_selftest_utf8codec();         // Plan 3 Task 2: UTF-8 <-> wide codec
+    cc_selftest_cptrlist_fifo();     // Plan 3 Task 2 Step 6: CPtrList::RemoveHead
+    cc_selftest_charnext();          // Plan 3 Task 2 Step 7: CharNext (Plan 2 debt)
+    cc_selftest_capitalize();        // Plan 3 Task 2 Step 8: Capitalize restored
     return g_failures;
 }
