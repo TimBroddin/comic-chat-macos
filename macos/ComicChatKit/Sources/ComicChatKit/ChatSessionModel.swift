@@ -100,6 +100,45 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// 8's `toNick:` announce) — guards the "first `.appearsAs` from an
     /// unseen nick" rule so a nick's later avatar changes don't re-announce.
     private var announcedBackTo: Set<String> = []
+    /// Own-say echo dedup (4a final-review carryover, Plan 4b Task 1): some
+    /// IRC servers echo a client's own PRIVMSG back to the sender. `send(_:)`
+    /// already renders the own line immediately via a synthetic local
+    /// `.text` event (that method's doc comment) — a server echo of the SAME
+    /// text must be dropped rather than rendered a second time. Holds exactly
+    /// the texts of sends still awaiting a possible echo; `handleLocked`
+    /// removes (at most) one matching entry per server-originated `.text`
+    /// with our own nick.
+    private var pendingLocalEchoes: [String] = []
+    /// Engine-queue-local mirror of `session.ownNick`, kept in sync from the
+    /// same events `ProtocolSession` itself uses (`.loggedIn`, `.nickChanged`
+    /// with `isSelf`). Exists ONLY so `handleLocked`'s echo-dedup check
+    /// (below) can compare against the current own nick WITHOUT calling
+    /// `session.ownNick` — that accessor does its own `sessionQueue.sync`
+    /// internally, and `sessionQueue` IS `engineQueue` (shared by injection,
+    /// `ProtocolSession`'s own doc comment), so calling it from `handleLocked`
+    /// (already running ON that queue) is a same-queue reentrant `sync`,
+    /// which traps — the exact hazard `emitMembers`'s doc comment documents
+    /// for `session.room(_:)`, here for `session.ownNick` instead. Seeded
+    /// from `config.nick` (the requested nick, correct until any rename).
+    private var currentOwnNick: String
+    /// Members-ordering guard (4a final-review carryover, Plan 4b Task 1):
+    /// `emitMembers()`'s detached `Task` reads `session.room(_:)` off the
+    /// engine queue (that method's own doc comment explains why it must be
+    /// detached rather than synchronous), so under rapid membership churn
+    /// several of these `Task`s can be in flight at once with no guarantee
+    /// they complete in spawn order — an earlier-fired-but-slower `Task`
+    /// could otherwise deliver its now-stale snapshot to `onMembers` AFTER a
+    /// later, more current one already arrived. `membersSeq` (engine-queue-
+    /// owned, incremented once per `emitMembers()` call — serialized, so no
+    /// two calls ever get the same value) tags each snapshot with its spawn
+    /// order; `appliedMembersSeq` (below) is compared against it on the MAIN
+    /// thread to drop any snapshot that arrives after a fresher one already
+    /// applied.
+    private var membersSeq = 0
+    /// Main-thread-owned counterpart to `membersSeq` — safe unsynchronized
+    /// because it is read and written ONLY inside the `DispatchQueue.main.async`
+    /// block in `emitMembers()`, i.e. always on the main thread.
+    private var appliedMembersSeq = 0
     /// Current viewport geometry (columns, unit twips, scale). `start()`
     /// seeds panel geometry with `PanelFit`'s 3-column default (see
     /// `setUpStripLocked`'s doc comment) so a strip exists and composes even
@@ -128,6 +167,7 @@ public final class ChatSessionModel: @unchecked Sendable {
 
     public init(config: ChatConfig) {
         self.config = config
+        self.currentOwnNick = config.nick
         self.session = ProtocolSession(host: config.host, port: config.port, nick: config.nick,
                                        encoding: config.encoding, engineQueue: engineQueue)
     }
@@ -233,13 +273,14 @@ public final class ChatSessionModel: @unchecked Sendable {
     }
 
     /// Hops onto the engine queue and routes one event. Called from the
-    /// event-consumer `Task` (off the engine queue) and from `send(_:)`'s
-    /// synthetic self-say — both funnel through this single entry point so
+    /// event-consumer `Task` (off the engine queue, `fromServer: true` — the
+    /// default) and from `send(_:)`'s synthetic self-say (`fromServer:
+    /// false`) — both funnel through this single entry point so
     /// `_transcript`/`announcedBackTo`/`loggedInContinuation` have exactly
     /// one serialized owner.
-    private func enqueueHandle(_ ev: ProtocolEvent) {
+    private func enqueueHandle(_ ev: ProtocolEvent, fromServer: Bool = true) {
         engineQueue.async { [weak self] in
-            self?.handleLocked(ev)
+            self?.handleLocked(ev, fromServer: fromServer)
         }
     }
 
@@ -254,6 +295,7 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///   .appearsAs (unseen nick) -> private reply-announce (toNick:), then
     ///                               bridge.apply + recompose
     ///   .text/.whisper/.action (strip-relevant) -> bridge.apply + recompose
+    ///        (.text only: own-say echo dedup first, see below)
     ///   .userJoined             -> bridge.apply + recompose, AND recompute
     ///                              sorted member list -> onMembers (final
     ///                              review: a join is both strip-relevant AND
@@ -261,12 +303,31 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///   .userParted/.userQuit/.kicked/.names/.endOfNames/.nickChanged
     ///                           -> recompute sorted member list -> onMembers
     ///   .statusLine/.error/.disconnectedHint -> onStatus
-    private func handleLocked(_ ev: ProtocolEvent) {
+    ///
+    /// - Parameter fromServer: `true` for every event arriving off the wire
+    ///   (the event-consumer `Task`'s default); `false` only for `send(_:)`'s
+    ///   synthetic self-say. Used by the `.text` case's own-say echo dedup
+    ///   below — a synthetic event (`fromServer == false`) never matches the
+    ///   `pendingLocalEchoes` check, since it IS the render being kept.
+    private func handleLocked(_ ev: ProtocolEvent, fromServer: Bool = true) {
         guard !isShutDown else { return }
+
+        // Own-say echo dedup (4a carryover): some servers echo PRIVMSG back to
+        // the sender; our synthetic local echo (send(_:)) already rendered it.
+        // Drop exactly one server copy per pending send, BEFORE the transcript
+        // append -- reflow (`reflowLocked`, which replays `_transcript`
+        // verbatim) must not double-render it either.
+        if case .text(let nick, _, _, let text, _, _) = ev,
+           fromServer, nick == currentOwnNick,
+           let i = pendingLocalEchoes.firstIndex(of: text) {
+            pendingLocalEchoes.remove(at: i)
+            return
+        }
         _transcript.append(ev)
 
         switch ev {
-        case .loggedIn:
+        case .loggedIn(let nick):
+            currentOwnNick = nick   // echo-only rule confirmation, mirrors ProtocolSession's own _ownNick update
             Task { [session, config] in
                 try? await session.join(config.room)
             }
@@ -304,7 +365,13 @@ public final class ChatSessionModel: @unchecked Sendable {
             // membership event happens to fire.
             emitMembers()
 
-        case .userParted, .userQuit, .kicked, .names, .endOfNames, .nickChanged:
+        case .nickChanged(_, let newNick, let isSelf):
+            if isSelf {
+                currentOwnNick = newNick   // echo-only rule confirmation, mirrors ProtocolSession's own _ownNick update
+            }
+            emitMembers()
+
+        case .userParted, .userQuit, .kicked, .names, .endOfNames:
             emitMembers()
 
         case .statusLine(let text):
@@ -349,10 +416,14 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// `Task` runs on its own (cooperative-pool) context, genuinely off the
     /// engine queue, so `session.room(_:)`'s internal `sync` is safe there.
     private func emitMembers() {
+        membersSeq += 1                              // engine queue — serialized
+        let seq = membersSeq
         Task { [session, config, onMembers] in
             let members = session.room(config.room)?.members ?? [:]
             let sorted = members.values.filter { !$0.departed }.map(\.nick).sorted()
             DispatchQueue.main.async {
+                guard seq > self.appliedMembersSeq else { return }   // stale snapshot — drop
+                self.appliedMembersSeq = seq
                 onMembers?(sorted)
             }
         }
@@ -383,10 +454,16 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// depending on any echo.
     public func send(_ text: String) async throws {
         try await session.say(config.room, text: text, annotations: nil)
+        // Registered BEFORE the synthetic event is enqueued (4a carryover:
+        // own-say echo dedup, `handleLocked`'s doc comment) so a server echo
+        // of this same text — which can only arrive after `session.say`
+        // above has already put the PRIVMSG on the wire — always finds a
+        // pending entry to consume, however the two async paths interleave.
+        engineQueue.async { [weak self] in self?.pendingLocalEchoes.append(text) }
         let ownNick = session.ownNick
         let synthetic = ProtocolEvent.text(nick: ownNick, ident: "", target: config.room,
                                           text: text, kind: 0, annotations: nil)
-        enqueueHandle(synthetic)
+        enqueueHandle(synthetic, fromServer: false)
     }
 
     // MARK: - setViewport (reflow)

@@ -58,6 +58,7 @@ public final class AppState {
                 cfg.room = "#comicrig"
             } catch {
                 statusLine = "Replay fixture failed to start: \(error)"
+                showConnectSheet = true
                 return
             }
         }

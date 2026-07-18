@@ -512,7 +512,7 @@ public final class ProtocolSession: @unchecked Sendable {
             guard let token = self.roomTokenFor(channel) else {
                 throw ProtocolSessionError.commandFailed("setTopic: unknown channel \(channel)")
             }
-            let rc = topic.withCString { cc_session_set_topic(s, token, $0) }
+            let rc = self.withEncodedCString(topic) { cc_session_set_topic(s, token, $0) }
             guard rc == 0 else { throw ProtocolSessionError.commandFailed("setTopic failed") }
         }
     }
@@ -527,12 +527,12 @@ public final class ProtocolSession: @unchecked Sendable {
             if let annotations {
                 var cAnn = annotations.toCAnnotations(encoding: self.encoding)
                 rc = withUnsafePointer(to: &cAnn) { annPtr in
-                    text.withCString { textPtr in
+                    self.withEncodedCString(text) { textPtr in
                         cc_session_send_say(s, token, annPtr, textPtr, modes)
                     }
                 }
             } else {
-                rc = text.withCString { textPtr in
+                rc = self.withEncodedCString(text) { textPtr in
                     cc_session_send_say(s, token, nil, textPtr, modes)
                 }
             }
@@ -574,6 +574,10 @@ public final class ProtocolSession: @unchecked Sendable {
     /// `withCString`-shaped equivalent of `WireCodec.encode`, needed because
     /// plain `String.withCString` always encodes as UTF-8 regardless of the
     /// session's `encoding` (see `announceAvatar`'s doc comment).
+    ///
+    /// NOTE: embedded NUL bytes in `s` truncate the wire string at the NUL
+    /// (C-string boundary) — same behavior as the original's char* pipeline;
+    /// IRC cannot carry NUL anyway (RFC 1459 §2.3.1).
     private func withEncodedCString<R>(_ s: String, _ body: (UnsafePointer<CChar>) -> R) -> R {
         var bytes = WireCodec.encode(s, encoding: encoding)
         bytes.append(0)
@@ -596,7 +600,7 @@ public final class ProtocolSession: @unchecked Sendable {
             }
             var cAnn = annotations?.toCAnnotations(encoding: self.encoding)
             let rc: Int32 = withCStringArray(nicks) { cNicks, count in
-                text.withCString { textPtr in
+                self.withEncodedCString(text) { textPtr in
                     if cAnn != nil {
                         return withUnsafePointer(to: &cAnn!) { annPtr in
                             cc_session_send_whisper(s, token, annPtr, textPtr, cNicks, count)

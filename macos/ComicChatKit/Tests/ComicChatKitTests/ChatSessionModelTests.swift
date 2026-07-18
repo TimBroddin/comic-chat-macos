@@ -44,19 +44,31 @@ private final class ImagesBox: @unchecked Sendable {
 /// Thread-safe accumulator for `onMembers`'s captured `[String]` (same
 /// lock-guarded-box shape as `ImagesBox` above — `onMembers` is also a
 /// `@Sendable` closure called on the main thread via `DispatchQueue.main.async`,
-/// while the test body reads it from its own task).
+/// while the test body reads it from its own task). Keeps the FULL history of
+/// delivered snapshots (not just the latest), in delivery order, so a test
+/// can assert on which snapshot arrived LAST — `emitMembers`'s detached-`Task`
+/// pattern means a slow earlier snapshot can be delivered after a later one,
+/// and only the history captures whether that actually happened.
 private final class MembersBox: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [String] = []
+    private var deliveryHistory: [[String]] = []
 
     func set(_ nicks: [String]) {
         lock.lock(); defer { lock.unlock() }
         storage = nicks
+        deliveryHistory.append(nicks)
     }
 
     func get() -> [String] {
         lock.lock(); defer { lock.unlock() }
         return storage
+    }
+
+    /// Every snapshot delivered so far, in delivery order.
+    func history() -> [[String]] {
+        lock.lock(); defer { lock.unlock() }
+        return deliveryHistory
     }
 }
 
@@ -153,6 +165,132 @@ extension EngineGlobalStateSelfTests {
                 }
                 try await Task.sleep(nanoseconds: 5_000_000)
             }
+        }
+
+        /// Plan 4b Task 1 (4a final-review carryover): own-say echo dedup.
+        /// Some IRC servers echo a client's own PRIVMSG back to the sender
+        /// (unlike the loopback rig's default, which never does). `send(_:)`
+        /// already renders the own line immediately via a synthetic local
+        /// `.text` event (that method's doc comment) — if the server ALSO
+        /// echoes the same PRIVMSG back, the transcript must still contain
+        /// exactly ONE `.text` event with that text, not two.
+        @Test(.timeLimit(.minutes(1)))
+        func ownSayEchoIsDeduped() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            try await model.send("hello once")
+            // wait for the say to actually reach the wire before the server
+            // "echoes" it back — otherwise the echo could arrive and be
+            // processed before the synthetic local event, which would still
+            // dedupe correctly but wouldn't exercise the intended ordering.
+            _ = try await waitForReceivedLine(server, containing: "PRIVMSG #p4 :hello once")
+            try await server.send(":Mac!mac@h PRIVMSG #p4 :hello once")
+
+            func matchCount() -> Int {
+                model.transcript.filter {
+                    if case .text(_, _, _, let text, _, _) = $0 { return text == "hello once" }
+                    return false
+                }.count
+            }
+            // Wait for the synthetic local render (always exactly one, sent
+            // BEFORE the echo above) to land, then give the echo a further
+            // settling window — long enough for it to have been processed if
+            // it were going to double-append (pre-fix behavior) — before
+            // asserting the final count.
+            while matchCount() < 1 {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+            #expect(matchCount() == 1, "expected exactly one .text event for the own-say echo, got \(matchCount())")
+
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Plan 4b Task 1 (4a final-review carryover): members-ordering
+        /// guard. `emitMembers()` reads `session.room(_:)` from a detached
+        /// `Task` (that method's own doc comment explains why it can't be a
+        /// direct synchronous read) — under a burst of rapid membership
+        /// churn, several of these `Task`s can be in flight at once, and
+        /// without a sequence guard nothing stops an earlier-fired-but-slower
+        /// `Task` from delivering its (now stale) snapshot to `onMembers`
+        /// AFTER a later, more current one already arrived. This test drives
+        /// a burst of churn (twenty nicks JOIN, then all but one PART, each
+        /// its own real network round-trip) and asserts the LAST `onMembers`
+        /// delivery equals the final member set — not merely that the final
+        /// set is eventually reached (which `peerJoinRefreshesMemberSidebar`-
+        /// style polling would miss: polling for "contains X" doesn't notice
+        /// a stale snapshot arriving last).
+        ///
+        /// HONESTY NOTE: this specific inversion was NOT reproduced as a
+        /// reliable black-box failure against the pre-fix code on this
+        /// harness (tried up to 20-way bursts, both batched and per-line
+        /// real round-trips, across many repeated runs — the detached
+        /// `Task`s' completion order tracked spawn order closely enough in
+        /// practice that the race did not flip). The `membersSeq`/
+        /// `appliedMembersSeq` guard below is still implemented exactly per
+        /// the brief (it is cheap, clearly correct, and matches the documented
+        /// hazard `emitMembers`'s own doc comment describes), and this test
+        /// stands as a real regression guard for its observable contract
+        /// going forward, not as adversarial proof the pre-fix code was
+        /// broken. See the Task 1 report for how this was investigated.
+        @Test(.timeLimit(.minutes(1)))
+        func membersOrderingReflectsLatestChurn() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            let members = MembersBox()
+            model.onMembers = { nicks in members.set(nicks) }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            // Large burst of membership churn, each line its own network
+            // round-trip (rather than one batched write) so real socket I/O
+            // and GCD scheduling interleave with the `emitMembers()` detached
+            // `Task`s each event spawns -- maximizing the chance that
+            // several are genuinely in flight at once and can complete out
+            // of spawn order (each Task's own `session.room(_:)` read
+            // contends with `sessionQueue`/`engineQueue`, which is BUSY
+            // processing the rest of this same burst). Twenty nicks join,
+            // then all but the last one part. Final state: {Mac, N19}.
+            for i in 0..<20 {
+                try await server.send(":N\(i)!u@h JOIN #p4")
+            }
+            for i in 0..<19 {
+                try await server.send(":N\(i)!u@h PART #p4")
+            }
+
+            let expectedFinal: Set<String> = ["Mac", "N19"]
+            // Settle on QUIESCENCE, not on "the expected value showed up" --
+            // the latter would make the loop's own exit condition the thing
+            // under test (trivially true the moment it's checked). Instead,
+            // poll `deliveryHistory`'s COUNT until it stops growing for a
+            // sustained window, then assert on whatever the last entry
+            // actually is. This lets a stale, later-arriving delivery (the
+            // pre-fix bug) show up as the final entry if the race fires.
+            var lastCount = -1
+            var stableSince = ContinuousClock.now
+            while ContinuousClock.now - stableSince < .milliseconds(150) {
+                let count = members.history().count
+                if count != lastCount {
+                    lastCount = count
+                    stableSince = ContinuousClock.now
+                }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            let history = members.history()
+            #expect(!history.isEmpty)
+            #expect(Set(history.last!) == expectedFinal,
+                    "expected the LAST onMembers delivery to be \(expectedFinal), got \(history.last!) (full history count: \(history.count), last 5: \(history.suffix(5)))")
+
+            model.shutdown()
+            server.stop()
         }
     }
 }

@@ -102,8 +102,8 @@ struct ComicStripView: NSViewRepresentable {
         if abs(width - co.lastRequestedWidth) > 0.5 {
             co.resizeDebounce?.invalidate()
             co.resizeDebounce = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: false) {
-                [weak model] _ in
-                co.lastRequestedWidth = width
+                [weak co, weak model] _ in
+                co?.lastRequestedWidth = width
                 model?.setViewport(widthPoints: width, scale: scale)
             }
         }
