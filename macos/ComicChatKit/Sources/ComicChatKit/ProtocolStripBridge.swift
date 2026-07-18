@@ -212,6 +212,23 @@ public final class ProtocolStripBridge {
 
     // MARK: - participant lifecycle
 
+    /// Registers a participant id this bridge did NOT itself assign — the
+    /// seam `ChatSessionModel` (Plan 4a Task 9) uses for the SELF
+    /// participant, which it must add directly via `Strip.addParticipant` +
+    /// `Strip.setSelf` (so `setSelf` sees the id at construction time,
+    /// ordering `addParticipant`/`ensureParticipant` doesn't guarantee) yet
+    /// still wants tracked here: without this call, the first `.userJoined`
+    /// or `.text` event carrying the SAME nick (an IRC server typically
+    /// echoes the joining client's own JOIN/NAMES like any other member)
+    /// would fall into `ensureParticipant`'s "not seen yet" branch and add a
+    /// SECOND, distinct participant for the same person. Idempotent no-op if
+    /// `nick` is already registered (keeps whichever id was assigned first).
+    public func preRegisterSelfParticipant(nick: String, id: Int32) {
+        guard participantIDs[nick] == nil else { return }
+        participantIDs[nick] = id
+        participantOrder.append(nick)
+    }
+
     @discardableResult
     private func ensureParticipant(_ nick: String) throws -> Int32 {
         if let existing = participantIDs[nick] { return existing }
