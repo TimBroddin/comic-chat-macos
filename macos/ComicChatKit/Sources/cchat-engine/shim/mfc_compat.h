@@ -207,6 +207,32 @@ inline BOOL IsDBCSLeadByte(BYTE) { return FALSE; }
 inline LPTSTR CharNext(LPCTSTR p) { return (LPTSTR)(p + (*p ? 1 : 0)); }
 inline void FillMemory(void* dst, size_t len, BYTE val) { memset(dst, val, len); }
 
+// --- _mbschr / _mbsrchr / _mbspbrk + OurMbs* macros (rule R9; Plan 3 Task 3:
+//     protsupp.cpp's key-string codec, utils.h:104-106) -----------------------
+// The original's OurMbsChr/OurMbsRChr/OurMbsPbrk macros (utils.h) wrap the CRT
+// MBCS-aware scan functions _mbschr/_mbsrchr/_mbspbrk so the key-string codec
+// (FindInKeyString/GetValueFromKeyString) scans correctly under a DBCS
+// codepage. This port's permanent posture is single-byte CP-1252 (no DBCS
+// codepage is ever active -- the same decision IsDBCSLeadByte()->FALSE/
+// CharNext() above already codify, and Plan 3 Task 2 made permanent for the
+// intl.c seam). Under that posture the MBCS scan degenerates exactly to the
+// plain single-byte CRT scan, so these collapse to strchr/strrchr/strpbrk.
+// Signatures match the CRT's own _mbschr family (const unsigned char* needle
+// haystack, taking/returning `const UCHAR*`), matching how utils.h's macros
+// cast to/from `(const UCHAR*)(LPCSTR)`.
+inline const UCHAR* _mbschr(const UCHAR* s, UINT c) {
+    return (const UCHAR*)strchr((const char*)s, (int)c);
+}
+inline const UCHAR* _mbsrchr(const UCHAR* s, UINT c) {
+    return (const UCHAR*)strrchr((const char*)s, (int)c);
+}
+inline const UCHAR* _mbspbrk(const UCHAR* s, const UCHAR* set) {
+    return (const UCHAR*)strpbrk((const char*)s, (const char*)set);
+}
+#define OurMbsChr(s,c)   ((LPCSTR)_mbschr((const UCHAR*)(LPCSTR)(s), c))
+#define OurMbsRChr(s,c)  ((LPCSTR)_mbsrchr((const UCHAR*)(LPCSTR)(s), c))
+#define OurMbsPbrk(s,s2) ((LPCSTR)_mbspbrk((const UCHAR*)(LPCSTR)(s), (const UCHAR*)(LPCSTR)(s2)))
+
 // --- legacy OS/2-style DIB header (wire-compatible; used only to detect the
 //     older BITMAPCOREHEADER format, rule R9 for dib.cpp) --------------------
 #pragma pack(push, 2)
@@ -374,6 +400,15 @@ class CString {
 public:
     CString() {}
     CString(const char* s) : m_s(s ? s : "") {}
+    // R9 (Plan 3 Task 3): MFC's CString(LPCTSTR lpch, int nLength) builds a
+    // string from an explicit byte count rather than a NUL terminator --
+    // protsupp.cpp's key-string codec uses it to slice a substring out of a
+    // larger buffer (GetValueFromKeyString: `CString(pszKeyString + nValPos,
+    // nNextValPos - nValPos)`). A negative/zero length yields an empty string
+    // (matches MFC: the real CString ASSERTs nLength>=0, but every lifted call
+    // site here always passes a non-negative difference of two positions
+    // within the same string, so no other behavior is reachable).
+    CString(const char* s, int len) : m_s(s && len > 0 ? std::string(s, (size_t)len) : std::string()) {}
     CString(const CString&) = default;
     CString& operator=(const CString&) = default;
     CString& operator=(const char* s) { m_s = s ? s : ""; return *this; }

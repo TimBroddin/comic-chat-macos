@@ -296,6 +296,25 @@ void        cc_session_fire_timer(cc_session* s, int32_t timer_id);             
  * once real parsing lands; kept behind CC_SESSION_TESTHOOK. */
 void        cc_session_test_echo(cc_session* s);
 
+/* ---- Annotation codec (Plan 3 Task 3) --------------------------------------
+ * Decoded comic annotation block ("User Display Info"). Values are indices,
+ * NOT the +'0' wire bytes. addressees are encoded nick strings (CP-1252).
+ * Wire grammar (state-and-codec.md §3.3):
+ *   #G<gp><ge><gi>E<ep><ee><ei>[R]M<m>[T<nick>[,<nick>...]]
+ * Every <x> byte is IndexToByte(value) = value + '0' (protsupp.cpp:1023).
+ * `cooked` is set only when both intensity fields have been written by the
+ * decoder (protsupp.cpp:1538-1539). */
+#define CC_MAX_ADDRESSEES 5
+typedef struct cc_annotations {
+    int32_t gesture_pose, gesture_emotion, gesture_intensity;   /* G group */
+    int32_t face_pose,    face_emotion,    face_intensity;      /* E group */
+    int32_t requested;                                          /* R flag (0/1) */
+    int32_t mode;                                               /* SM_* say mode 1..5 */
+    int32_t addressee_count;
+    char    addressees[CC_MAX_ADDRESSEES][64];                  /* encoded nicks */
+    int32_t cooked;                                             /* both intensities present */
+} cc_annotations;
+
 #ifdef __cplusplus
 }
 #endif

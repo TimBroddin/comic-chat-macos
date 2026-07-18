@@ -22,7 +22,9 @@ let package = Package(
                 // draw path (bodycam.cpp) are now live against the CDC adapter.
                 .define("CC_NO_DIRSCAN"),
                 .define("CC_NO_UI"),
-                .define("CC_NO_PROTOCOL"),
+                // CC_NO_PROTOCOL retired in Plan 3 Task 3: EmotionToBytes/
+                // BytesToEmotion (avatario.cpp) and the annotation codec
+                // (protsupp.cpp) are now live.
                 .unsafeFlags(["-Wno-tautological-undefined-compare"]),
             ],
             linkerSettings: [

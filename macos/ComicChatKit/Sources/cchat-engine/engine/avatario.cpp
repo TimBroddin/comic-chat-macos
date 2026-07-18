@@ -61,13 +61,13 @@ float emFloats[] = {
 	(float) EM_3QFWALK,
 };
 
-// R11 (protocol clause): EmotionToBytes/BytesToEmotion serve the protocol
-// layer (byte-codec for the wire annotation format) and call IndexToByte/
-// ByteToIndex, which are defined only in protsupp.cpp (Plan 3). Not required
-// by the load/parse path — nothing in the ten lifted files calls either
-// function. Whole definitions wrapped per R11; header declarations (none —
-// these aren't declared in any lifted header) N/A.
-#ifndef CC_NO_PROTOCOL
+// R11-removal (Plan 3 Task 3): EmotionToBytes/BytesToEmotion serve the
+// protocol layer (byte-codec for the wire annotation format) and call
+// IndexToByte/ByteToIndex, now defined in protsupp.cpp (this task's codec
+// lift). The #ifndef CC_NO_PROTOCOL guard that previously wrapped this block
+// (added Plan 2, since protsupp.cpp didn't exist yet) is removed -- restoring
+// the original's unconditional compilation -- and CC_NO_PROTOCOL is no longer
+// defined anywhere (Package.swift). Bodies unchanged from the original.
 BYTE IndexToByte(BYTE);
 BYTE ByteToIndex(BYTE);
 
@@ -90,7 +90,6 @@ void BytesToEmotion(CEmotion &em, BYTE emIndex, BYTE inIndex) {
 	else em.m_emotion = emFloats[emIndex];
 	em.m_intensity = (float)(inIndex / 10.0);
 }
-#endif // CC_NO_PROTOCOL
 
 float EmotionToFloat(int index)
 {

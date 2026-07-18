@@ -18,7 +18,16 @@
 #include "panel.h"      // Task 6: CUnitPanelPage (SetFonts + font statics)
 #include "bridge_art.h" // Task 7 review fix: bridge_decode_aura_to_white_alpha
 #include "ccommon_str.h" // Plan 3 Task 2: bLowLevelQuoting/Unquoting + UTF-8 codec
+#include "protsupp.h"    // Plan 3 Task 3: annotation codec (partial lift)
+#include "userinfo.h"    // Plan 3 Task 3: CUserInfo (annotation codec test rig)
 #include <unistd.h>   // mkstemp, close (testShimFileApis)
+
+// EmotionToBytes/BytesToEmotion (avatario.cpp) — declared here for the
+// annotation-codec test rig, same pattern as BreakIntoLines/Capitalize above
+// (their owning header, avatario.h, doesn't declare them -- see avatario.cpp's
+// own local declaration inside bInsertAnnotations for the original's
+// identical convention).
+void BytesToEmotion(CEmotion &em, BYTE emIndex, BYTE inIndex);
 
 // ::BreakIntoLines free function (balloon.cpp) — declared here for the
 // characterization test (balloon.h declares only the CLabel:: method wrapper).
@@ -2793,6 +2802,457 @@ static int cc_selftest_capitalize() {
     return 0;
 }
 
+// --- Plan 3 Task 3: annotation codec (encode/decode) ------------------------
+// A minimal test-only CAvatarX subclass driving bInsertAnnotations's
+// GetIndices/GetEmotions without a real .avb file: the annotation codec
+// selftest is meant to run standalone (no fixture path -- unlike
+// cc_selftest_bodydraw/panel/strip, which all take an avatarPath). This is
+// test infrastructure only (not part of the lift), analogous to how
+// panelLoadAvatar() below is test-only rig for the panel/strip selftests --
+// except this one needs no file at all, since GetIndices/GetEmotions just
+// return canned values instead of reading a loaded pose/emotion record.
+class CCTestAvatar : public CAvatarX {
+public:
+    CHAR face = 1, torso = 2;
+    BYTE requested = 0;
+    CEmotion faceEmotion{0.3, EM_NEUTRAL}, torsoEmotion{0.5, EM_NEUTRAL};
+
+    virtual CBody *GetBodyFromEmotion(CEmotion &) { return nullptr; }
+    virtual CBody *GetBodyFromEmotion(CEmotionOpts &) { return nullptr; }
+    virtual void SetNeutral() {}
+    virtual void SetSequential(void *, int) {}
+    virtual void RecordBody(CBody*) {}
+    virtual void GetIndices(CHAR &chFaceIndex, CHAR &chTorsoIndex, BYTE &bbRequested) {
+        chFaceIndex = face; chTorsoIndex = torso; bbRequested = requested;
+    }
+    virtual void SetIndices(CHAR chFaceIndex, CHAR chTorsoIndex, BYTE bbRequested) {
+        face = chFaceIndex; torso = chTorsoIndex; requested = bbRequested;
+    }
+    virtual void GetEmotions(CEmotion &face_, CEmotion &torso_) {
+        face_ = faceEmotion; torso_ = torsoEmotion;
+    }
+    virtual void SetEmotions(CEmotion &face_, CEmotion &torso_) {
+        faceEmotion = face_; torsoEmotion = torso_;
+    }
+    virtual CAvatarX *DupAvatar() { return new CCTestAvatar(*this); }
+};
+
+// Test-only PFNRESOLVETALKTO registry (protsupp.h): a fixed-size table of
+// live CUserInfo* the test has vended talkTos keys for, mirroring the shape
+// (if not the implementation) of ccContext().session.userFromTalkTo -- a
+// bounded linear scan recovering the real pointer from its truncated DWORD
+// key, never trying to widen the truncated bits directly (see protsupp.cpp's
+// GetAddressees deviation-4 comment for why that direct widening crashes on
+// LP64). Test infrastructure only, not part of the lift.
+struct CCTestTalkToRegistry {
+    static const int CAP = 16;
+    CUserInfo* entries[CAP] = {};
+    int count = 0;
+    void reset() { count = 0; }
+    DWORD add(CUserInfo* pui) {
+        ASSERT(count < CAP);
+        entries[count++] = pui;
+        return (DWORD)(uintptr_t)pui;
+    }
+};
+static CCTestTalkToRegistry g_talkToRegistry;
+static CUserInfo* cc_test_resolve_talkto(DWORD key) {
+    for (int i = 0; i < g_talkToRegistry.count; i++)
+        if ((DWORD)(uintptr_t)g_talkToRegistry.entries[i] == key)
+            return g_talkToRegistry.entries[i];
+    return nullptr;
+}
+
+// Thin test wrapper over ProcessUDIData (brief Step 2/6). `wire` must start
+// with '#' (ASSERT(*szTmp == '#') in the original). The trivial resolver
+// always returns NULL (no addressees resolvable) -- sufficient for every
+// vector in this task that doesn't exercise the T-group (Step 8 below
+// supplies its own resolver for that case). Returns 0 on success.
+static CUserInfo* cc_test_lookup_none(const char*, CChatDoc*) { return nullptr; }
+
+static int cc_test_decode_udi(const char* wire, cc_annotations* out) {
+    if (wire == nullptr || *wire != '#' || out == nullptr) return 1;
+    char buf[256];
+    strncpy(buf, wire, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    CUserInfo pui;
+    ProcessUDIData(nullptr, &pui, buf, FALSE /*bVIPMode*/, cc_test_lookup_none);
+
+    out->gesture_pose = pui.m_udi.m_chGest;
+    out->gesture_emotion = pui.m_udi.m_chGestE;
+    out->gesture_intensity = pui.m_udi.m_chGestI;
+    out->face_pose = pui.m_udi.m_chExpr;
+    out->face_emotion = pui.m_udi.m_chExprE;
+    out->face_intensity = pui.m_udi.m_chExprI;
+    out->requested = pui.m_udi.m_bbReq;
+    out->mode = BM2SM(pui.m_udi.m_uModes);   // wire SM_* value, inverse of ProcessUDIData's SM2BM
+    out->cooked = pui.m_udi.m_bbCooked;
+
+    int upper = pui.m_udi.m_talkTos.GetUpperBound();
+    out->addressee_count = 0;
+    for (int i = 0; i <= upper && out->addressee_count < CC_MAX_ADDRESSEES; i++) {
+        // Recover the real pointer via the test registry (cc_test_resolve_talkto),
+        // not a direct DWORD->pointer widening -- see the GetAddressees
+        // deviation-4 comment in protsupp.cpp for why the naive cast crashes
+        // on LP64. Every pointer GetTalkTos could have stored here was
+        // resolved through cc_test_lookup_none/cc_test_lookup_table, which
+        // register into g_talkToRegistry at resolution time.
+        CUserInfo* addressee = cc_test_resolve_talkto(pui.m_udi.m_talkTos[i]);
+        if (!addressee) continue;  // registry miss: should not happen for any vector in this task
+        strncpy(out->addressees[out->addressee_count], addressee->GetName(), 63);
+        out->addressees[out->addressee_count][63] = '\0';
+        out->addressee_count++;
+    }
+    return 0;
+}
+
+// Thin test wrapper over bInsertAnnotations (brief Step 2/6). Builds a
+// CCTestAvatar from `in`'s gesture/face fields, a CUserInfo carrying `in`'s
+// addressees as its m_udi.m_talkTos, and calls the encoder with
+// bIncludeParenthesis=FALSE (the IRCX-transport shape; Step 8 covers the
+// parenthesized plain-IRC transport separately). Returns the encoded length
+// (>0) on success, <=0 on failure.
+static int cc_test_encode_udi(const cc_annotations* in, char* out, int outSize) {
+    if (in == nullptr || out == nullptr || outSize <= 0) return -1;
+
+    CCTestAvatar av;
+    av.torso = (CHAR)in->gesture_pose;
+    av.requested = (BYTE)in->requested;
+    BytesToEmotion(av.torsoEmotion, (BYTE)in->gesture_emotion, (BYTE)in->gesture_intensity);
+    av.face = (CHAR)in->face_pose;
+    BytesToEmotion(av.faceEmotion, (BYTE)in->face_emotion, (BYTE)in->face_intensity);
+
+    CUserInfo puiSelf;
+    CUserInfo* allocated[CC_MAX_ADDRESSEES] = {};
+    int nAllocated = 0;
+    for (int i = 0; i < in->addressee_count && i < CC_MAX_ADDRESSEES; i++) {
+        // Default-construct + assign via GetName() rather than the
+        // CUserInfo(const char* nick, ...) constructor: that overload's real
+        // body (userinfo.cpp) is not lifted this task (only the default ctor
+        // is an R12(a) single, lifted_singles.cpp) -- see the NickTable
+        // comment above for the identical reasoning.
+        CUserInfo* addressee = new CUserInfo();
+        addressee->GetName() = in->addressees[i];
+        allocated[nAllocated++] = addressee;
+        // R13 (panel.cpp:316-322): via-uintptr_t cast, LP64-safe on the WRITE
+        // side; the read side (GetAddressees, via pfnResolve below) recovers
+        // the real pointer through g_talkToRegistry, not a naive widening --
+        // see protsupp.cpp's GetAddressees deviation-4 comment.
+        puiSelf.m_udi.m_talkTos.Add(g_talkToRegistry.add(addressee));
+    }
+
+    USHORT uModes = SM2BM((BYTE)in->mode);
+    char buf[1024];
+    BOOL ok = bInsertAnnotations(&av, &puiSelf, buf, uModes, FALSE /*bIncludeParenthesis*/, cc_test_resolve_talkto);
+    if (!ok) return -1;
+
+    int len = (int)strlen(buf);
+    if (len >= outSize) {
+        for (int i = 0; i < nAllocated; i++) delete allocated[i];
+        return -1;
+    }
+    strcpy(out, buf);
+
+    for (int i = 0; i < nAllocated; i++) delete allocated[i];
+    return len;
+}
+
+// brief Step 2: hand-encoded round-trip vector. Wire arithmetic (IndexToByte
+// (v) = v + '0', protsupp.cpp:1023):
+//   '2' = 0x32 = 2 + '0' (0x30)  -> gesture_pose = 2
+//   '9' = 0x39 = 9 + '0'         -> gesture_emotion = 9 (EM_NEUTRAL, avatario.cpp emFloats[9])
+//   '5' = 0x35 = 5 + '0'         -> gesture_intensity = 5
+//   '1' = 0x31 = 1 + '0'         -> face_pose = 1
+//   '9' = 0x39 = 9 + '0'         -> face_emotion = 9 (EM_NEUTRAL)
+//   '3' = 0x33 = 3 + '0'         -> face_intensity = 3
+//   '1' = 0x31 = 1 + '0'         -> mode = 1 (SM_SAY, defines.h:57)
+//
+// DISCOVERED PRE-EXISTING BUG (not introduced by this lift, verified against
+// the original avatario.cpp emFloats[] table verbatim): EM_HAPPY and
+// EM_NEUTRAL are BOTH defined as (float)0.0 (avatar.h:328,336 -- EM_HAPPY is
+// literally `0 * 2 * PI / 8`, EM_NEUTRAL is `(float)0.0`). EmotionToBytes's
+// linear scan (avatario.cpp:71-76, `for i=1..n: if emFloats[i]==em.m_emotion:
+// emVal=i; break`) starts at index 1 and finds EM_HAPPY (index 1) before it
+// ever reaches EM_NEUTRAL (index 9) -- so a live avatar whose emotion is
+// EM_NEUTRAL is UNCONDITIONALLY re-encoded to the wire as emotion byte 1
+// (HAPPY), never 9. Confirmed with a standalone reproduction of the exact
+// original loop (equal to 1, not 9, for em.m_emotion==0.0). This makes the
+// DECODE direction (ProcessUDIData: direct ByteToIndex, no EmotionToBytes
+// involved) exact for value 9, but the ENCODE direction (bInsertAnnotations
+// -> EmotionToBytes) can never reproduce emotion byte 9 for any live avatar
+// state, by construction of the original's own table. This selftest
+// therefore verifies DECODE against the brief's exact vector (byte-exact,
+// unaffected by the bug), and verifies ENCODE separately below with values
+// that don't hit the collision (COY=index 2, unambiguous), rather than
+// asserting a round-trip the original code cannot actually perform.
+static int cc_selftest_annotation_codec() {
+    const char* wire = "#G295E193M1";
+    cc_annotations a; memset(&a, 0, sizeof a);
+    int ok = cc_test_decode_udi(wire, &a);
+    CC_CHECK(ok == 0);
+    CC_CHECK(a.gesture_pose == 2 && a.gesture_emotion == 9 && a.gesture_intensity == 5);
+    CC_CHECK(a.face_pose == 1 && a.face_emotion == 9 && a.face_intensity == 3);
+    CC_CHECK(a.mode == 1 && a.addressee_count == 0);
+
+    // Encode-direction round-trip, using an emotion index (2 = EM_COY) that
+    // is NOT ambiguous in emFloats[] (unlike 9/EM_NEUTRAL, see above) --
+    // genuinely exercises bInsertAnnotations/EmotionToBytes byte-exact.
+    cc_annotations b; memset(&b, 0, sizeof b);
+    b.gesture_pose = 2; b.gesture_emotion = 2; b.gesture_intensity = 5;
+    b.face_pose = 1;    b.face_emotion = 2;    b.face_intensity = 3;
+    b.mode = 1;
+    char out[128];
+    int n = cc_test_encode_udi(&b, out, sizeof out);
+    CC_CHECK(n > 0 && strcmp(out, "#G225E123M1") == 0);
+    return 0;
+}
+
+// brief Step 8(a)/(b): the two transports for the same "#G...M..." blob.
+// (a) IRCX: the block travels alone (DATA ... CCUDI1 :#G...), no parens
+//     (ircproto.cpp:542-549) -- bIncludeParenthesis=FALSE, exactly
+//     cc_test_encode_udi's default above. Re-asserted here explicitly as its
+//     own behavior.
+// (b) plain IRC: the block is prepended to the message text, PARENTHESIZED
+//     (ircproto.cpp:554-556): "(#G...M<m>) <text>". The decoder's trigger is
+//     `strncmp(szMesg, "(#", 2)` + a ") " search (protsupp.cpp:1566, 1605-
+//     1609) -- this task doesn't lift that trigger (it's inside ProcessSay,
+//     Task 6 territory), but bInsertAnnotations's bIncludeParenthesis=TRUE
+//     path (the encoder half of the same contract) IS in scope, so this
+//     freezes the encoder's half of the two-transport contract and hand-
+//     verifies the decoder's trigger string against the encoder's literal
+//     output.
+static int cc_selftest_annotation_transports() {
+    // Emotion index 2 (EM_COY), not 9 (EM_NEUTRAL) -- see the
+    // cc_selftest_annotation_codec comment above for why 9 cannot round-trip
+    // through the real EmotionToBytes (EM_HAPPY/EM_NEUTRAL both == 0.0f).
+    CCTestAvatar av;
+    av.torso = 2; av.face = 1; av.requested = 0;
+    BytesToEmotion(av.torsoEmotion, 2, 5);
+    BytesToEmotion(av.faceEmotion, 2, 3);
+    CUserInfo puiSelf;
+    USHORT uModes = SM2BM(1);  // SM_SAY
+
+    // (a) IRCX: bare blob, no parens, no trailing ") ".
+    {
+        char buf[128];
+        BOOL ok = bInsertAnnotations(&av, &puiSelf, buf, uModes, FALSE, cc_test_resolve_talkto);
+        CC_CHECK(ok);
+        CC_CHECK(strcmp(buf, "#G225E123M1") == 0);
+        CC_CHECK(strncmp(buf, "(#", 2) != 0);  // NOT the plain-IRC shape
+    }
+
+    // (b) plain IRC: parenthesized, with the ") " terminator the decoder's
+    // `strstr(szMesg+2, ") ")` trigger (protsupp.cpp:1566) looks for.
+    {
+        char buf[128];
+        BOOL ok = bInsertAnnotations(&av, &puiSelf, buf, uModes, TRUE, cc_test_resolve_talkto);
+        CC_CHECK(ok);
+        CC_CHECK(strcmp(buf, "(#G225E123M1) ") == 0);
+        CC_CHECK(strncmp(buf, "(#", 2) == 0);           // decoder's transport trigger
+        CC_CHECK(strstr(buf + 2, ") ") != nullptr);      // decoder's terminator search
+    }
+    return 0;
+}
+
+// brief Step 8(c): anti-spoof mask. protsupp.cpp:1588-1592's "anti-hacker
+// line" forces SAY/THINK to WHISPER on a private message -- that masking
+// itself lives in ProcessSay's inline block (Task 6 territory, not lifted
+// here), but ProcessUDIData's OWN M-group decode (this task's scope) has no
+// such masking (protsupp.cpp:1525-1530 -- ProcessUDIData is the DATA/CCUDI1
+// out-of-band path, which the original never subjects to the private-message
+// mask; only the inline PRIVMSG-text path is). This test freezes that
+// asymmetry: decoding an M2 (SM_WHISPER) byte through ProcessUDIData yields
+// BM_WHISPER either way, decoding M1 (SM_SAY) yields BM_SAY unmasked (no
+// bVIPMode/privmsg parameter exists on ProcessUDIData to mask it -- masking
+// is ProcessSay's job, not ProcessUDIData's, confirmed by re-reading both
+// original call sites).
+static int cc_selftest_annotation_antispoof_scope() {
+    // M2 = IndexToByte(2) = '2' -> SM_WHISPER -> BM_WHISPER.
+    {
+        char buf[64]; strcpy(buf, "#M2");
+        CUserInfo pui;
+        ProcessUDIData(nullptr, &pui, buf, FALSE, cc_test_lookup_none);
+        CC_CHECK(pui.m_udi.m_uModes == BM_WHISPER);
+    }
+    // M1 = IndexToByte(1) = '1' -> SM_SAY -> BM_SAY (ProcessUDIData never
+    // masks this to BM_WHISPER -- that's ProcessSay's anti-hacker line, out
+    // of this task's scope; documented here so the boundary is explicit and
+    // testable, not silently assumed).
+    {
+        char buf[64]; strcpy(buf, "#M1");
+        CUserInfo pui;
+        ProcessUDIData(nullptr, &pui, buf, FALSE, cc_test_lookup_none);
+        CC_CHECK(pui.m_udi.m_uModes == BM_SAY);
+    }
+    return 0;
+}
+
+// brief Step 8(d): T-list decode with 5 nicks (GetTalkTos has no clip of its
+// own on decode -- protsupp.cpp:1066-1101 just Add()s every resolved nick;
+// the clip-at-5 lives on the ENCODE side, GetAddressees/GetWhisperedAddressees
+// `min(GetUpperBound(), 4)`, protsupp.cpp:3009/3025). This test freezes both
+// halves: decoding 6 comma-separated nicks (all resolvable) yields 6 talkTos
+// entries (no decode-side clip), and re-encoding that same CUserInfo's
+// m_udi.m_talkTos via GetAddressees clips the OUTPUT to the first 5.
+struct NickTable {
+    static const int N = 6;
+    CUserInfo users[N];
+    NickTable() {
+        // Assign via the mutable GetName() reference rather than SetName():
+        // CUserInfo::SetName (userinfo.h, inline) unconditionally calls
+        // SetScreenName(), whose real body is userinfo.cpp territory not
+        // lifted this task (only the ctor + GetScreenName are R12(a)-lifted
+        // singles so far, lifted_singles.cpp) -- calling SetName here would
+        // be a new link-time dependency this task doesn't own. GetName()
+        // returns CString& (a mutable reference), so this achieves the same
+        // observable result (a named CUserInfo) without it.
+        const char* names[N] = {"alice","bob","carol","dave","erin","frank"};
+        for (int i = 0; i < N; i++) users[i].GetName() = names[i];
+    }
+    CUserInfo* find(const char* nick) {
+        for (int i = 0; i < N; i++)
+            if (strcmp(users[i].GetName(), nick) == 0) return &users[i];
+        return nullptr;
+    }
+};
+static NickTable* g_talkToTestTable;
+static CUserInfo* cc_test_lookup_table(const char* nick, CChatDoc*) {
+    CUserInfo* found = g_talkToTestTable ? g_talkToTestTable->find(nick) : nullptr;
+    // Register with the test talk-to registry: every pointer GetTalkTos
+    // stores into an m_udi.m_talkTos DWORD (via this resolver) must be
+    // recoverable afterward through cc_test_resolve_talkto, not a naive
+    // widening cast (see cc_test_decode_udi's comment).
+    if (found) g_talkToRegistry.add(found);
+    return found;
+}
+
+static int cc_selftest_annotation_addressees() {
+    g_talkToRegistry.reset();
+    NickTable table;
+    g_talkToTestTable = &table;
+    // Pre-register the whole table so GetAddressees's resolver (below) can
+    // recover every pointer, exactly as cc_test_lookup_table would do lazily
+    // during a decode -- here we go straight to the encode side, so nothing
+    // resolves the pointers into the registry unless we do it explicitly.
+    for (int i = 0; i < NickTable::N; i++) g_talkToRegistry.add(&table.users[i]);
+
+    // (d) decode: T<6 names> -> GetTalkTos resolves and Add()s all 6, no clip
+    // on this side.
+    {
+        char buf[128];
+        strcpy(buf, "#Talice,bob,carol,dave,erin,frank");
+        CUserInfo pui;
+        ProcessUDIData(nullptr, &pui, buf, FALSE, cc_test_lookup_table);
+        CC_CHECK(pui.m_udi.m_talkTos.GetSize() == 6);
+    }
+
+    // (d, encode clip): GetAddressees clips to the first 5
+    // (min(GetUpperBound(), 4), protsupp.cpp:3009) when re-serializing a
+    // talkTos array that has 6 entries.
+    {
+        CUserInfo puiSelf;
+        for (int i = 0; i < NickTable::N; i++)
+            // R13 (panel.cpp:316-322): via-uintptr_t cast, LP64-safe.
+            puiSelf.m_udi.m_talkTos.Add((DWORD)(uintptr_t)&table.users[i]);
+        CString str;
+        GetAddressees(&puiSelf, ",", str, TRUE, cc_test_resolve_talkto);
+        CC_CHECK(strcmp(str, "alice,bob,carol,dave,erin") == 0);  // first 5 only, "frank" dropped
+    }
+
+    g_talkToTestTable = nullptr;
+    g_talkToRegistry.reset();
+    return 0;
+}
+
+// brief Step 8(e): `cooked` is set only when both intensity fields have been
+// written by the decoder. CUserDisplayInfo::Reset() (userinfo.h:40-47) zero-
+// inits m_chGestI/m_chExprI (NOT -1 -- only the pose fields m_chGest/m_chExpr
+// default to -1), so ProcessUDIData's `if (m_chGestI != -1 && m_chExprI !=
+// -1)` check is driven by whether Reset() ran at all, not by whether G/E
+// groups were literally present in this particular wire string. Documented
+// explicitly since it's a real quirk of the original arithmetic, not an
+// artifact of this lift: a wire string with NEITHER G nor E groups still
+// ends up "cooked" (both intensities sit at their Reset() default of 0,
+// which is != -1).
+static int cc_selftest_annotation_cooked() {
+    // Full G+E groups present -> cooked (both intensities explicitly set).
+    {
+        char buf[64]; strcpy(buf, "#G295E193M1");
+        CUserInfo pui;
+        ProcessUDIData(nullptr, &pui, buf, FALSE, cc_test_lookup_none);
+        CC_CHECK(pui.m_udi.m_bbCooked == 1);
+    }
+    // Neither G nor E group present -> STILL cooked, because Reset() already
+    // put both intensities at 0 (!= -1). This is the original's own
+    // arithmetic (protsupp.cpp:1538-1539), not a lift artifact.
+    {
+        char buf[64]; strcpy(buf, "#M1");
+        CUserInfo pui;
+        ProcessUDIData(nullptr, &pui, buf, FALSE, cc_test_lookup_none);
+        CC_CHECK(pui.m_udi.m_bbCooked == 1);
+    }
+    return 0;
+}
+
+// --- key-string codec (protsupp.cpp:5073-5260) selftest ---------------------
+static int cc_selftest_keystring() {
+    CString ks;
+    CC_CHECK(ChangeKeyString(ks, "msg", "hello", 100) == TRUE);
+    CC_CHECK(strcmp(ks, "msg=hello") == 0);
+    CC_CHECK(ChangeKeyString(ks, "id", "200", 100) == TRUE);
+    CC_CHECK(strcmp(ks, "msg=hello;id=200") == 0);
+
+    CString val;
+    CC_CHECK(GetValueFromKeyString(ks, "msg", val) == TRUE);
+    CC_CHECK(strcmp(val, "hello") == 0);
+    CC_CHECK(GetValueFromKeyString(ks, "id", val) == TRUE);
+    CC_CHECK(strcmp(val, "200") == 0);
+    CC_CHECK(GetValueFromKeyString(ks, "nope", val) == FALSE);
+
+    // Quoted value containing a reserved char (';').
+    CString ks2;
+    CC_CHECK(ChangeKeyString(ks2, "msg", "hello; what is your name", 200) == TRUE);
+    CC_CHECK(strcmp(ks2, "msg=\"hello; what is your name\"") == 0);
+    CC_CHECK(GetValueFromKeyString(ks2, "msg", val) == TRUE);
+    CC_CHECK(strcmp(val, "hello; what is your name") == 0);  // quotes stripped back off
+
+    // DISCOVERED PRE-EXISTING BUG (verified byte-identical against the
+    // original, v2.5-beta-1-modern/protsupp.cpp:5154-5157 -- not introduced
+    // by this lift): ChangeKeyString's deletion branch (`pszValue == NULL ||
+    // *pszValue == '\0'`) computes the correctly-shortened `strNew` (with the
+    // key removed) but returns TRUE WITHOUT ever assigning it back to the
+    // `strKeyString` output parameter -- the only write-back
+    // (`strKeyString = strNew + strPair;`) is unreachable from the deletion
+    // branch (it returns earlier, line ~546). So deletion always silently
+    // no-ops: the function reports success (TRUE) but the caller's key
+    // string is left completely unchanged. Confirmed reachable in the
+    // original (CIrcProto::ChangeProperty, ircproto.cpp:1397-1399, forwards
+    // its caller-supplied pszValue straight through -- a NULL/empty value
+    // there would hit this exact branch). This is a real functional defect,
+    // not merely a memory-safety hazard like the FindInKeyString bug above,
+    // so it is NOT silently patched here (unlike that one) -- flagged in the
+    // task report for the parent/a later task to decide whether/when to fix,
+    // since "wire/property behavior" changes are explicitly called out as
+    // needing escalation rather than casual correction. This selftest
+    // therefore asserts the ACTUAL (buggy) behavior: `ks` is unchanged after
+    // the "deletion".
+    CC_CHECK(ChangeKeyString(ks, "msg", NULL, 100) == TRUE);
+    CC_CHECK(strcmp(ks, "msg=hello;id=200") == 0);  // unchanged -- see bug note above
+
+    // Enumeration (still over the un-deleted two-entry string).
+    LPCSTR pEnum = ks;
+    CString key, value;
+    CC_CHECK(EnumKeyString(pEnum, key, value) == TRUE);
+    CC_CHECK(strcmp(key, "msg") == 0 && strcmp(value, "hello") == 0);
+    CC_CHECK(pEnum != NULL);  // one more entry ("id=200") remains
+    CC_CHECK(EnumKeyString(pEnum, key, value) == TRUE);
+    CC_CHECK(strcmp(key, "id") == 0 && strcmp(value, "200") == 0);
+    CC_CHECK(pEnum == NULL);  // no more entries
+
+    return 0;
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -2830,5 +3290,11 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_cptrlist_fifo();     // Plan 3 Task 2 Step 6: CPtrList::RemoveHead
     cc_selftest_charnext();          // Plan 3 Task 2 Step 7: CharNext (Plan 2 debt)
     cc_selftest_capitalize();        // Plan 3 Task 2 Step 8: Capitalize restored
+    cc_selftest_annotation_codec();            // Plan 3 Task 3 Step 2: codec round-trip
+    cc_selftest_annotation_transports();       // Plan 3 Task 3 Step 8(a)(b): IRCX vs plain-IRC
+    cc_selftest_annotation_antispoof_scope();  // Plan 3 Task 3 Step 8(c): anti-spoof scope
+    cc_selftest_annotation_addressees();       // Plan 3 Task 3 Step 8(d): T-list + clip-at-5
+    cc_selftest_annotation_cooked();           // Plan 3 Task 3 Step 8(e): cooked flag
+    cc_selftest_keystring();                   // Plan 3 Task 3: PROP CLIENT key-string codec
     return g_failures;
 }
