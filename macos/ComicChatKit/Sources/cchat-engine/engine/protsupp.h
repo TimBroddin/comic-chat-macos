@@ -11,6 +11,7 @@
 #define __PROTSUPP_H__
 
 #include "mfc_compat.h"  // R1 (was stdafx.h): CString/CDWordArray/CPtrArray/BOOL/BYTE/USHORT
+#include "comicchat.h"   // Plan 3 Task 6: cc_annotations/cc_user_ref (payload-stage API)
 
 // Forward declaration only (R8): CChatDoc is a UI/document class, never
 // lifted. The codec subset's signatures name it purely as an opaque pointer
@@ -116,5 +117,117 @@ void ProcessUDIData(CChatDoc *pDoc, CUserInfo *pui, char *szData, BOOL bVIPMode,
 BOOL ChangeKeyString(CString &strKeyString, LPCSTR pszKey, LPCSTR pszValue, int nMaxSize);
 BOOL GetValueFromKeyString(LPCSTR pszKeyString, LPCSTR pszKey, CString &strValueOut);
 BOOL EnumKeyString(LPCSTR &pszKeyString, CString &strKey, CString &strValue);
+
+// =============================================================================
+// Plan 3 Task 6: the payload SECOND STAGE -- OnTextMsg/OnDataMsg/ProcessSay/
+// ProcessComment, extracted from the original's UI/policy entanglement (R20)
+// per the task brief. See protsupp.cpp's Task 6 provenance comment for the
+// full fidelity diff; this header declares only the resulting stateless
+// classification API.
+//
+// WHY STATELESS, NOT A LIFT OF THE ORIGINAL SIGNATURES: the original
+// ProcessSay/ProcessComment/OnTextMsg/OnDataMsg all take a live CUserInfo*
+// (ignore/flood flags, request-info counters, avatar-download state) and a
+// CChatDoc* (history/rules/UI). Neither exists in this headless engine --
+// Task 3/5b's discovery already established that the session-side user table
+// (CUserInfo objects, LookupPui) is NOT lifted; Swift owns per-user state
+// (state-and-codec.md §1.4) and the engine only ever sees wire-parsed nick
+// STRINGS plus an opaque cc_user_ref from ccSessionResolveUser. So the payload
+// stage here is reshaped into a pure classifier: (nick, wire text, msgType,
+// resolver) in, "which ONE event to emit + its decoded fields" out. Every
+// ignore-list/flood-counter/rules-matching/history-entry/avatar-download-state
+// check the original made against pui's live flags is R20-dropped (there is
+// no engine-side object to check those flags against); Swift, which DOES own
+// the real per-user ignore/flood state, is free to filter/suppress after
+// receiving the classified event. This is the payload stage's R20 boundary,
+// listed exhaustively in the task report.
+
+// Which single event OnTextMsg's/OnDataMsg's classification maps to. Mirrors
+// the cc_proto_event variants this task populates (CC_EV_TEXT/ACTION/SOUND/
+// AWAY_PEER/APPEARS_AS/DATA), plus ccPayloadSuppressed for wire content the
+// original silently ate (untreated CTCP verbs, X-VCHAT, DCC, mid-negotiation
+// probe replies with no display-worthy text -- see protsupp.cpp for the list).
+typedef enum ccPayloadClass {
+    ccPayloadSay,           // -> CC_EV_TEXT (plain say/think/whisper-anti-spoof, decoded annotations)
+    ccPayloadAction,        // -> CC_EV_ACTION (\x01ACTION..\x01 CTCP, or m_uModes BM_ACTION comics-action)
+    ccPayloadSound,         // -> CC_EV_SOUND (\x01SOUND "file" text\x01 CTCP)
+    ccPayloadAwayPeer,      // -> CC_EV_AWAY_PEER (\x01AWAY message\x01 CTCP)
+    ccPayloadAppearsAs,     // -> CC_EV_APPEARS_AS ("# Appears as name.url" comment)
+    ccPayloadData,          // -> CC_EV_DATA (IRCX UDI blob with no visible text; OnDataMsg only)
+    ccPayloadSuppressed,    // no event -- a CTCP verb inside ProcessSay with no
+                            // in-scope event (R20); falls out of OnTextMsg with
+                            // no event, but is NEVER produced by ProcessComment
+                            // (see ccPayloadHandledNoEvent for that case)
+    ccPayloadHandledNoEvent // ProcessComment's "#" grammar MATCHED a known
+                            // prefix (return TRUE in the original) but that
+                            // branch's original body is pure R20-dropped
+                            // policy/reply-sending with no in-scope event
+                            // (GetInfo/HeresInfo/BDrop/BDrop2). Distinct from
+                            // ccPayloadSuppressed: this means "stop, do NOT
+                            // fall through to ProcessSay" (matching the
+                            // original's `!ProcessComment(...)` being FALSE
+                            // when ProcessComment returns TRUE) -- whereas an
+                            // UNMATCHED "#" comment (no prefix recognized,
+                            // ProcessComment returns FALSE in the original)
+                            // must fall through to ProcessSay's plain-say
+                            // path, matching the original's OWN dispatch
+                            // exactly (protsupp.cpp:4368's `if (*szMesg != '#'
+                            // || !ProcessComment(...)) ProcessSay(...)`).
+} ccPayloadClass;
+
+// Resolver typedef for the payload stage's own nick->ref lookups (R19):
+// GetTalkTos/IdentifyWhispers/ProcessSay's PuiFromDocNickIdent all resolved a
+// nick string to a session-table pointer in the original; here that resolves
+// to an opaque cc_user_ref via ccSessionResolveUser (bridge/cc_session.h).
+// room_token disambiguates same-nick-different-room per R19's own contract.
+typedef cc_user_ref (*PFNRESOLVENICKREF)(const char *szNickname, uint32_t room_token);
+
+// The classification result. `text` holds the display text for
+// Say/Action/Sound/AwayPeer; `file` is the sound filename (Sound only);
+// `avatarName`/`avatarUrl` are AppearsAs only; `annotations`/`hasAnnotations`
+// carry the decoded udi block for Say/Action (never set for the other
+// classes -- CTCP/comment payloads don't carry a udi block of their own,
+// matching the original: PrepareTextAction/PrepareSound only ever *mask*
+// pui->m_udi.m_uModes into BM_ACTION, they don't touch the G/E groups).
+typedef struct ccPayloadResult {
+    ccPayloadClass  cls;
+    CString         text;
+    CString         file;
+    CString         avatarName;
+    CString         avatarUrl;
+    cc_annotations  annotations;
+    BOOL            hasAnnotations;
+} ccPayloadResult;
+
+// OnTextMsg (protsupp.cpp:4358 original). szMesg is the CTCP-unquoted (caller
+// already ran bLowLevelUnquoting via ccCSInString upstream, ircsock.cpp) wire
+// text, mutable (the codec advances/rewrites through it exactly like the
+// original). msgType is the MT_* bitmask (PRVMSG/NOTICE/WHISPER |
+// CHANNELSEND/PRIVATEMSG). pfnResolve resolves talk-to nick tokens (R19);
+// room_token scopes those lookups. szExplicitTalkTos is nullable: the
+// original's WHISPER handler (ircsock.cpp:1832-1841) pre-computes a
+// CDWordArray of talk-to targets from the WHISPER command's OWN target-list
+// wire field (args[2], distinct from any inline annotation "T" group) via
+// GetTalkTos(doc,&talkTos,args[2]) and passes it through to OnTextMsg, which
+// IdentifyWhispers then uses INSTEAD of defaulting to "just me" -- pass that
+// same raw wire target-list string here (NULL for PRIVMSG/NOTICE, which have
+// no such field) and OnTextMsg decodes it internally via the same GetTalkTos.
+// Dispatches internally to ProcessComment (szMesg[0]=='#') or ProcessSay (the
+// CTCP/plain-say path), exactly like the original's `if (*szMesg != '#' ||
+// !ProcessComment(...)) ProcessSay(...)` -- see protsupp.cpp for why this
+// port folds both into one entry point rather than two free functions plus a
+// live CUserInfo* to carry state between them.
+ccPayloadResult OnTextMsg(const char *szNickname, char *szMesg, BYTE msgType,
+                          uint32_t room_token, PFNRESOLVENICKREF pfnResolve,
+                          char *szExplicitTalkTos = NULL);
+
+// OnDataMsg (protsupp.cpp:4374 original). szData is the IRCX DATA payload
+// (already known to start with '#' by the caller's CCUDI1 dispatch gate,
+// ircsock.cpp). Original dispatch: `*(szData+1)==' '` -> ProcessComment (a
+// "# " comment arrived via DATA instead of PRIVMSG -- e.g. "# Appears as"),
+// else ProcessUDIData (a real UDI annotation blob) -- verbatim, reproduced
+// here.
+ccPayloadResult OnDataMsg(const char *szNickname, char *szData, BYTE msgType,
+                          uint32_t room_token, PFNRESOLVENICKREF pfnResolve);
 
 #endif // __PROTSUPP_H__

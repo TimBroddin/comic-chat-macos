@@ -52,16 +52,16 @@ const char* CUserInfo::GetQualifiedName() {
     return GetScreenName();  // safe non-null fallback if ever reached in release
 }
 
-// GetMyNickName (setupdlg.cpp — UI, Plan 3): CUserInfo::IsSelf() is an INLINE
-// virtual in userinfo.h (strcmp(GetName(), GetMyNickName())). Being virtual it
-// sits in the CUserInfo vtable, so emitting that vtable (anchored by the
-// GetScreenName R12a single in lifted_singles.cpp) forces GetMyNickName to link
-// even though no lifted code CALLS IsSelf on a session user. Return "" -- the
-// headless port has no "self" user (matching MyAvatarID()==0's "no self
-// selected" posture), so IsSelf() correctly reports FALSE for every session
-// user (strcmp(name, "") != 0 for any non-empty nick). Plan 3 lifts the real
-// body and deletes this stub.
-const char* GetMyNickName() { return ""; }
+// GetMyNickName: MOVED to protsupp.cpp (Plan 3 Task 6, R19). CUserInfo::IsSelf()
+// is an INLINE virtual in userinfo.h (strcmp(GetName(), GetMyNickName())).
+// Being virtual it sits in the CUserInfo vtable, so emitting that vtable
+// (anchored by the GetScreenName R12a single in lifted_singles.cpp) forces
+// GetMyNickName to link even though no lifted payload-stage code calls
+// IsSelf() on a session user. Task 6 replaces this R12(b) UI-stub ("" always)
+// with a real forwarder to ccSessionOwnNick() (R19) in protsupp.cpp -- see
+// the "GetMyNickName / IsSelf" note there for the full decision + why IsSelf()
+// itself needed no change (it is byte-identical, untouched userinfo.h; only
+// the free function it calls gained a real, non-UI body).
 
 // --- CBodySingle / CBodyDouble (avatar.h) — real bodies now LIVE ------------
 // Task 7 lifted bodycam.cpp, which defines all ten CBodySingle/CBodyDouble

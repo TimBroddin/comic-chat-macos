@@ -65,6 +65,43 @@
 #include "protsupp.h"
 #include "avatar.h"      // CAvatarX::GetIndices/GetEmotions, CEmotion (bInsertAnnotations)
 #include "userinfo.h"    // CUserInfo, CUserDisplayInfo (already lifted, Plan 2 Task 8)
+#include "ccommon_str.h" // Plan 3 Task 6: bLowLevelUnquoting/g_chLLQuoteCTCP (ProcessSay/ProcessComment's first line)
+#include "ircproto.h"    // Plan 3 Task 6: CTCP ID tables (actionID/soundID/...) + comment prefixes (APPEARSPREFIX/...)
+#include "format.h"      // Plan 3 Task 6: nResettingSequence (PrepareSound)
+#include "cc_session.h"  // Plan 3 Task 6 (R19): ccSessionOwnNick/ccSessionResolveUser + ccSession()
+
+// UnConst (chat.h:311 in the original -- a plain const-cast helper, not lifted
+// on its own; ircsock.cpp already carries an identical file-local copy for
+// the same reason -- R1/R8, not worth a shared header for one line).
+static inline char *UnConst(const char *sz) { return const_cast<char*>(sz); }
+
+// --- GetMyNickName (R19; DECISION recorded here, task report cites this) ----
+// GetMyNickName (originally setupdlg.cpp's UI-layer accessor for
+// theApp.m_myNick) had a Plan-2 R12(b) trap stub in cc_link_stubs.cpp
+// (`return "";`) that existed ONLY to satisfy the linker for
+// CUserInfo::IsSelf() (userinfo.h:113-116, an INLINE virtual, untouched,
+// byte-identical to the original: `const char *GetMyNickName(); return
+// (strcmp(GetName(), GetMyNickName()) == 0);` -- note this is a local
+// FUNCTION DECLARATION inside the method body, an archaic but valid C++
+// construct, that then calls the free function of the same name). This task
+// (R19) REPLACES that stub with a real forwarder to ccSessionOwnNick() (the
+// resolver Task 1 defined for exactly this "own nick" datum, wired by
+// bridge/cc_session.cpp Step 4) -- GetMyNickName now answers with the
+// SESSION's actual own nick instead of a permanent "no self" placeholder.
+// DECISION on IsSelf(): no change needed to userinfo.h at all. IsSelf() was
+// ALREADY correctly wired to call the free function GetMyNickName() (not a
+// member) by the original's own code shape; giving that free function a real
+// body is sufficient -- IsSelf() now correctly compares against the live
+// session nick for any CUserInfo it's called on (session users AND the
+// scratch CUserInfo objects this file's payload stage creates), with no
+// further wiring. This function lives HERE (protsupp.cpp) rather than back
+// in cc_link_stubs.cpp because protsupp.cpp is this port's "session-state
+// glue" home for the payload stage (R19's own resolvers are implemented
+// alongside it) and because GetMyNickName's real original home
+// (setupdlg.cpp) is UI, never slated for a lift -- protsupp.cpp is the
+// closest non-UI file that already reroutes session-identity questions
+// through ccSession()'s resolvers.
+const char* GetMyNickName() { return ccSessionOwnNick(); }
 
 // EmotionToBytes is defined in avatario.cpp (now live, Task 3 un-gates
 // CC_NO_PROTOCOL); declared here exactly as the original does at its call
@@ -655,4 +692,727 @@ CString &strValue)
 	}
 	pszKeyString = (nNextValPos == -1) ? NULL : pszKeyString + nNextValPos;
 	return TRUE;
+}
+
+
+// =============================================================================
+// Plan 3 Task 6: the payload SECOND STAGE.
+//
+// PROVENANCE / FIDELITY DIFF (report cites this comment): lifts OnTextMsg
+// (original :4358-4371), OnDataMsg (:4374-4395), ProcessSay's codec+CTCP-
+// dispatch core (:1545-1919, MINUS the R20-dropped ignore/flood/rules/history
+// pieces enumerated below), ProcessComment's "#"-grammar core (:846-1020,
+// MINUS the R20-dropped policy/avatar-download-action pieces), IdentifyWhispers
+// (:1448-1467), and the CTCP-dispatch table's ACTION/SOUND/AWAY branches
+// (:1626-1869, the only three of the ten CTCP verbs that map to an event in
+// the Task-5a union -- see the per-verb table in the task report).
+//
+// UNIFICATION (state-and-codec.md §3.2, the brief's Step 3 requirement): the
+// original had the "#G..E..[R]M.[T..]" grammar hand-inlined a SECOND time
+// inside ProcessSay (:1566-1612), byte-for-byte identical to ProcessUDIData's
+// body (:1485-1542) except for writing into `pui->m_udi` via a local `szStart`
+// instead of `szTmp`, and a private-message anti-spoof mask ProcessUDIData's
+// call site never needed. This port collapses BOTH call sites onto the ONE
+// decoder already lifted in Task 3 -- ProcessUDIData itself: OnDataMsg's UDI
+// branch calls it directly (as the original did); ccOnTextMsgInline (below)
+// -- the plain-IRC "(#...) text" trigger -- calls the SAME ProcessUDIData
+// against a scratch CUserInfo, then applies the anti-spoof mask as a
+// POST-step (identical net effect to the original's inline mask, applied
+// where the original applied it: right after the M-group parse, before T).
+// There is now exactly ONE annotation-body decoder in this codebase used by
+// BOTH the IRCX DATA path and the plain-IRC inline path: ProcessUDIData.
+// (ircsock.cpp's OWN pre-Task-6 standalone decoder, ccDecodeAnnotationBody/
+// ccSplitInlineAnnotations, added as a Task-5b placeholder specifically
+// because Task 6 hadn't landed yet -- see ircsock.cpp's SECTION 5 comment,
+// "This mirrors the grammar... Task 6's job" -- is RETIRED by this task; its
+// two callers in HandleCommand are rewired to call OnTextMsg/OnDataMsg
+// instead, per Step 5 below. That retires the THIRD copy the brief's "3
+// original locations" refers to: ProcessUDIData (Task 3), the ProcessSay
+// inline block (original, never separately lifted), and ccDecodeAnnotationBody
+// (Task 5b's stand-in for the not-yet-lifted Task 6 code) all collapse onto
+// this ONE call: ProcessUDIData.
+//
+// WHY A SCRATCH CUserInfo, NOT A SESSION USER TABLE: Task 3's discovery
+// (state-and-codec.md §1.4) already established the engine does not own a
+// live per-nick CUserInfo table -- Swift does. ProcessUDIData/GetTalkTos are
+// PARAMETERIZED (Task 3, R19-stubbed) to take any CUserInfo* target and any
+// PFNLOOKUPPUI resolver; a stack-local CUserInfo used purely as "the codec's
+// scratch destination for this one message" (exactly what cc_test_decode_udi
+// already does in cc_selftest.cpp) is the correct, minimal instantiation --
+// it never leaks past this call, never gets a nick assigned, and is not a new
+// "session user table" of any kind. This is the same reasoning Task 3's own
+// test rig already used; Task 6 just makes it the REAL (non-test) call site.
+//
+// R19 RESOLVER WIRING: PFNRESOLVENICKREF (protsupp.h) is the payload stage's
+// own resolver shape (nick,room_token)->cc_user_ref, matching
+// ccSessionResolveUser exactly (bridge/cc_session.h). Internally it is
+// adapted to Task 3's PFNLOOKUPPUI (nick,CChatDoc*)->CUserInfo* shape via
+// ccPayloadLookupAdapter below: ccSessionResolveUser's cc_user_ref return
+// value (an opaque uint32_t, never a real pointer -- see comicchat.h's
+// cc_user_ref doc comment) is round-tripped through the SAME "test registry"
+// technique cc_selftest.cpp's cc_test_resolve_talkto already established
+// (Task 3): a small process-wide table mapping resolved cc_user_ref keys to
+// scratch CUserInfo* stand-ins, so GetTalkTos's `talkerPui->m_udi.m_talkTos.
+// Add((DWORD)(uintptr_t)pui)` line (verbatim, Task 3) stores something
+// GetAddressees-shaped callers can round-trip -- but Task 6's OWN callers
+// (ccPayloadFromUdi below) never re-resolve those DWORDs back into pointers;
+// they read pui->m_udi.m_talkTos as opaque keys and hand them to the SAME
+// ccSessionResolveUser call a second time is unnecessary -- see
+// ccPayloadFromUdi's comment for exactly how the decoded talkTos array
+// becomes the event's addressee strings without ever dereferencing a
+// reconstructed pointer (only ccPayloadLookupAdapter's OWN table, populated
+// by itself, is ever dereferenced -- never a bare cc_user_ref widened
+// directly, preserving the LP64 safety Task 3's GetAddressees deviation-4
+// already established).
+// =============================================================================
+
+// --- R19 resolver adapter: PFNRESOLVENICKREF -> PFNLOOKUPPUI ---------------
+// GetTalkTos/ProcessUDIData (Task 3) call their resolver as
+// CUserInfo*(*)(const char*, CChatDoc*) and store the result via
+// (DWORD)(uintptr_t)pui in talkTos. Task 6's own resolver is
+// cc_user_ref(*)(const char*, uint32_t room_token) (ccSessionResolveUser's
+// shape). ccPayloadLookupAdapter bridges the two: it calls the Task-6
+// resolver, and if it returns a non-NONE ref, vends a STABLE scratch
+// CUserInfo* for that ref (creating one the first time that ref is seen this
+// call, freed by the caller after the decode -- see ccPayloadTalkToPool
+// below), so the DWORD GetTalkTos stores really is a dereferenceable pointer
+// for the lifetime of this one message's processing, exactly like Task 3's
+// cc_test_resolve_talkto/g_talkToRegistry test rig, just wired to the REAL
+// resolver instead of a test table.
+namespace {
+struct ccPayloadTalkToPool {
+    static const int CAP = 8;
+    CUserInfo* entries[CAP] = {};
+    cc_user_ref refs[CAP] = {};
+    int count = 0;
+    CUserInfo* vend(cc_user_ref ref) {
+        for (int i = 0; i < count; i++) if (refs[i] == ref) return entries[i];
+        if (count >= CAP) return nullptr;
+        CUserInfo* pui = new CUserInfo();
+        refs[count] = ref;
+        entries[count] = pui;
+        count++;
+        return pui;
+    }
+    void clear() {
+        for (int i = 0; i < count; i++) delete entries[i];
+        count = 0;
+    }
+};
+// Thread-local-free (single-threaded engine contract, matching ccSession()'s
+// own file-static g_session pattern) -- reset at the start of every
+// OnTextMsg/OnDataMsg call, so no state survives across messages.
+ccPayloadTalkToPool g_payloadTalkToPool;
+PFNRESOLVENICKREF g_payloadResolve = nullptr;
+uint32_t g_payloadRoomToken = 0;
+
+CUserInfo* ccPayloadLookupAdapter(const char* szNickname, CChatDoc* /*doc*/) {
+    if (!g_payloadResolve || !szNickname) return nullptr;
+    cc_user_ref ref = g_payloadResolve(szNickname, g_payloadRoomToken);
+    if (ref == CC_USER_REF_NONE) return nullptr;
+    return g_payloadTalkToPool.vend(ref);
+}
+
+// Reverse direction: given a talkTos DWORD key (as GetTalkTos stored it --
+// (DWORD)(uintptr_t) of a ccPayloadLookupAdapter-vended CUserInfo*), find
+// which of THIS pool's slots it is, and hand back the cc_user_ref that
+// produced it (NOT the nick -- Task 6 has no nick string cached against a
+// ref; the event's addressee list is populated from the SAME wire nick
+// tokens ProcessUDIData's GetTalkTos already tokenized, read straight back
+// off the source string by ccPayloadFromUdi -- see there).
+cc_user_ref ccPayloadPoolRefForKey(DWORD key) {
+    for (int i = 0; i < g_payloadTalkToPool.count; i++)
+        if ((DWORD)(uintptr_t)g_payloadTalkToPool.entries[i] == key)
+            return g_payloadTalkToPool.refs[i];
+    return CC_USER_REF_NONE;
+}
+} // namespace
+
+// Convert a fully-decoded CUserDisplayInfo (pui->m_udi, after ProcessUDIData
+// or the inline-block equivalent has run) into the wire-facing cc_annotations
+// value (comicchat.h) the event union carries. addresseeSource, if non-NULL,
+// is the ORIGINAL wire text of the T-group (already consumed by GetTalkTos --
+// re-tokenized here, verbatim GetToken() calls, purely to recover the nick
+// STRINGS for the event; cc_annotations.addressees[] are encoded nick
+// strings by design, see comicchat.h -- Task 5a's C-boundary deliberately
+// does not carry resolved refs across the wire, Swift re-resolves display
+// names itself). Every ref ccPayloadLookupAdapter vended during this decode
+// is still reachable via ccPayloadPoolRefForKey for a test to verify
+// end-to-end resolution (see cc_selftest.cpp's Task 6 vectors) -- production
+// callers don't need it since the string form is what the event carries.
+static void ccPayloadUdiToAnnotations(const CUserDisplayInfo &udi, const char* addresseeSource, cc_annotations* out) {
+    memset(out, 0, sizeof(*out));
+    out->gesture_pose = udi.m_chGest;
+    out->gesture_emotion = udi.m_chGestE;
+    out->gesture_intensity = udi.m_chGestI;
+    out->face_pose = udi.m_chExpr;
+    out->face_emotion = udi.m_chExprE;
+    out->face_intensity = udi.m_chExprI;
+    out->requested = udi.m_bbReq;
+    out->mode = BM2SM(udi.m_uModes);
+    out->cooked = udi.m_bbCooked;
+    out->addressee_count = 0;
+    if (addresseeSource) {
+        char buf[256];
+        strncpy(buf, addresseeSource, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char *next, *tok = buf;
+        while (out->addressee_count < CC_MAX_ADDRESSEES) {
+            char* name = GetToken(tok, &next, ",");
+            if (!name) break;
+            strncpy(out->addressees[out->addressee_count], name, sizeof(out->addressees[0]) - 1);
+            out->addressees[out->addressee_count][sizeof(out->addressees[0]) - 1] = '\0';
+            out->addressee_count++;
+            tok = next;
+        }
+    }
+}
+
+// Forward declarations (definitions follow ccProcessSay below, matching the
+// original file's own ordering -- PrepareTextAction/PrepareComicsAction/
+// PrepareSound/IdentifyWhispers all precede ProcessSay at :1104-1467/1545 in
+// the original; here ccProcessSay is presented first for readability and
+// these four are declared ahead of it).
+static char* ccPrepareTextAction(const char* szNickname, char *szMesg, CString &strNewMesg, USHORT &uModes);
+static char* ccPrepareComicsAction(const char* szNickname, char *szMesg, CString &strNewMesg);
+static char* ccPrepareSound(const char* szNickname, char *szMesg, CString &strNewMesg, USHORT &uModes, CString &outFile);
+static void ccIdentifyWhispers(CUserInfo* pui, BYTE msgType, USHORT &uModes, CDWordArray *talkTos, PFNRESOLVENICKREF pfnResolve, uint32_t room_token);
+
+// --- ProcessComment's "#"-grammar core (protsupp.cpp:846-1020 original) ----
+// R20 boundary (each listed individually in the task report): the original
+// interleaves EVERY branch with `!pui->Ignored() && !pui->IsFlooding()`
+// gates, `pui->IsOperator()` checks (background-drop authorization),
+// avatar-download state machine (`NeedsDownload`/`SetUserAvatarRealInfo`),
+// and history/UI side effects (`AddAndExecute(new ChangeAvatarEntry(...))`,
+// `AddAndExecute(new GetInfoEntry(...))`). NONE of that state exists in the
+// engine (no live CUserInfo, no CChatDoc, no history list) -- every one of
+// those checks is DROPPED (R20), not merely stubbed true/false, because
+// there is no engine-side flag to evaluate them against; Swift owns the real
+// ignore/flood/operator state and may suppress the emitted event itself.
+// Grammar branches with NO event in the Task-5a union (GetInfo/HeresInfo
+// probe-reply exchange, BDrop/BDrop2 backdrop-change announcements) are
+// R20-dropped outright (ccPayloadSuppressed) -- listed individually in the
+// task report; only "# Appears as" maps to an event (CC_EV_APPEARS_AS).
+static ccPayloadResult ccProcessComment(char *szMesg) {
+    ccPayloadResult r; memset(&r, 0, sizeof(r));
+    // Default to ccPayloadSuppressed (NOT MATCHED, "return FALSE" in the
+    // original -> OnTextMsg falls through to ProcessSay, protsupp.cpp:4368).
+    // Every recognized prefix branch below sets ccPayloadHandledNoEvent
+    // (MATCHED, "return TRUE") instead before returning -- this is the fix
+    // for the fidelity bug caught by cc_selftest_pv_comment_grammar_
+    // suppressed during Task 6 development: the original's `return TRUE`
+    // STOPS dispatch (ProcessSay never runs for a matched-but-silent
+    // comment), so a matched prefix must not merely emit no event, it must
+    // also prevent the fallthrough that would otherwise re-emit the raw
+    // "#..." text as a CC_EV_TEXT say.
+    r.cls = ccPayloadSuppressed;
+
+    // Low Level Unquoting for \r \n (protsupp.cpp:848, verbatim first line).
+    bLowLevelUnquoting(g_chLLQuoteCTCP, TRUE /*bTreatAsByteArray*/, szMesg, szMesg);
+
+    ASSERT(*szMesg == '#');
+    szMesg++;  // nuke the crosshatch (protsupp.cpp:851)
+
+    if (!strncmp(szMesg, APPEARSPREFIX, g_nAppearsAsLen)) {
+        // "# Appears as <name>.<url>" (protsupp.cpp:854-900). R20-dropped:
+        // the ComicUser()-flag flip, the NeedsDownload()/SetUserAvatarRealInfo
+        // interactive-download branch, and the AddAndExecute(ChangeAvatarEntry)
+        // history entry -- all live-CUserInfo/CChatDoc state this engine
+        // doesn't hold. The grammar itself (name/url tokenization) is
+        // verbatim: GetToken (whitespace-terminated) then GetToken2(".,)",",)")
+        // exactly as the original.
+        char *szVar = szMesg + g_nAppearsAsLen;
+        char *szCharName = GetToken(szVar, &szVar);
+        if (!szCharName) { r.cls = ccPayloadHandledNoEvent; return r; }  // djk - BETA1 Fix (verbatim guard; original still `return TRUE`)
+        char nameBuf[128];
+        strncpy(nameBuf, szCharName, sizeof(nameBuf) - 1);
+        nameBuf[sizeof(nameBuf) - 1] = '\0';
+        char *szCharURL = GetToken2(szVar, &szVar, ".,)", ",)");
+        r.cls = ccPayloadAppearsAs;
+        r.avatarName = nameBuf;
+        r.avatarUrl = szCharURL ? szCharURL : "";
+        return r;
+    }
+
+    if (!strncmp(szMesg, GETINFOPREFIX, strlen(GETINFOPREFIX))) {
+        // "# GetInfo" (protsupp.cpp:902-924): original replies with
+        // "# HeresInfo: <profile>" over the wire (bChatSendPrivMesg). No
+        // event in the Task-5a union carries a profile-reply send (R20 --
+        // this is an outbound CTCP reply, not a comic-relevant inbound
+        // event); Task 4's cc_session_send_whisper/outbound API is the
+        // mechanism a LATER task could wire this through if ever needed.
+        // MATCHED (original returns TRUE) -> no fallthrough to ProcessSay.
+        r.cls = ccPayloadHandledNoEvent;
+        return r;
+    }
+
+    if (!strncmp(szMesg, REQUESTCHARPREFIX, g_nGetCharLen)) {
+        // "# GetCharInfo" (protsupp.cpp:926-939): original replies by
+        // re-announcing our avatar with the URL. Same R20 reasoning as
+        // GetInfo above (outbound reply, no matching inbound event).
+        r.cls = ccPayloadHandledNoEvent;
+        return r;
+    }
+
+    if (!strncmp(szMesg, HERESINFOPREFIX, g_nHeresInfoLen)) {
+        // "# HeresInfo: <profile>" (protsupp.cpp:941-962): original only
+        // acts `if (pui->IsRequestInfo(RF_PROFILE))` (a live-pui request
+        // counter this engine doesn't hold) then AddAndExecute's a history
+        // entry. R20: no engine-side request-counter to gate on, no history
+        // list to write to. MATCHED either way (original returns TRUE
+        // unconditionally after the if/else) -> no fallthrough.
+        r.cls = ccPayloadHandledNoEvent;
+        return r;
+    }
+
+    if (!strncmp(szMesg, BACKGRNDPREFIX, strlen(BACKGRNDPREFIX))) {
+        // "# BDrop: <name>" (protsupp.cpp:964-983): original gates on
+        // `pui->IsOperator()` (a live-pui flag) then AddAndExecute's a
+        // ChangeBackDropEntry. R20: no operator flag to check, no backdrop
+        // history to write. (CC_EV_ROOM_PROP already carries PROP CLIENT
+        // bk= changes via ccEmitClientDataChange, ircsock.cpp -- the
+        // IRCX-native path for backdrop sync; this "# " form is the legacy
+        // plain-IRC announcement of the same fact and is not re-plumbed to
+        // an event this task, per R20). MATCHED -> no fallthrough.
+        r.cls = ccPayloadHandledNoEvent;
+        return r;
+    }
+
+    if (!strncmp(szMesg, NEWBACKGRNDPREFIX, strlen(NEWBACKGRNDPREFIX))) {
+        // "# BDrop2: <name>[,<url>]" (protsupp.cpp:988-1017): same R20
+        // reasoning as BDrop above (operator-gated backdrop announcement).
+        // MATCHED -> no fallthrough.
+        r.cls = ccPayloadHandledNoEvent;
+        return r;
+    }
+
+    return r;  // no comment prefix matched -> FALSE in the original
+}
+
+// --- CTCP dispatch core, extracted from ProcessSay (protsupp.cpp:1545-1919) -
+// R20 boundary (each listed individually in the task report):
+//   * `AcceptWhispers()`/`theApp.m_bVIPMode` gates (:1553-1560) -- app-policy
+//     flags this engine doesn't hold. DROPPED: classification always
+//     proceeds; Swift may suppress after the fact.
+//   * Every `!pui->Ignored() && !pui->IsFlooding()` gate around ACTION/SOUND
+//     (:1628, 1641, 1651) -- same reasoning, DROPPED.
+//   * VERSION/PING/TIME/EMAIL/URL/NETMEET/CLIENTINFO CTCP branches
+//     (:1659-1810, 1858-1865) -- these are OUTBOUND-REPLY-SENDING or
+//     UI-launching (ReplyVersion/ReplyPing/ReplyTime/ReplyEmail/
+//     ReplyHomePage send a wire reply via GetOutBuff()/theApp session-identity
+//     globals this engine's Task 1 config never modeled; ShowVersion/ShowTime/
+///    ShowEmail/ShowHomePage/DoNetMeetingCX gate on live pui request-info
+//     counters then AddAndExecute a history entry or FLaunchBrowser/
+//     AfxMessageBox a UI action) -- NONE of the four in-scope events
+//     (ACTION/SOUND/AWAY_PEER/APPEARS_AS) cover these; R20-dropped
+//     (ccPayloadSuppressed) rather than invented new event types (brief:
+//     "if you need an event shape not in the union, STOP and return
+//     NEEDS_CONTEXT" -- these seven CTCP verbs have no in-scope event, so
+//     they are dropped, not escalated, per R20's own "drop with note" option).
+//   * `fileDCCID`/`xvchatID` (:1718-1815) -- DCC file transfer (filesend.cpp,
+//     explicitly out of scope this plan per the roadmap) and X-VCHAT
+//     (ignored by the original itself, "ignore X-VCHAT CTCPs"). DROPPED.
+//   * The "until NOTICE'ed" `\x01*` reply-collection branch (:1816-1866) --
+//     these are the SAME four ShowVersion/ShowTime/ShowEmail/ShowHomePage/
+//     DoNetMeetingCX UI actions reached via a different CTCP framing
+//     (NOTICE'd replies to OUR OWN earlier CTCP requests) -- same R20
+//     reasoning, DROPPED.
+//   * The final say path (:1874-1913): `bAddToWhisperBox` (UI display
+//     routing), `theApp.m_dynaRules.bMatchAndApplyRules` (rules engine,
+//     twice, plus `SetCachRecipients`), `AddAndExecute(new SayEntry(...))`
+//     (history). ALL DROPPED -- Swift's rules/history/display live entirely
+//     outside the engine; the emitted CC_EV_TEXT/CC_EV_ACTION event IS the
+//     "here's a say, you decide what to do with it" replacement for this
+//     whole block.
+// The three verbs that DO map to an in-scope event (ACTION at :1626-1648,
+// SOUND at :1649-1658, AWAY at :1777-1794) are lifted; PrepareTextAction/
+// PrepareComicsAction/PrepareSound (:1104-1123, 1382-1440) are lifted
+// verbatim as codec-shaped string transforms (they don't touch pui flags,
+// only pui->GetScreenName() -- read via the nick string parameter here,
+// since there is no live pui) modulo the CTCPUnQuoteString deviation noted
+// at PrepareSound's call site below.
+static ccPayloadResult ccProcessSay(const char* szNickname, CUserInfo* pui, char *szMesg, BYTE msgType, uint32_t room_token, PFNRESOLVENICKREF pfnResolve, CDWordArray *explicitTalkTos) {
+    ccPayloadResult r; memset(&r, 0, sizeof(r));
+    r.cls = ccPayloadSay;
+    CString strActionMesg;
+    // Raw T-group wire text (comma-separated encoded nicks), captured from the
+    // inline annotation block if one was present -- threaded to
+    // ccPayloadUdiToAnnotations below so the event's addressees[] carries the
+    // actual talk-to nick strings (cc_annotations' wire-facing string form,
+    // see comicchat.h/ccPayloadUdiToAnnotations's doc comment), not an empty
+    // list. Empty ("") if no inline block, or the block had no T-group.
+    char talkToSrc[256]; talkToSrc[0] = '\0';
+
+    // Low Level Unquoting for \r \n (protsupp.cpp:1563, verbatim first codec line
+    // reached from ProcessSay -- the R20-dropped AcceptWhispers/VIP gates above
+    // it never touch szMesg, so skipping them changes no codec behavior).
+    bLowLevelUnquoting(g_chLLQuoteCTCP, TRUE /*bTreatAsByteArray*/, szMesg, szMesg);
+
+    // --- unified inline-annotation parse (state-and-codec.md §3.2 unification;
+    // see the file-header comment above for the full "3 locations -> 1"
+    // account). Original :1566-1612 hand-inlined the SAME grammar
+    // ProcessUDIData already implements; here we call ProcessUDIData itself
+    // against `pui` (the caller's scratch CUserInfo), on the "(#...) text"
+    // substring, then advance szMesg past the parenthetical exactly as the
+    // original did.
+    BOOL bHadInlineAnnotations = FALSE;
+    if (!strncmp(szMesg, "(#", 2) && strstr(szMesg + 2, ") ")) {
+        char* close = strstr(szMesg + 2, ") ");
+        // ProcessUDIData ASSERTs *szTmp=='#' and wants a NUL-terminated
+        // buffer -- carve the parenthetical body (between '(' and ')') into a
+        // scratch buffer, matching the original's in-place szStart walk
+        // (which relied on the buffer having the ") " terminator to stop at;
+        // here we materialize that same substring explicitly).
+        char body[256];
+        size_t bodyLen = (size_t)(close - (szMesg + 1));
+        if (bodyLen >= sizeof(body)) bodyLen = sizeof(body) - 1;
+        strncpy(body, szMesg + 1, bodyLen);
+        body[bodyLen] = '\0';
+
+        // Capture the T-group's raw wire text (if any) BEFORE ProcessUDIData
+        // consumes it via GetTalkTos's tokenizer -- ccPayloadUdiToAnnotations
+        // re-derives the event's addressee STRINGS from this substring (see
+        // that function's doc comment for why: cc_annotations carries
+        // strings, not resolved refs).
+        {
+            const char* t = strchr(body, CTALKTOPREFIX);
+            if (t) strncpy(talkToSrc, t + 1, sizeof(talkToSrc) - 1);
+        }
+
+        g_payloadResolve = pfnResolve;
+        g_payloadRoomToken = room_token;
+        // ProcessUDIData's own VIP-mode gate (bVIPMode) is R20-dropped here
+        // (FALSE -- no session policy flag to read), matching this file's
+        // other ProcessUDIData call sites (OnDataMsg below).
+        ProcessUDIData(nullptr, pui, body, FALSE /*bVIPMode*/, ccPayloadLookupAdapter);
+
+        // anti-spoof quirk (PRESERVE VERBATIM, protsupp.cpp:1588-1592,
+        // "anti-hacker line"): on a private message, force-mask SAY/THINK to
+        // WHISPER. Applied as a post-step here (ProcessUDIData already wrote
+        // m_uModes); original applied it inline right after parsing the
+        // M-group, before the T-group -- same net m_uModes value either way
+        // since T-group parsing never touches m_uModes.
+        if (msgType & MT_PRIVATEMSG) {
+            pui->m_udi.m_uModes &= ~(BM_SAY | BM_THINK);  // anti-hacker line
+            pui->m_udi.m_uModes |= BM_WHISPER;
+        }
+
+        szMesg = close + 2;  // advance string to end of parenthetical annotation (:1609)
+        bHadInlineAnnotations = TRUE;
+    } else if (!pui->m_bbValidUDI) {
+        // (protsupp.cpp:1613-1622) no embedded annotation AND no pending UDI
+        // from a preceding out-of-band DATA line -- reset, apply the same
+        // anti-spoof default-to-WHISPER for private messages.
+        pui->m_udi.Reset();
+        if (msgType & MT_PRIVATEMSG) {
+            pui->m_udi.m_uModes &= ~BM_SAY;
+            pui->m_udi.m_uModes |= BM_WHISPER;
+        }
+    }
+    // else: pui->m_bbValidUDI was set by a preceding OnDataMsg call on this
+    // same scratch pui (out-of-band IRCX DATA arrived just before this
+    // PRIVMSG) -- pui->m_udi already holds the right block, verbatim :1613.
+
+    pui->m_bbValidUDI = 0;  // pui->m_udi no more valid for next incoming text (:1624)
+
+    // --- CTCP dispatch (the three in-scope verbs; R20 table above covers
+    // the rest). msgType/pui->m_udi.m_uModes drive the SAME branch structure
+    // as the original (:1626-1869), minus the ignore/flood gates.
+    if ((pui->m_udi.m_uModes & BM_ACTION) || !strncmp(szMesg, actionID, g_nActionLen)) {
+        // ACTION (:1626-1648): either the CTCP \x01ACTION..\x01 form, or an
+        // already-BM_ACTION-flagged comics action (m_udi.m_uModes set via a
+        // preceding annotation block with M=5/SM_ACTION). PrepareTextAction
+        // strips the CTCP framing; PrepareComicsAction just prefixes the
+        // screen name -- both lifted verbatim (protsupp.cpp:1104-1123),
+        // using szNickname in place of pui->GetScreenName() (no live
+        // CUserInfo screen-name field on this engine's scratch object --
+        // the wire nick IS the display name at this layer; Swift owns the
+        // real screen-name mapping).
+        char* szText;
+        if (!strncmp(szMesg, actionID, g_nActionLen))
+            szText = ccPrepareTextAction(szNickname, szMesg, strActionMesg, pui->m_udi.m_uModes);
+        else
+            szText = ccPrepareComicsAction(szNickname, szMesg, strActionMesg);
+        r.cls = ccPayloadAction;
+        r.text = szText;
+        cc_annotations ann;
+        ccPayloadUdiToAnnotations(pui->m_udi, talkToSrc[0] ? talkToSrc : nullptr, &ann);
+        r.annotations = ann;
+        r.hasAnnotations = bHadInlineAnnotations ? 1 : 0;
+        return r;
+    }
+
+    if (!strncmp(szMesg, soundID, g_nSoundLen)) {
+        // SOUND (:1649-1658, PrepareSound :1382-1440). DEVIATION (documented,
+        // task report): PrepareSound's unquoted-filename branch called
+        // histent.cpp's CTCPUnQuoteString (CTCP backslash-quote unescaping)
+        // -- histent.cpp is out of this task's (and this plan's) scope, so
+        // ccPrepareSound below skips that unescape step for the unquoted
+        // form (the quoted `"..."` form, which needs no unquoting, is
+        // unaffected). Rare edge case: an unquoted sound filename containing
+        // embedded g_chLLQuoteIRCX-escaped bytes will carry the escape
+        // sequence literally instead of being unescaped. bFindAndPlaySound
+        // (actual audio playback) is R20-dropped -- Swift decides whether/how
+        // to play sounds; the event just names the file.
+        CString file;
+        char* szText = ccPrepareSound(szNickname, szMesg, strActionMesg, pui->m_udi.m_uModes, file);
+        r.cls = ccPayloadSound;
+        r.text = szText;
+        r.file = file;
+        return r;
+    }
+
+    if (!strnicmp(szMesg, awayID, g_nAwayLen)) {
+        // AWAY (:1777-1794, ShowAway :1240-1266). R20: the original's
+        // `!pui->Ignored() && !pui->IsFlooding()` gate around ShowAway, and
+        // ShowAway's OWN `DoUserAway(doc, pui, bAway)` (live-pui flag write)
+        // + `AddAndExecute(new GetInfoEntry(...))` (history) are all
+        // DROPPED -- no engine-side pui flags or history list. The grammar
+        // (strip the trailing 0x01, treat empty-vs-nonempty as back/away) is
+        // reproduced: an empty message after the AWAY prefix means "back"
+        // (message text = ""); CC_EV_AWAY_PEER carries whichever text arrived
+        // (Swift's UI decides how to phrase back-vs-away, matching the
+        // original's IDS_BACKREPORT/IDS_AWAYREPORT string-resource choice --
+        // a UI concern, R20).
+        const char* szOffset = szMesg + g_nAwayLen + 1;
+        CString strAwayMsg = szOffset;
+        int iEnd = strAwayMsg.Find((char)0x01);
+        if (iEnd >= 0) strAwayMsg = strAwayMsg.Left(iEnd);
+        r.cls = ccPayloadAwayPeer;
+        r.text = strAwayMsg;
+        return r;
+    }
+
+    if (strnicmp(szMesg, versionID, g_nVersionLen) == 0 ||
+        strnicmp(szMesg, pingID, g_nPingLen) == 0 ||
+        strnicmp(szMesg, timeID, g_nTimeLen) == 0 ||
+        strnicmp(szMesg, fileDCCID, g_nFileDCCLen) == 0 ||
+        strnicmp(szMesg, emailID, g_nEmailLen) == 0 ||
+        strnicmp(szMesg, urlID, g_nUrlLen) == 0 ||
+        strnicmp(szMesg, netMeetingID, g_nNetMeetLen) == 0 ||
+        strnicmp(szMesg, clientInfoID, g_nClientInfoLen) == 0 ||
+        strnicmp(szMesg, xvchatID, g_nXVChatLen) == 0 ||
+        (*szMesg == 0x01 && szMesg[1] == '*')) {
+        // VERSION/PING/TIME/DCC/EMAIL/URL/NETMEET/CLIENTINFO/X-VCHAT + the
+        // "until NOTICE'ed" reply-collection framing -- R20-dropped per the
+        // function header comment (outbound-reply-sending or UI-launching,
+        // no in-scope event). Also covers the original's bare
+        // `*szMesg==0x01 -> goto exitCheckFlood` catch-all (any other CTCP
+        // verb): same net effect, suppressed.
+        r.cls = ccPayloadSuppressed;
+        return r;
+    }
+    if (*szMesg == 0x01) {
+        // any other/unrecognized CTCP verb (:1868-1869 catch-all). Suppressed.
+        r.cls = ccPayloadSuppressed;
+        return r;
+    }
+
+    // --- plain say path (:1874-1913, minus rules/history/UI -- R20) --------
+    if (!pui->m_udi.m_bbCooked || pui->m_udi.m_talkTos.GetUpperBound() < 0) {
+        // IdentifyWhispers (protsupp.cpp:1448-1467, lifted verbatim below as
+        // ccIdentifyWhispers) -- private messages with no already-decoded
+        // talk-to list implicitly address ME, UNLESS the caller supplied an
+        // explicit talk-to list (the WHISPER command's own target-list field,
+        // ircsock.cpp:1832-1841 -- see protsupp.h's OnTextMsg doc comment).
+        ccIdentifyWhispers(pui, msgType, pui->m_udi.m_uModes, explicitTalkTos, pfnResolve, room_token);
+    }
+
+    r.cls = ccPayloadSay;
+    r.text = szMesg;
+    cc_annotations ann;
+    // talkToSrc (see declaration comment above) carries the inline block's
+    // own T-group text when one was present; IdentifyWhispers's own
+    // talk-to writes (explicit-list or "just me" fallback, just above) have
+    // no corresponding wire-text form to recover here -- Swift already has
+    // the WHISPER command's raw target-list field directly (ircsock.cpp
+    // passes it as szExplicitTalkTos) if it needs the string form for that
+    // case.
+    ccPayloadUdiToAnnotations(pui->m_udi, talkToSrc[0] ? talkToSrc : nullptr, &ann);
+    r.annotations = ann;
+    r.hasAnnotations = bHadInlineAnnotations ? 1 : 0;
+    return r;
+}
+
+// PrepareTextAction (protsupp.cpp:1104-1114, verbatim grammar; pui->GetScreenName()
+// -> szNickname, no live CUserInfo screen name at this layer).
+static char* ccPrepareTextAction(const char* szNickname, char *szMesg, CString &strNewMesg, USHORT &uModes) {
+    strNewMesg = szNickname;
+    strNewMesg += (szMesg + g_nActionLen);
+    int iEndIndex = strNewMesg.Find((char)0x01);
+    if (iEndIndex >= 0)
+        strNewMesg = strNewMesg.Left(iEndIndex);
+    uModes &= ~BM_SAY;
+    uModes |= BM_ACTION;
+    return UnConst(strNewMesg);
+}
+
+// PrepareComicsAction (protsupp.cpp:1117-1123, verbatim).
+static char* ccPrepareComicsAction(const char* szNickname, char *szMesg, CString &strNewMesg) {
+    strNewMesg = szNickname;
+    strNewMesg += " ";
+    strNewMesg += szMesg;
+    return UnConst(strNewMesg);
+}
+
+// PrepareSound (protsupp.cpp:1382-1440). Deviation: the unquoted-filename
+// branch's CTCPUnQuoteString call is dropped (histent.cpp out of scope --
+// see ccProcessSay's SOUND-branch comment); bFindAndPlaySound (actual
+// playback) is R20-dropped (Swift's decision). `outFile` receives the parsed
+// filename (event payload); return value is the display text.
+static char* ccPrepareSound(const char* szNickname, char *szMesg, CString &strNewMesg, USHORT &uModes, CString &outFile) {
+    char *szSound = szMesg + g_nSoundLen, *szEnd;
+
+    while (my_isspace(*szSound))
+        szSound++;
+
+    if (!*szSound) { outFile = ""; return UnConst(CString("")); }  // empty string cancels display
+
+    BOOL bQuoted = (*szSound == '"');
+    if (bQuoted) {
+        szEnd = strchr(++szSound, '"');
+        if (!szEnd) { outFile = ""; return UnConst(CString("")); }  // no matching quote
+    } else {
+        szEnd = strchr(szSound + 1, ' ');
+        if (!szEnd) szEnd = strchr(szSound, 0x01);
+        if (!szEnd) szEnd = strchr(szSound, '\0');
+    }
+
+    CString strFile(szSound, (int)(szEnd - szSound));
+    // (deviation: CTCPUnQuoteString skipped for the unquoted form -- see
+    // function header comment)
+    outFile = strFile;
+
+    if (*szEnd == '"')
+        szEnd++;  // now end must be at space or end
+    strNewMesg = szNickname;
+    strNewMesg += szEnd;
+    int iEndIndex = strNewMesg.Find((char)0x01);
+    if (iEndIndex >= 0)
+        strNewMesg = strNewMesg.Left(iEndIndex);
+
+    char szResetSeq[MAX_FORMATTINGPERBYTE];
+    if (nResettingSequence(szEnd, szResetSeq))
+        strNewMesg += CString(szResetSeq);
+
+    strNewMesg += " (";
+    strNewMesg += (const char*)strFile;
+    strNewMesg += ")";
+
+    uModes &= ~BM_SAY;
+    uModes |= BM_ACTION;
+
+    return UnConst(strNewMesg);
+}
+
+// IdentifyWhispers (protsupp.cpp:1448-1467, lifted verbatim modulo the R19
+// resolver reroute + the "doc ? doc->m_puiSelf : ExternalPui(...)" session-
+// table fallback, which has no engine-side equivalent -- see below).
+static void ccIdentifyWhispers(CUserInfo* pui, BYTE msgType, USHORT &uModes, CDWordArray *talkTos, PFNRESOLVENICKREF pfnResolve, uint32_t room_token) {
+    if (msgType & MT_PRIVATEMSG) {
+        uModes &= ~BM_SAY;
+        uModes |= BM_WHISPER;
+        pui->m_udi.m_talkTos.RemoveAll();
+        if (talkTos) {
+            int upper = talkTos->GetUpperBound();
+            for (int i = 0; i <= upper; i++)
+                pui->m_udi.m_talkTos.Add(talkTos->GetAt(i));
+        } else {
+            // Original: `doc ? doc->m_puiSelf : ExternalPui(GetMyNickName(), "", TRUE)`
+            // -- both branches are session-table lookups this engine doesn't
+            // own. R19: resolve OUR OWN nick (ccSessionOwnNick, via the
+            // caller-supplied pfnResolve against room_token) instead -- same
+            // semantic ("the implicit addressee of a private message is
+            // me"), sourced from the resolver rather than a doc pointer.
+            g_payloadResolve = pfnResolve;
+            g_payloadRoomToken = room_token;
+            CUserInfo* pUIMe = ccPayloadLookupAdapter(ccSessionOwnNick(), nullptr);
+            if (pUIMe)
+                pui->m_udi.m_talkTos.Add((DWORD)(uintptr_t)pUIMe);  // R13: via-uintptr_t, LP64-safe
+        }
+    }
+}
+
+// --- OnTextMsg / OnDataMsg (protsupp.cpp:4358-4395) -------------------------
+// Both original entry points resolved a live CUserInfo* via
+// PuiFromDocNickIdent (session-table lookup, not lifted -- R19 territory)
+// then dispatched. Here there is no session table to resolve INTO; the
+// scratch CUserInfo `pui` exists ONLY to give ProcessUDIData/GetTalkTos/
+// ccProcessSay a m_udi to decode into for the duration of this one call,
+// exactly like the codec's own test rig (cc_test_decode_udi). The
+// CHANNELPREFIX(*szNickname) guard (both originals) is preserved verbatim --
+// wire messages FROM an entire channel (rare, some servers' broadcast
+// pseudo-senders) are not processed.
+ccPayloadResult OnTextMsg(const char *szNickname, char *szMesg, BYTE msgType, uint32_t room_token, PFNRESOLVENICKREF pfnResolve, char *szExplicitTalkTos) {
+    ccPayloadResult r; memset(&r, 0, sizeof(r));
+    r.cls = ccPayloadSuppressed;
+    if (!szNickname || !*szNickname || CHANNELPREFIX(*szNickname)) return r;
+    if (!szMesg) return r;
+
+    g_payloadTalkToPool.clear();
+    CUserInfo pui;  // scratch decode target (see file header comment)
+
+    if (*szMesg == '#') {
+        ccPayloadResult c = ccProcessComment(szMesg);
+        if (c.cls != ccPayloadSuppressed) { g_payloadTalkToPool.clear(); return c; }
+        // ProcessComment returned FALSE (no "# " prefix matched a known
+        // grammar) -> fall through to ProcessSay, exactly like the original's
+        // `if (*szMesg != '#' || !ProcessComment(...)) ProcessSay(...)`.
+    }
+
+    // WHISPER's explicit target-list (ircsock.cpp:1832-1841 original;
+    // protsupp.h's OnTextMsg doc comment) -- decode via GetTalkTos (Task 3,
+    // R19-resolver-parameterized) exactly like the original's pre-computed
+    // CDWordArray, using the SAME resolver adapter this file's other codec
+    // call sites use.
+    CDWordArray explicitTalkTos;
+    CDWordArray* pExplicitTalkTos = nullptr;
+    if (szExplicitTalkTos) {
+        g_payloadResolve = pfnResolve;
+        g_payloadRoomToken = room_token;
+        GetTalkTos(nullptr, &explicitTalkTos, szExplicitTalkTos, ccPayloadLookupAdapter);
+        pExplicitTalkTos = &explicitTalkTos;
+    }
+
+    ccPayloadResult say = ccProcessSay(szNickname, &pui, szMesg, msgType, room_token, pfnResolve, pExplicitTalkTos);
+    g_payloadTalkToPool.clear();
+    return say;
+}
+
+ccPayloadResult OnDataMsg(const char *szNickname, char *szData, BYTE msgType, uint32_t room_token, PFNRESOLVENICKREF pfnResolve) {
+    ccPayloadResult r; memset(&r, 0, sizeof(r));
+    r.cls = ccPayloadSuppressed;
+    if (!szNickname || !*szNickname || CHANNELPREFIX(*szNickname)) return r;
+    if (!szData) return r;
+
+    g_payloadTalkToPool.clear();
+    if (*(szData + 1) == ' ') {
+        // "# " comment arriving via DATA instead of PRIVMSG (:4390, verbatim
+        // dispatch condition) -- e.g. an IRCX "# Appears as" sent out-of-band.
+        ccPayloadResult c = ccProcessComment(szData);
+        g_payloadTalkToPool.clear();
+        return c;
+    }
+
+    // Real UDI annotation blob (:4394, ProcessUDIData dispatch). Capture the
+    // T-group's raw wire text (if any) BEFORE ProcessUDIData consumes it via
+    // GetTalkTos's tokenizer, same as ccProcessSay's inline-block handling
+    // above -- so the event's addressees[] carries the actual nick strings,
+    // not an empty list.
+    char talkToSrc[256]; talkToSrc[0] = '\0';
+    {
+        const char* t = strchr(szData, CTALKTOPREFIX);
+        if (t) strncpy(talkToSrc, t + 1, sizeof(talkToSrc) - 1);
+    }
+
+    CUserInfo pui;
+    g_payloadResolve = pfnResolve;
+    g_payloadRoomToken = room_token;
+    ProcessUDIData(nullptr, &pui, szData, FALSE /*bVIPMode, R20-dropped*/, ccPayloadLookupAdapter);
+    r.cls = ccPayloadData;
+    ccPayloadUdiToAnnotations(pui.m_udi, talkToSrc[0] ? talkToSrc : nullptr, &r.annotations);
+    r.hasAnnotations = 1;
+    (void)msgType;
+    g_payloadTalkToPool.clear();
+    return r;
 }

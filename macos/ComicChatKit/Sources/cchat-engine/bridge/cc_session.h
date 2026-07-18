@@ -61,6 +61,19 @@ CCSession* ccSession();
 // cc_session.cpp; declared here so lifted files can call it.
 void ccEmitProtoEvent(const struct cc_proto_event* ev);
 
+// --- R19 resolvers (Plan 3 Task 6) ------------------------------------------
+// ccSessionOwnNick(): replaces every lifted GetMyNickName() call. Reads
+// ccSession()->cfg.own_nick(user_data); "" (never NULL) if the config didn't
+// supply one, matching cc_own_nick_fn's documented contract.
+const char* ccSessionOwnNick();
+
+// ccSessionResolveUser(): replaces every lifted LookupPui(nick, doc) call in
+// the payload-stage codec path (protsupp.cpp's ProcessSay/GetTalkTos/
+// IdentifyWhispers). Reads ccSession()->cfg.resolve_user(user_data, nick,
+// room_token); returns CC_USER_REF_NONE (0) if the config didn't supply a
+// resolver -- callers must treat 0 as "unknown user", never dereference it.
+cc_user_ref ccSessionResolveUser(const char* nick, uint32_t room_token);
+
 // Test-only activation hook (Plan 3 Task 5a): every public cc_session_* entry
 // point activates g_session on entry and clears it on exit (see
 // cc_session.cpp), but ccEmitProtoEvent has no public entry point of its own

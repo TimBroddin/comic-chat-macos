@@ -80,6 +80,10 @@ struct RGBTRIPLE { BYTE rgbtBlue; BYTE rgbtGreen; BYTE rgbtRed; };
 // matching that exactly avoids deduction failures on the original code's
 // mixed int/float/double call sites (e.g. avatar.cpp's max(float, double)).
 inline int stricmp(const char* a, const char* b) { return strcasecmp(a ? a : "", b ? b : ""); }
+// strnicmp (rule R9; Plan 3 Task 6, protsupp.cpp's CTCP-verb dispatch table
+// uses the length-bounded case-insensitive compare -- same Win32-CRT-ism as
+// stricmp above, same POSIX equivalent).
+inline int strnicmp(const char* a, const char* b, size_t n) { return strncasecmp(a ? a : "", b ? b : "", n); }
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #define max(a,b) (((a) > (b)) ? (a) : (b))
 

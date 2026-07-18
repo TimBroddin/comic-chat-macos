@@ -519,90 +519,26 @@ static void ccCSInString(char **pszString, const char *szChannelName = NULL) {
 }
 
 //=--------------------------------------------------------------------------=
-// SECTION 5: annotation decode for CC_EV_TEXT / CC_EV_DATA (Task-6 seam)
+// SECTION 5: payload-stage classification for CC_EV_TEXT/DATA/ACTION/SOUND/
+// AWAY_PEER/APPEARS_AS/WHISPER (Plan 3 Task 6)
 //=--------------------------------------------------------------------------=
-// Per the brief's Task-6 seam: the PRIVMSG/NOTICE/DATA handlers emit the RAW
-// text/data event with the annotation blob decoded IF TRIVIALLY AVAILABLE. The
-// full CTCP/comment CLASSIFICATION (into CC_EV_ACTION/SOUND/APPEARS_AS) is
-// Task 6's job (ProcessSay/ProcessComment). Here we do the cheap, self-
-// contained decode of the two annotation transports:
-//   * plain IRC in-band:  "(#G..E..[R]M.[T..]) <text>"  -> strip the prefix,
-//                          decode G/E/R/M/T, set has_annotations, text = rest.
-//   * IRCX out-of-band:   DATA payload "#G..E..[R]M.[T..]" -> decode into a
-//                          cc_annotations (no visible text; CC_EV_DATA).
-// This mirrors the grammar in state-and-codec §3.3 (IndexToByte = value+'0').
-// It does NOT do CTCP (0x01) or "# " comment classification (Task 6).
+// Task 5b (this file, when first lifted) had a STAND-IN decoder here
+// (ccDecodeAnnotationBody/ccSplitInlineAnnotations) that did the annotation
+// grammar's cheap self-contained decode but explicitly NOT CTCP/comment
+// classification -- that was always this task's job. Task 6 lifts the real
+// payload stage (protsupp.cpp: OnTextMsg/OnDataMsg/ProcessSay/ProcessComment)
+// and this section's two functions are RETIRED (state-and-codec.md §3.2's
+// "unify the duplicated inline-annotation parse block" -- see protsupp.cpp's
+// Task 6 header comment for the full "3 locations -> 1" account: this file's
+// stand-in decoder was the third). The PRIVMSG/NOTICE/DATA/WHISPER handlers
+// below now call OnTextMsg/OnDataMsg (protsupp.h) directly, exactly as the
+// original's HandleCommand did.
 
-// Decode the "#G.E.[R]M.[T..]" body (starting at the '#') into out. Returns a
-// pointer just past the block, or NULL if the leading '#G' isn't present.
-static const char* ccDecodeAnnotationBody(const char* p, cc_annotations* out) {
-	memset(out, 0, sizeof(*out));
-	if (!p || p[0] != '#' || p[1] != CGESTUREPREFIX) return NULL;
-	p++; // skip '#'
-	// G group
-	if (*p != CGESTUREPREFIX) return NULL;
-	p++;
-	int haveGIntensity = 0, haveEIntensity = 0;
-	if (*p) { out->gesture_pose    = (int)ByteToIndex((BYTE)*p++); }
-	if (*p) { out->gesture_emotion = (int)ByteToIndex((BYTE)*p++); }
-	if (*p && *p != CEXPRESSIONPREFIX) { out->gesture_intensity = (int)ByteToIndex((BYTE)*p++); haveGIntensity = 1; }
-	// E group
-	if (*p == CEXPRESSIONPREFIX) {
-		p++;
-		if (*p) { out->face_pose    = (int)ByteToIndex((BYTE)*p++); }
-		if (*p) { out->face_emotion = (int)ByteToIndex((BYTE)*p++); }
-		if (*p && *p != CREQUESTEDPREFIX && *p != CMODEPREFIX && *p != CTALKTOPREFIX) {
-			out->face_intensity = (int)ByteToIndex((BYTE)*p++); haveEIntensity = 1;
-		}
-	}
-	// R flag (presence only)
-	if (*p == CREQUESTEDPREFIX) { out->requested = 1; p++; }
-	// M mode
-	if (*p == CMODEPREFIX) {
-		p++;
-		if (*p) { out->mode = (int)ByteToIndex((BYTE)*p++); }
-	}
-	// T addressee list (comma-separated encoded nicks; clip at CC_MAX_ADDRESSEES)
-	if (*p == CTALKTOPREFIX) {
-		p++;
-		int n = 0;
-		while (*p && n < CC_MAX_ADDRESSEES) {
-			char buf[64]; int bi = 0;
-			while (*p && *p != ',' && bi < (int)sizeof(buf) - 1)
-				buf[bi++] = *p++;
-			buf[bi] = '\0';
-			strncpy(out->addressees[n], buf, sizeof(out->addressees[n]) - 1);
-			out->addressees[n][sizeof(out->addressees[n]) - 1] = '\0';
-			n++;
-			if (*p == ',') p++;
-		}
-		out->addressee_count = n;
-	}
-	// cooked (state-and-codec §3.3: both intensity fields arrived)
-	out->cooked = (haveGIntensity && haveEIntensity) ? 1 : 0;
-	return p;
-}
-
-// For plain-IRC in-band text "(#...) actual text": if szText starts with "(#"
-// and contains ") ", decode the annotation block and return a pointer to the
-// text after the ") "; otherwise return szText unchanged and clear *pHas.
-static const char* ccSplitInlineAnnotations(const char* szText, cc_annotations* out, int* pHas) {
-	*pHas = 0;
-	memset(out, 0, sizeof(*out));
-	if (!szText) return "";
-	if (szText[0] == '(' && szText[1] == '#') {
-		const char* close = strstr(szText, ") ");
-		if (close) {
-			// decode the body between '(' and ')'
-			cc_annotations tmp;
-			if (ccDecodeAnnotationBody(szText + 1, &tmp)) {
-				*out = tmp;
-				*pHas = 1;
-			}
-			return close + 2;  // skip ") "
-		}
-	}
-	return szText;
+// R19 resolver adapter: protsupp.h's PFNRESOLVENICKREF shape, backed by
+// ccSessionResolveUser (bridge/cc_session.h) -- the same resolver every other
+// R19 site in this port reaches through.
+static cc_user_ref ccResolveNickRef(const char* szNickname, uint32_t room_token) {
+	return ccSessionResolveUser(szNickname, room_token);
 }
 
 //=--------------------------------------------------------------------------=
@@ -698,11 +634,15 @@ static void ccHandleCommand(CCSession& sess, char *szLine, PIRCPARSE pParse)
 		case cmdidData:
 		{
 			// IRCX comic annotation blob: DATA <target> CCUDI1 :#G...
-			// Original: OnDataMsg -> ProcessUDIData (Task-6 stage). R18/Task-6
-			// seam: emit CC_EV_DATA with the annotations decoded trivially here.
-			// The "# Appears as" fan-out (:1307-1317) is a Task-6 classification
-			// concern (it's a comment, not a UDI blob); a "# Appears as" arriving
-			// via DATA is still emitted raw (Task 6 refines to CC_EV_APPEARS_AS).
+			// Original (ircsock.cpp:1274-1320): msgType is MT_CHANNELSEND|MT_DATA
+			// for a channel target, MT_PRIVATEMSG|MT_DATA otherwise; then
+			// OnDataMsg(doc, nick, ident, lastString, msgType) -- the "# Appears
+			// as" doc-fan-out (:1307-1317, "interpret as being sent to all rooms
+			// they are a member of") is g_docs/LookupPui SESSION-TABLE fan-out
+			// this engine doesn't hold (R19/R20: no per-room doc list to fan out
+			// to) -- Swift, which DOES track room membership, can replicate that
+			// fan-out itself off the single CC_EV_APPEARS_AS this emits (room_token
+			// carries the DATA target's room if it was a channel, 0 if private).
 			if (pParse->lastString &&
 				pParse->lastString[0] == '#' &&
 				pParse->nArgs >= 3 &&
@@ -710,22 +650,32 @@ static void ccHandleCommand(CCSession& sess, char *szLine, PIRCPARSE pParse)
 				*pParse->nick &&
 				*pParse->user)
 			{
-				cc_annotations ann;
-				if (ccDecodeAnnotationBody(pParse->lastString, &ann)) {
-					cc_proto_event ev; memset(&ev, 0, sizeof(ev));
-					ev.type = CC_EV_DATA;
-					ev.u.data.nick = pParse->nick;
-					ev.u.data.annotations = ann;
-					ccEmitProtoEvent(&ev);
-				} else {
-					// "# Appears as ..."-style comment arriving via DATA -- emit
-					// raw text so Task 6 can classify it (CC_EV_TEXT with the
-					// data payload; no annotations decoded).
-					cc_proto_event ev; memset(&ev, 0, sizeof(ev));
-					ev.type = CC_EV_DATA;
-					ev.u.data.nick = pParse->nick;
-					memset(&ev.u.data.annotations, 0, sizeof(ev.u.data.annotations));
-					ccEmitProtoEvent(&ev);
+				BOOL bChannelTarget = CHANNELPREFIX(pParse->args[1][0]);
+				BYTE msgType = (BYTE)((bChannelTarget ? MT_CHANNELSEND : MT_PRIVATEMSG) | MT_DATA);
+				uint32_t tok = bChannelTarget ? ccSessionRoomTokenForChannel(sess, pParse->args[1]) : 0;
+
+				ccPayloadResult res = OnDataMsg(pParse->nick, pParse->lastString, msgType, tok, ccResolveNickRef);
+				cc_proto_event ev; memset(&ev, 0, sizeof(ev));
+				ev.room_token = tok;
+				switch (res.cls) {
+					case ccPayloadData:
+						ev.type = CC_EV_DATA;
+						ev.u.data.nick = pParse->nick;
+						ev.u.data.annotations = res.annotations;
+						ccEmitProtoEvent(&ev);
+						break;
+					case ccPayloadAppearsAs:
+						ev.type = CC_EV_APPEARS_AS;
+						ev.u.appears_as.nick = pParse->nick;
+						ev.u.appears_as.avatar_name = (LPCTSTR)res.avatarName;
+						ev.u.appears_as.url = (LPCTSTR)res.avatarUrl;
+						ccEmitProtoEvent(&ev);
+						break;
+					default:
+						// ccPayloadSuppressed (an unrecognized "# " comment
+						// grammar arrived via DATA) -- no event, matching the
+						// original's ProcessComment returning FALSE silently.
+						break;
 				}
 			}
 			break;
@@ -970,27 +920,73 @@ static void ccHandleCommand(CCSession& sess, char *szLine, PIRCPARSE pParse)
 					if (*pParse->user && *pParse->machine)
 						strID.Format("%s@%s", pParse->user, pParse->machine);
 
-					// Original: "# Appears as" fan-out to all shared rooms
-					// (:1644-1654) is a Task-6 comment classification; here we
-					// emit CC_EV_TEXT raw and let Task 6 route # comments.
+					// Original (:1638-1660): "# Appears as" fan-out to every room
+					// the sender shares with us (g_docs/LookupPui session-table
+					// walk) is R19/R20-dropped -- no per-room doc list here; Swift
+					// tracks room membership and can replicate the fan-out itself
+					// off the single CC_EV_APPEARS_AS this emits (room_token names
+					// the ONE room this PRIVMSG actually targeted, or 0 if
+					// private). CSInString (DBCS/UTF-8 channel-name-prefixed
+					// decode, R2/Task-5b's ccCSInString) runs unconditionally,
+					// matching the original's non-fan-out "else" branch (the
+					// fan-out branch never called CSInString at all -- a minor
+					// original asymmetry that doesn't matter here since there is
+					// only ever one target to decode against).
 					ccCSInString(&pParse->lastString, pParse->args[1]);
 
-					// Trivial annotation split (plain-IRC in-band "(#...) text").
-					cc_annotations ann; int hasAnn = 0;
-					const char* body = ccSplitInlineAnnotations(pParse->lastString, &ann, &hasAnn);
+					uint32_t tok = bChannel ? ccSessionRoomTokenForChannel(sess, pParse->args[1]) : 0;
+					ccPayloadResult res = OnTextMsg(pParse->nick, pParse->lastString, msgType, tok, ccResolveNickRef);
 
 					cc_proto_event ev; memset(&ev, 0, sizeof(ev));
-					ev.type = CC_EV_TEXT;
-					ev.room_token = bChannel ? ccSessionRoomTokenForChannel(sess, pParse->args[1]) : 0;
-					ev.u.text.nick = pParse->nick;
-					ev.u.text.ident = strID;
-					ev.u.text.target = pParse->args[1];
-					ev.u.text.text = body;
-					ev.u.text.kind = (int)msgType;
-					ev.u.text.has_annotations = hasAnn;
-					if (hasAnn) ev.u.text.annotations = ann;
-					else memset(&ev.u.text.annotations, 0, sizeof(ev.u.text.annotations));
-					ccEmitProtoEvent(&ev);
+					ev.room_token = tok;
+					switch (res.cls) {
+						case ccPayloadSay:
+							ev.type = CC_EV_TEXT;
+							ev.u.text.nick = pParse->nick;
+							ev.u.text.ident = strID;
+							ev.u.text.target = pParse->args[1];
+							ev.u.text.text = (LPCTSTR)res.text;
+							ev.u.text.kind = (int)msgType;
+							ev.u.text.has_annotations = res.hasAnnotations;
+							if (res.hasAnnotations) ev.u.text.annotations = res.annotations;
+							else memset(&ev.u.text.annotations, 0, sizeof(ev.u.text.annotations));
+							ccEmitProtoEvent(&ev);
+							break;
+						case ccPayloadAction:
+							ev.type = CC_EV_ACTION;
+							ev.u.action.nick = pParse->nick;
+							ev.u.action.text = (LPCTSTR)res.text;
+							ev.u.action.has_annotations = res.hasAnnotations;
+							if (res.hasAnnotations) ev.u.action.annotations = res.annotations;
+							else memset(&ev.u.action.annotations, 0, sizeof(ev.u.action.annotations));
+							ccEmitProtoEvent(&ev);
+							break;
+						case ccPayloadSound:
+							ev.type = CC_EV_SOUND;
+							ev.u.sound.nick = pParse->nick;
+							ev.u.sound.file = (LPCTSTR)res.file;
+							ev.u.sound.text = (LPCTSTR)res.text;
+							ccEmitProtoEvent(&ev);
+							break;
+						case ccPayloadAwayPeer:
+							ev.type = CC_EV_AWAY_PEER;
+							ev.u.away_peer.nick = pParse->nick;
+							ev.u.away_peer.message = (LPCTSTR)res.text;
+							ccEmitProtoEvent(&ev);
+							break;
+						case ccPayloadAppearsAs:
+							ev.type = CC_EV_APPEARS_AS;
+							ev.u.appears_as.nick = pParse->nick;
+							ev.u.appears_as.avatar_name = (LPCTSTR)res.avatarName;
+							ev.u.appears_as.url = (LPCTSTR)res.avatarUrl;
+							ccEmitProtoEvent(&ev);
+							break;
+						default:
+							// ccPayloadSuppressed/ccPayloadData (DATA-only class,
+							// never returned by OnTextMsg) -- no event, matching
+							// the original's silent CTCP-verb/comment drop.
+							break;
+					}
 				}
 				else if (!*pParse->nick && !*pParse->user)
 				{
@@ -1139,30 +1135,77 @@ static void ccHandleCommand(CCSession& sess, char *szLine, PIRCPARSE pParse)
 		case cmdidWhisper:
 		{
 			// IRCX inbound whisper: WHISPER <chan> <targetlist> :<text>.
-			// Original: GetTalkTos(doc, &talkTos, args[2]) then OnTextMsg(...
-			// MT_WHISPER). R18: emit CC_EV_WHISPER(nick, ident, text). The talk-to
-			// list (args[2]) is nick-string text on the wire (state-and-codec §2);
-			// Swift resolves it. Annotations decoded trivially if inline.
+			// Original (ircsock.cpp:1832-1841): GetTalkTos(doc,&talkTos,args[2])
+			// precomputes the explicit talk-to list from the WHISPER command's
+			// OWN target-list field, then OnTextMsg(doc, nick, "X", lastString,
+			// MT_PRIVATEMSG|MT_WHISPER, &talkTos) -- "for now, treated similarly
+			// to Private Message". Routed through OnTextMsg here exactly the
+			// same way (protsupp.h's szExplicitTalkTos parameter carries
+			// args[2] through to the SAME GetTalkTos call the original made).
+			// R18: classify via OnTextMsg's result -- a plain whisper emits
+			// CC_EV_WHISPER (as before); a CTCP/comment arriving over WHISPER
+			// (rare but not excluded by the grammar) now correctly classifies
+			// into ACTION/SOUND/AWAY_PEER/APPEARS_AS too, matching what the
+			// original's OnTextMsg->ProcessSay/ProcessComment dispatch would
+			// have done for ANY msgType, WHISPER included.
 			if (*pParse->nick && pParse->lastString) {
 				ccCSInString(&pParse->lastString, pParse->args[1]);
-				cc_annotations ann; int hasAnn = 0;
-				const char* body = ccSplitInlineAnnotations(pParse->lastString, &ann, &hasAnn);
+
+				uint32_t tok = (pParse->nArgs >= 2 && CHANNELPREFIX(pParse->args[1][0]))
+					? ccSessionRoomTokenForChannel(sess, pParse->args[1]) : 0;
+				BYTE msgType = MT_PRIVATEMSG | MT_WHISPER;
+				ccPayloadResult res = OnTextMsg(pParse->nick, pParse->lastString, msgType, tok,
+				                                ccResolveNickRef, pParse->args[2]);
 
 				CString strID;
 				if (*pParse->user && *pParse->machine)
 					strID.Format("%s@%s", pParse->user, pParse->machine);
 
 				cc_proto_event ev; memset(&ev, 0, sizeof(ev));
-				ev.type = CC_EV_WHISPER;
-				ev.room_token = (pParse->nArgs >= 2 && CHANNELPREFIX(pParse->args[1][0]))
-					? ccSessionRoomTokenForChannel(sess, pParse->args[1]) : 0;
-				ev.u.whisper.nick = pParse->nick;
-				ev.u.whisper.ident = strID;
-				ev.u.whisper.text = body;
-				ev.u.whisper.has_annotations = hasAnn;
-				if (hasAnn) ev.u.whisper.annotations = ann;
-				else memset(&ev.u.whisper.annotations, 0, sizeof(ev.u.whisper.annotations));
-				ccEmitProtoEvent(&ev);
+				ev.room_token = tok;
+				switch (res.cls) {
+					case ccPayloadSay:
+						ev.type = CC_EV_WHISPER;
+						ev.u.whisper.nick = pParse->nick;
+						ev.u.whisper.ident = strID;
+						ev.u.whisper.text = (LPCTSTR)res.text;
+						ev.u.whisper.has_annotations = res.hasAnnotations;
+						if (res.hasAnnotations) ev.u.whisper.annotations = res.annotations;
+						else memset(&ev.u.whisper.annotations, 0, sizeof(ev.u.whisper.annotations));
+						ccEmitProtoEvent(&ev);
+						break;
+					case ccPayloadAction:
+						ev.type = CC_EV_ACTION;
+						ev.u.action.nick = pParse->nick;
+						ev.u.action.text = (LPCTSTR)res.text;
+						ev.u.action.has_annotations = res.hasAnnotations;
+						if (res.hasAnnotations) ev.u.action.annotations = res.annotations;
+						else memset(&ev.u.action.annotations, 0, sizeof(ev.u.action.annotations));
+						ccEmitProtoEvent(&ev);
+						break;
+					case ccPayloadSound:
+						ev.type = CC_EV_SOUND;
+						ev.u.sound.nick = pParse->nick;
+						ev.u.sound.file = (LPCTSTR)res.file;
+						ev.u.sound.text = (LPCTSTR)res.text;
+						ccEmitProtoEvent(&ev);
+						break;
+					case ccPayloadAwayPeer:
+						ev.type = CC_EV_AWAY_PEER;
+						ev.u.away_peer.nick = pParse->nick;
+						ev.u.away_peer.message = (LPCTSTR)res.text;
+						ccEmitProtoEvent(&ev);
+						break;
+					case ccPayloadAppearsAs:
+						ev.type = CC_EV_APPEARS_AS;
+						ev.u.appears_as.nick = pParse->nick;
+						ev.u.appears_as.avatar_name = (LPCTSTR)res.avatarName;
+						ev.u.appears_as.url = (LPCTSTR)res.avatarUrl;
+						ccEmitProtoEvent(&ev);
+						break;
+					default:
+						break;
+				}
 			}
 			break;
 		}

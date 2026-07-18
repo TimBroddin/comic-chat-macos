@@ -3925,6 +3925,9 @@ void pvOnEvent(void* ud, const cc_proto_event* ev) {
         case CC_EV_NICK_REJECTED:  pa = std::to_string(ev->u.nick_rejected.kind); pb = ev->u.nick_rejected.bad_nick; break;
         case CC_EV_STATUS_LINE:    pa = ev->u.status_line.text; break;
         case CC_EV_AWAY_PEER:      pa = ev->u.away_peer.nick; pb = ev->u.away_peer.message; break;
+        case CC_EV_ACTION:         pa = ev->u.action.text; pb = ev->u.action.nick; break;
+        case CC_EV_SOUND:          pa = ev->u.sound.file; pb = ev->u.sound.nick; break;
+        case CC_EV_APPEARS_AS:     pa = ev->u.appears_as.avatar_name; pb = ev->u.appears_as.url; break;
         default: break;
     }
     c->a.push_back(pa); c->b.push_back(pb);
@@ -4080,19 +4083,21 @@ static int cc_selftest_pv_whisper() {
     return 0;
 }
 
-// VECTOR 7: "# Appears as" avatar announce (Task-6 seam). For THIS task the
-// PRIVMSG/DATA handlers emit the raw event; classification into CC_EV_APPEARS_AS
-// is Task 6. Here a "# Appears as" arriving via PRIVMSG emits CC_EV_TEXT with
-// the raw "# Appears as ..." body (no inline annotations, since it doesn't
-// start with "(#"). This freezes the seam: Task 6 will reclassify. Documented.
+// VECTOR 7: "# Appears as" avatar announce (Task-6 seam -- NOW CLOSED). A
+// "# Appears as" arriving via PRIVMSG now routes through OnTextMsg->
+// ProcessComment (protsupp.cpp), classifying into CC_EV_APPEARS_AS(name,url)
+// instead of the pre-Task-6 raw CC_EV_TEXT. name/url grammar: GetToken reads
+// up to the next whitespace/separator ("bob"), GetToken2(".,)",",)")  reads
+// the rest up to a '.'/','/')' terminator ("http://x/bob.avb" has no such
+// terminator before EOS, so it reads the whole remainder).
 static int cc_selftest_pv_appears_as_seam() {
     PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
     const char* wire = ":Bob!bob@h PRIVMSG #comicrig :# Appears as bob.http://x/bob.avb\r\n";
     cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
-    int it = pvFind(cap, CC_EV_TEXT);
+    CC_CHECK(pvFind(cap, CC_EV_TEXT) < 0);  // no longer a raw CC_EV_TEXT
+    int it = pvFind(cap, CC_EV_APPEARS_AS);
     CC_CHECK(it >= 0);
-    // raw text carries the "# Appears as ..." payload (Task 6 classifies it)
-    CC_CHECK(cap.a[it].find("# Appears as bob") == 0);
+    CC_CHECK(cap.a[it] == "bob" && cap.b[it] == "http://x/bob.avb");
     cc_session_destroy(s);
     return 0;
 }
@@ -4233,6 +4238,192 @@ static int cc_selftest_pv_names() {
     return 0;
 }
 
+// =============================================================================
+// Plan 3 Task 6: payload-stage (ProcessSay/ProcessComment/CTCP) selftests.
+// Brief Step 1's three failing-then-passing vectors, plus per-CTCP/comment-
+// grammar coverage (Step 6 equivalent). All feed real wire bytes through
+// cc_session_feed_bytes -> HandleCommand -> OnTextMsg/OnDataMsg (the payload
+// stage this task lifts), proving the CLASSIFICATION now happens (pre-Task-6,
+// these all arrived as raw CC_EV_TEXT -- see VECTOR 5/7's comments above,
+// which this task updated to assert the closed seam).
+// =============================================================================
+
+// VECTOR 15 (brief Step 1a): \x01ACTION waves\x01 -> CC_EV_ACTION(nick,text).
+// PrepareTextAction strips the CTCP framing + trailing 0x01 and prefixes the
+// nick (protsupp.cpp:1104-1114): "Bob" + " waves" = "Bob waves".
+static int cc_selftest_pv_action_ctcp() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    char wire[128];
+    int n = snprintf(wire, sizeof(wire), ":Bob!bob@h PRIVMSG #comicrig :%cACTION waves%c\r\n", 0x01, 0x01);
+    cc_session_feed_bytes(s, (const uint8_t*)wire, (size_t)n);
+    CC_CHECK(pvFind(cap, CC_EV_TEXT) < 0);   // no longer a raw say
+    int ia = pvFind(cap, CC_EV_ACTION);
+    CC_CHECK(ia >= 0);
+    CC_CHECK(cap.a[ia] == "Bob waves" && cap.b[ia] == "Bob");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 16 (brief Step 1b/c + the R19 resolver end-to-end proof): an inline
+// "(#...) " say addressed to Bob (T-group "Bob") arrives with a resolver that
+// maps "Bob" -> ref 7 (CC_USER_REF_NONE=0, so 7 is an arbitrary non-zero
+// stand-in ref). Asserts CC_EV_TEXT(has_annotations=1, addressees[0]=="Bob")
+// AND, separately, that calling the SAME resolver function
+// ccSessionResolveUser answers with ref 7 for "Bob" in this room -- proving
+// the resolver wiring the payload stage's ccPayloadLookupAdapter
+// (protsupp.cpp) threads through actually reaches the caller-supplied
+// resolve_user callback end-to-end (R19): the decoded talkTos string ("Bob")
+// is the wire-facing form cc_annotations carries (comicchat.h: addressees[]
+// are encoded nick strings, not refs -- Task 5a's C-boundary design, see
+// protsupp.cpp's Task 6 header comment), and the SAME nick, run back through
+// the resolver, is exactly the ref (7) GetTalkTos/ccPayloadLookupAdapter
+// resolved it to internally during the decode (a real CUserInfo* was vended
+// for ref 7 and stored in pui->m_udi.m_talkTos -- proving the resolver call
+// actually happened, not just that it COULD be called).
+static cc_user_ref pvResolveBobToSeven(void* /*user_data*/, const char* nick, uint32_t /*room_token*/) {
+    if (nick && !strcmp(nick, "Bob")) return 7;
+    return CC_USER_REF_NONE;
+}
+static int cc_selftest_pv_inline_annotation_resolver_e2e() {
+    struct Cap { std::string text, nick; cc_annotations ann{}; int hasAnn = 0; } cap;
+    cc_session_config cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.user_data = &cap;
+    cfg.send = [](void*, const uint8_t*, size_t) {};
+    cfg.own_nick = pvOwnNick;
+    cfg.resolve_user = pvResolveBobToSeven;
+    cfg.on_event = [](void* ud, const cc_proto_event* ev) {
+        if (ev->type != CC_EV_TEXT) return;
+        Cap* c = static_cast<Cap*>(ud);
+        c->text = ev->u.text.text; c->nick = ev->u.text.nick;
+        c->hasAnn = ev->u.text.has_annotations; c->ann = ev->u.text.annotations;
+    };
+    cc_session* s = cc_session_create(&cfg);
+    // #G295E193M1 (see cc_selftest_annotation_codec's byte-arithmetic
+    // comment) + T-group addressing "Bob".
+    const char* wire = ":Carl!carl@h PRIVMSG #comicrig :(#G295E193M1TBob) hello\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    CC_CHECK(cap.text == "hello" && cap.nick == "Carl");
+    CC_CHECK(cap.hasAnn == 1);
+    CC_CHECK(cap.ann.addressee_count == 1 && strcmp(cap.ann.addressees[0], "Bob") == 0);
+    // R19 end-to-end proof: the SAME resolver the payload stage called
+    // internally (ccSessionResolveUser -> cfg.resolve_user, wired via
+    // ccPayloadLookupAdapter -> GetTalkTos's pfnLookupPui parameter,
+    // protsupp.cpp) answers ref 7 for "Bob" -- call it directly here (through
+    // the public cc_session.h resolver, activated for this session) to prove
+    // it is reachable and wired, not merely declared.
+    ccActivateSessionForTest(s);
+    CC_CHECK(ccSessionResolveUser("Bob", 0) == 7);
+    ccDeactivateSessionForTest();
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 17 (brief Step 6 equivalent): \x01SOUND "boing.wav"\x01 ->
+// CC_EV_SOUND(nick, file, text). PrepareSound (protsupp.cpp:1382-1440):
+// quoted-filename branch needs no CTCPUnQuoteString (see ccProcessSay's
+// SOUND-branch comment for the documented deviation on the unquoted form).
+static int cc_selftest_pv_sound_ctcp() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    char wire[128];
+    int n = snprintf(wire, sizeof(wire), ":Bob!bob@h PRIVMSG #comicrig :%cSOUND \"boing.wav\"%c\r\n", 0x01, 0x01);
+    cc_session_feed_bytes(s, (const uint8_t*)wire, (size_t)n);
+    int is = pvFind(cap, CC_EV_SOUND);
+    CC_CHECK(is >= 0);
+    CC_CHECK(cap.a[is] == "boing.wav" /*file*/ && cap.b[is] == "Bob" /*nick*/);
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 18 (brief Step 6 equivalent): peer \x01AWAY message\x01 ->
+// CC_EV_AWAY_PEER(nick, message). protsupp.cpp:1777-1794's grammar: strip
+// the trailing 0x01, message text passed through as-is.
+static int cc_selftest_pv_away_peer_ctcp() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    char wire[128];
+    int n = snprintf(wire, sizeof(wire), ":Bob!bob@h PRIVMSG #comicrig :%cAWAY gone fishing%c\r\n", 0x01, 0x01);
+    cc_session_feed_bytes(s, (const uint8_t*)wire, (size_t)n);
+    int ia = pvFind(cap, CC_EV_AWAY_PEER);
+    CC_CHECK(ia >= 0);
+    CC_CHECK(cap.a[ia] == "Bob" && cap.b[ia] == "gone fishing");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 19 (brief Step 6 equivalent, comment-grammar coverage): the
+// R20-dropped "#" comment branches (GetInfo/HeresInfo/BDrop/BDrop2) all
+// classify as ccPayloadSuppressed (no event) since their original bodies are
+// pure outbound-reply-sending or live-pui-gated policy actions this engine
+// doesn't hold (see ccProcessComment's per-branch comments). Confirms they
+// are silently dropped, not crashes or misrouted events -- matching the
+// original's own "return TRUE, no visible effect for us" shape for a
+// headless peer.
+static int cc_selftest_pv_comment_grammar_suppressed() {
+    {
+        PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+        const char* wire = ":Bob!bob@h PRIVMSG #comicrig :# GetInfo\r\n";
+        cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+        CC_CHECK(cap.types.empty());
+        cc_session_destroy(s);
+    }
+    {
+        PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+        const char* wire = ":Bob!bob@h PRIVMSG #comicrig :# HeresInfo: some profile text\r\n";
+        cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+        CC_CHECK(cap.types.empty());
+        cc_session_destroy(s);
+    }
+    {
+        PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+        const char* wire = ":Bob!bob@h PRIVMSG #comicrig :# BDrop: oldbackdrop\r\n";
+        cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+        CC_CHECK(cap.types.empty());
+        cc_session_destroy(s);
+    }
+    {
+        PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+        const char* wire = ":Bob!bob@h PRIVMSG #comicrig :# BDrop2: newbackdrop,http://x/b.bgb\r\n";
+        cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+        CC_CHECK(cap.types.empty());
+        cc_session_destroy(s);
+    }
+    return 0;
+}
+
+// VECTOR 20 (brief Step 6 equivalent): OnDataMsg's "# " comment arriving via
+// DATA classifies the SAME way as PRIVMSG (ProcessComment is dispatched
+// identically from both entry points) -- a DATA-borne "# Appears as" ->
+// CC_EV_APPEARS_AS, proving the ONE decoder/dispatcher serves both call
+// sites (protsupp.cpp OnDataMsg's `*(szData+1)==' '` branch).
+static int cc_selftest_pv_data_appears_as() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    const char* wire = ":Bob!bob@h DATA #comicrig CCUDI1 :# Appears as bob.http://x/bob.avb\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+    CC_CHECK(pvFind(cap, CC_EV_DATA) < 0);   // not a UDI blob -- a comment
+    int it = pvFind(cap, CC_EV_APPEARS_AS);
+    CC_CHECK(it >= 0 && cap.a[it] == "bob" && cap.b[it] == "http://x/bob.avb");
+    cc_session_destroy(s);
+    return 0;
+}
+
+// VECTOR 21 (WHISPER classification, closing the WHISPER/OnTextMsg seam):
+// a WHISPER carrying an ACTION CTCP classifies into CC_EV_ACTION exactly like
+// PRIVMSG does (OnTextMsg's dispatch is msgType-agnostic past the
+// MT_PRIVATEMSG-vs-MT_CHANNELSEND branch point) -- proving the WHISPER path
+// (ircsock.cpp cmdidWhisper) now routes through the SAME OnTextMsg/ProcessSay
+// classification as PRIVMSG/NOTICE, not a separate raw CC_EV_WHISPER-always
+// path.
+static int cc_selftest_pv_whisper_action_ctcp() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    char wire[160];
+    int n = snprintf(wire, sizeof(wire), ":Bob!bob@h WHISPER #comicrig Anon :%cACTION grins%c\r\n", 0x01, 0x01);
+    cc_session_feed_bytes(s, (const uint8_t*)wire, (size_t)n);
+    CC_CHECK(pvFind(cap, CC_EV_WHISPER) < 0);
+    int ia = pvFind(cap, CC_EV_ACTION);
+    CC_CHECK(ia >= 0 && cap.a[ia] == "Bob grins" && cap.b[ia] == "Bob");
+    cc_session_destroy(s);
+    return 0;
+}
+
 extern "C" int32_t cc_run_selftests(void) {
     g_failures = 0;
     testCString();
@@ -4297,5 +4488,13 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_pv_ircx_caps();                 // 800 IRCX caps + probe-timer cancel
     cc_selftest_pv_part_quit();                 // PART/QUIT/self-PART
     cc_selftest_pv_names();                     // 353/366 NAMES
+    // Plan 3 Task 6: payload stage (ProcessSay/ProcessComment/CTCP dispatch)
+    cc_selftest_pv_action_ctcp();                       // \x01ACTION..\x01 -> CC_EV_ACTION
+    cc_selftest_pv_inline_annotation_resolver_e2e();    // inline (#...T Bob) + R19 resolver->ref 7
+    cc_selftest_pv_sound_ctcp();                        // \x01SOUND "file"\x01 -> CC_EV_SOUND
+    cc_selftest_pv_away_peer_ctcp();                    // \x01AWAY msg\x01 -> CC_EV_AWAY_PEER
+    cc_selftest_pv_comment_grammar_suppressed();        // GetInfo/HeresInfo/BDrop(2) -> no event (R20)
+    cc_selftest_pv_data_appears_as();                   // DATA-borne "# Appears as" -> CC_EV_APPEARS_AS
+    cc_selftest_pv_whisper_action_ctcp();               // WHISPER carrying ACTION -> CC_EV_ACTION
     return g_failures;
 }

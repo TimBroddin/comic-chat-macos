@@ -16,6 +16,19 @@ void ccEmitProtoEvent(const cc_proto_event* ev) {
     if (s->cfg.on_event) s->cfg.on_event(s->cfg.user_data, ev);
 }
 
+// --- R19 resolvers (Plan 3 Task 6) ------------------------------------------
+const char* ccSessionOwnNick() {
+    CCSession* s = ccSession();
+    const char* n = s->cfg.own_nick ? s->cfg.own_nick(s->cfg.user_data) : "";
+    return n ? n : "";
+}
+
+cc_user_ref ccSessionResolveUser(const char* nick, uint32_t room_token) {
+    CCSession* s = ccSession();
+    if (!s->cfg.resolve_user || !nick) return CC_USER_REF_NONE;
+    return s->cfg.resolve_user(s->cfg.user_data, nick, room_token);
+}
+
 void ccActivateSessionForTest(cc_session* h) {
     CCSession* s = reinterpret_cast<CCSession*>(h);
     if (!s) return;
