@@ -573,6 +573,68 @@ extension EngineGlobalStateSelfTests {
             model.shutdown()
             server.stop()
         }
+
+        /// Plan 4b Task 6 fix round 1 (review Important): two rapid
+        /// `.appearsAs` announces for the SAME unresolved name, before the
+        /// first download lands, must trigger only ONE fetch of the avatar
+        /// URL -- not two concurrent ones. `StubHTTPProtocol` is given an
+        /// artificial delay so the first fetch is still in flight when the
+        /// second `.appearsAs` line is sent (closing the race window the
+        /// pre-fix code left open), and `StubHTTPProtocol.hitCount(for:)`
+        /// gives a direct observable on `startLoading` invocations for the
+        /// URL -- the in-flight guard is asserted structurally (exactly one
+        /// hit), not just via final-state correctness, which a duplicate
+        /// fetch could also happen to leave intact.
+        @Test(.timeLimit(.minutes(1)))
+        func duplicateAppearsAsDoesNotDuplicateInFlightDownload() async throws {
+            let downloadName = "cc-t6-dupe-\(UUID().uuidString)"
+            let stubURL = URL(string: "http://cc-t6-stub.invalid/\(downloadName).avb")!
+            let fixtureData = try Data(contentsOf: URL(fileURLWithPath: fixture("armando.avb")))
+            // 300ms is comfortably longer than the time it takes to send a
+            // second IRC line and have `handleLocked` route it back to
+            // `downloadAvatarIfNeededLocked` on the engine queue, so both
+            // `.appearsAs` announces are guaranteed to reach the guard while
+            // the first fetch's `startLoading` is still parked in its delay.
+            StubHTTPProtocol.register(url: stubURL, data: fixtureData, delay: 0.3)
+            defer { StubHTTPProtocol.unregister(url: stubURL) }
+
+            let userCharactersDir = ChatSessionModel.userCharactersDir
+            let expectedPath = (userCharactersDir as NSString).appendingPathComponent("\(downloadName.lowercased()).avb")
+            try? FileManager.default.removeItem(atPath: expectedPath)
+            defer { try? FileManager.default.removeItem(atPath: expectedPath) }
+
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art,
+                                                       autoDownloadAvatars: true))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            try await server.send(":Win!u@h JOIN #p4")
+            // Two back-to-back announces of the SAME unresolved name/URL --
+            // the pre-fix code has no in-flight guard, so both would pass
+            // `bridge.resolvesName` (still unresolved -- the first fetch
+            // hasn't landed) and each spawn their own detached download.
+            try await server.send(":Win!u@h PRIVMSG #p4 :# Appears as \(downloadName).\(stubURL.absoluteString)")
+            try await server.send(":Win!u@h PRIVMSG #p4 :# Appears as \(downloadName).\(stubURL.absoluteString)")
+
+            var attempts = 0
+            while !FileManager.default.fileExists(atPath: expectedPath), attempts < 400 {
+                try await Task.sleep(nanoseconds: 25_000_000)
+                attempts += 1
+            }
+            #expect(FileManager.default.fileExists(atPath: expectedPath),
+                    "expected the downloaded avatar to land at \(expectedPath)")
+            let landed = try Data(contentsOf: URL(fileURLWithPath: expectedPath))
+            #expect(landed == fixtureData)
+
+            #expect(StubHTTPProtocol.hitCount(for: stubURL) == 1,
+                    "expected exactly one fetch of the avatar URL despite two rapid .appearsAs announces for the same unresolved name -- a count > 1 means the in-flight guard failed to suppress the duplicate concurrent download")
+
+            model.shutdown()
+            server.stop()
+        }
     }
 }
 
@@ -589,10 +651,25 @@ private final class StubHTTPProtocol: URLProtocol, @unchecked Sendable {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var responses: [URL: Data] = [:]
     nonisolated(unsafe) private static var registered = false
+    /// Plan 4b Task 6 fix round 1: per-URL `startLoading` hit count, so the
+    /// in-flight-avatar-download guard is directly observable — a second
+    /// concurrent fetch of the SAME URL (the pre-fix race) increments this a
+    /// second time; the guard (once in place) keeps it at 1. Reset by
+    /// `register` so each test starts from a clean count.
+    nonisolated(unsafe) private static var hitCounts: [URL: Int] = [:]
+    /// Optional artificial delay (Plan 4b Task 6 fix round 1) so a test can
+    /// hold `startLoading` open long enough for a SECOND `.appearsAs` for
+    /// the same name to reach `downloadAvatarIfNeededLocked` while the first
+    /// fetch is still in flight — without a delay, the real (fast, local)
+    /// stub response can land before the second announce is even parsed,
+    /// closing the race window the guard is meant to close.
+    nonisolated(unsafe) private static var delays: [URL: TimeInterval] = [:]
 
-    static func register(url: URL, data: Data) {
+    static func register(url: URL, data: Data, delay: TimeInterval = 0) {
         lock.lock()
         responses[url] = data
+        delays[url] = delay
+        hitCounts[url] = 0
         if !registered {
             URLProtocol.registerClass(StubHTTPProtocol.self)
             registered = true
@@ -603,7 +680,15 @@ private final class StubHTTPProtocol: URLProtocol, @unchecked Sendable {
     static func unregister(url: URL) {
         lock.lock()
         responses.removeValue(forKey: url)
+        delays.removeValue(forKey: url)
+        hitCounts.removeValue(forKey: url)
         lock.unlock()
+    }
+
+    /// Number of times `startLoading` has been invoked for `url` so far.
+    static func hitCount(for url: URL) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return hitCounts[url] ?? 0
     }
 
     override class func canInit(with request: URLRequest) -> Bool {
@@ -621,16 +706,27 @@ private final class StubHTTPProtocol: URLProtocol, @unchecked Sendable {
         }
         Self.lock.lock()
         let data = Self.responses[url]
+        let delay = Self.delays[url] ?? 0
+        if data != nil {
+            Self.hitCounts[url, default: 0] += 1
+        }
         Self.lock.unlock()
         guard let data else {
             client?.urlProtocol(self, didFailWithError: URLError(.fileDoesNotExist))
             return
         }
-        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
-                                       headerFields: ["Content-Length": "\(data.count)"])!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: data)
-        client?.urlProtocolDidFinishLoading(self)
+        func respond() {
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                                           headerFields: ["Content-Length": "\(data.count)"])!
+            self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            self.client?.urlProtocol(self, didLoad: data)
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
+        if delay > 0 {
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: respond)
+        } else {
+            respond()
+        }
     }
 
     override func stopLoading() {}

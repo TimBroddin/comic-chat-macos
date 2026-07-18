@@ -253,6 +253,21 @@ public final class ChatSessionModel: @unchecked Sendable {
     private var isShutDown = false
     private var consumerTask: Task<Void, Never>?
 
+    /// Engine-queue-owned in-flight guard (Plan 4b Task 6 fix round 1):
+    /// avatar NAMEs (not nicks — the download destination is name-keyed,
+    /// same key `downloadAvatarIfNeededLocked` fetches by) currently being
+    /// fetched by a detached download `Task`. Without this, N `.appearsAs`
+    /// announces for the same unresolved name arriving before the first
+    /// download lands would each pass `downloadAvatarIfNeededLocked`'s
+    /// `bridge.resolvesName` check (still unresolved — the first download
+    /// hasn't landed yet) and spawn N redundant concurrent fetches of the
+    /// same URL. Inserted into synchronously (engine queue, before the
+    /// detached `Task` is spawned) and removed on EVERY exit of that `Task`
+    /// (success or thrown error) via an `engineQueue.async` hop back —
+    /// touched ONLY on `engineQueue`, like every other piece of state in
+    /// this section.
+    private var inFlightAvatarDownloads: Set<String> = []
+
     // MARK: Whisper (Plan 4b Task 4)
 
     /// Engine-queue-owned whisper transcripts, keyed by peer nick. Appended
@@ -677,10 +692,21 @@ public final class ChatSessionModel: @unchecked Sendable {
               let scheme = parsed.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
             return
         }
+        // In-flight guard (fix round 1): a second `.appearsAs` for the same
+        // NAME arriving while the first download is still in flight bails
+        // out here instead of spawning a redundant fetch of the same URL.
+        guard !inFlightAvatarDownloads.contains(avatarName) else { return }
+        inFlightAvatarDownloads.insert(avatarName)
 
         let downloader = AvatarDownloader()
         let dir = URL(fileURLWithPath: Self.userCharactersDir)
         Task.detached { [weak self] in
+            defer {
+                self?.engineQueue.async { [weak self] in
+                    guard let self, !self.isShutDown else { return }
+                    self.inFlightAvatarDownloads.remove(avatarName)
+                }
+            }
             guard let self else { return }
             do {
                 let downloadedPath = try await downloader.fetch(name: avatarName, url: parsed, into: dir)
