@@ -126,6 +126,17 @@ typedef struct cc_canvas_ops {
                       const char* bytes, int32_t len);
     void (*fill_rect)(void* ctx, int32_t l, int32_t t, int32_t r, int32_t b,
                       uint32_t color);
+    /* draw_image's dest rect edges may arrive in reversed order -- reversed
+     * HORIZONTAL order (dr < dl) means mirror the image; this is how the
+     * engine draws an avatar body facing the other way (FlipBodyBox,
+     * engine/bodycam.cpp mirrors the dest rect the same way the original's
+     * GDI StretchDIBits negative-width blit did). The vertical order (dt/db)
+     * has never been observed reversed. The source rect is always
+     * normal-order (the CDC adapter always passes 0,0,w,h -- see
+     * shim/mfc_compat.cpp's DrawPoseImage/DrawAuraImage). Canvas
+     * implementations that only draw upright must special-case dr < dl to
+     * flip; naively normalizing with abs()/min() silently drops the mirror
+     * (final review, Plan 2 Task 13 follow-on: this exact bug shipped once). */
     void (*draw_image)(void* ctx, const cc_image* img,
                        int32_t dl, int32_t dt, int32_t dr, int32_t db,
                        int32_t sl, int32_t st, int32_t sr, int32_t sb);

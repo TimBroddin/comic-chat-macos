@@ -283,6 +283,17 @@ public final class CGCanvas: Canvas {
         context.fill(CGRect(x: x, y: yBottom, width: width, height: height))
     }
 
+    /// Draws `img`'s `(sl,st,sr,sb)` source sub-rect into the `(dl,dt,dr,db)`
+    /// dest rect (twips, y-up).
+    ///
+    /// MIRRORED DEST RECTS (see `cc_canvas_ops.draw_image`'s doc comment in
+    /// comicchat.h): dest rect edges may arrive in reversed order. Reversed
+    /// HORIZONTAL order (dr < dl) means mirror the image left-right — this is
+    /// how the engine draws an avatar body facing the other way (FlipBodyBox,
+    /// engine/bodycam.cpp, replicating GDI StretchDIBits negative-width-blit
+    /// semantics). The vertical order is asserted normal (dt >= db); the source
+    /// rect is always normal-order (the CDC adapter — DrawPoseImage/
+    /// DrawAuraImage, shim/mfc_compat.cpp — always passes `0,0,w,h`).
     public func drawImage(_ img: UnsafePointer<cc_image>?,
                           dl: Int32, dt: Int32, dr: Int32, db: Int32,
                           sl: Int32, st: Int32, sr: Int32, sb: Int32) {
@@ -322,15 +333,44 @@ public final class CGCanvas: Canvas {
         }
 
         // Destination rect (dl,dt,dr,db) in twips, y-up: bottom is the smaller y.
-        // (dr/dl may be swapped — take min for left, abs for extent.)
+        //
+        // MIRRORED-RECT CONVENTION: the engine signals "draw this image
+        // horizontally mirrored" (FlipBodyBox, engine/bodycam.cpp) by emitting
+        // dr < dl -- a dest rect whose left/right edges arrive in REVERSED
+        // order, replicating the original GDI StretchDIBits negative-width-blit
+        // semantics. The NORMALIZED rect (min for x, abs for extent) is the
+        // same either way; only the pixel content drawn into it differs: normal
+        // order draws upright, reversed order draws horizontally flipped. The
+        // vertical edges (dt/db) are NEVER reversed by the engine (dt is always
+        // >= db, i.e. top >= bottom in this y-up space -- verified against
+        // every `image` line in Tests/ComicChatKitTests/Fixtures/strip-golden.txt,
+        // Plan 2 Task 13's follow-on fix); an unexpected vertical inversion
+        // would mean either a new engine call pattern this canvas hasn't been
+        // taught about, or a bug upstream, so it's asserted rather than
+        // silently mirrored.
+        assert(dt >= db, "CGCanvas.drawImage: unexpected vertical dest-rect inversion (dt=\(dt) db=\(db)) -- the engine has never been observed emitting this; see the mirrored-rect convention note above")
         let dx = CGFloat(min(dl, dr))
         let dw = CGFloat(abs(dr - dl))
         let dyBottom = CGFloat(min(dt, db))
         let dh = CGFloat(abs(dt - db))
+        let destRect = CGRect(x: dx, y: dyBottom, width: dw, height: dh)
 
         // CGContext.draw already renders a top-down CGImage upright in a y-up
-        // context (it places row 0 at the rect's top / max-y). No manual flip.
-        context.draw(cropped, in: CGRect(x: dx, y: dyBottom, width: dw, height: dh))
+        // context (it places row 0 at the rect's top / max-y). No manual flip
+        // needed for the normal (unmirrored) case.
+        if dr < dl {
+            // Horizontal mirror: flip the CTM around the rect's vertical
+            // midline so the image draws reflected left-right within the same
+            // normalized `destRect`, then restore.
+            context.saveGState()
+            context.translateBy(x: destRect.midX, y: 0)
+            context.scaleBy(x: -1, y: 1)
+            context.translateBy(x: -destRect.midX, y: 0)
+            context.draw(cropped, in: destRect)
+            context.restoreGState()
+        } else {
+            context.draw(cropped, in: destRect)
+        }
     }
 
     public func path(_ pts: UnsafePointer<cc_path_pt>?, n: Int32,
