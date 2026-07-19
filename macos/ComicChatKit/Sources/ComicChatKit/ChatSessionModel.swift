@@ -207,6 +207,15 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// existing snapshot read, same delivery posture as `onMembers`. Drives
     /// `AppState.selfIsOp`, which gates the Kick/Ban context-menu items.
     public var onSelfOp: (@Sendable (Bool) -> Void)?
+    /// Fired on the MAIN thread for every inbound `.sound` event (nick, file)
+    /// — Plan 4b Task 9. Session-level playback callback: fires regardless of
+    /// which transcript the event was recorded to (a channel-borne `.sound`
+    /// still appends to that room's transcript above `handleLocked`'s switch,
+    /// like any other channel-scoped event — only PLAYBACK is uniformly
+    /// session-level). The app layer (`AppState`) owns the actual
+    /// `AVAudioPlayer` + `SoundLibrary` resolution; this Kit stays
+    /// AVFoundation-free.
+    public var onSound: (@Sendable (String, String) -> Void)?
 
     /// `var` (Plan 4b Task 5): `changeCharacter` updates the model's OWN
     /// notion of `config.characterName` so a subsequent `reflowLocked()` (or
@@ -254,9 +263,18 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// -> rebuild from the new room's transcript -> recompose).
     private var activeRoom: String = ""
     /// Session-scoped event log (Plan 4b Task 7, clarification 2): whisper/
-    /// sound/status/login/error events (token 0 — `channel == nil`) that
-    /// belong to no single room. Kept for Task 10 (save) / Task 11 (text
-    /// view), which consume per-room transcript + relevant session events.
+    /// status/login/error events (token 0 — `channel == nil`) that belong to
+    /// no single room. Kept for Task 10 (save) / Task 11 (text view), which
+    /// consume per-room transcript + relevant session events.
+    ///
+    /// NOTE (Task 9 wording correction): `.sound` is NOT always session-scoped
+    /// like this list's other members — a channel-borne `.sound` (the engine
+    /// tokens the whole PRIVMSG payload switch, same as `.text`/`.action`)
+    /// routes to THAT ROOM's transcript below, exactly like any other
+    /// channel-scoped event; only a session-scoped `.sound` (no room token)
+    /// lands here. What IS uniformly session-level is PLAYBACK — `onSound`
+    /// fires regardless of which transcript the event was recorded to (see
+    /// `handleLocked`'s `.sound` case).
     private var sessionTranscript: [ProtocolEvent] = []
     /// Convenience read of the ACTIVE room's transcript (the `transcript`
     /// public accessor's backing). Per-room appends go directly to
@@ -488,8 +506,11 @@ public final class ChatSessionModel: @unchecked Sendable {
     }
 
     /// Thread-safe snapshot of the session-scoped event log (Plan 4b Task 7,
-    /// clarification 2) — whisper/sound/status/login events that belong to no
-    /// single room. Task 10/11 consume this alongside a room's transcript.
+    /// clarification 2) — whisper/status/login events that belong to no
+    /// single room. A channel-borne `.sound` is NOT included here (Task 9
+    /// wording correction — see `sessionTranscript`'s doc comment); it lands
+    /// in that room's transcript like any other channel-scoped event. Task
+    /// 10/11 consume this alongside a room's transcript.
     public var sessionEvents: [ProtocolEvent] {
         engineQueue.sync { sessionTranscript }
     }
@@ -691,12 +712,19 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///   .userParted/.userQuit/.kicked/.names/.endOfNames/.nickChanged
     ///                           -> recompute sorted member list -> onMembers
     ///   .statusLine/.error/.disconnectedHint -> onStatus
+    ///   .sound                  -> onSound (session-level playback callback,
+    ///                              Task 9); transcript placement follows the
+    ///                              room token like any other event — NOT
+    ///                              forced session-scoped (see
+    ///                              `sessionTranscript`'s doc comment)
     ///
     /// - Parameter channel: the room this event is scoped to (Plan 4b Task 7),
-    ///   `nil` for session-scoped events (whisper/sound/status/login — see
-    ///   `ScopedEvent`'s doc comment). A channel-scoped event appends to THAT
-    ///   room's transcript and drives the live strip ONLY when it is the
-    ///   active room; otherwise it bumps that room's unread (messages only)
+    ///   `nil` for session-scoped events (whisper/status/login — see
+    ///   `ScopedEvent`'s doc comment; a `.sound` MAY also be session-scoped if
+    ///   it carries no room token, but a channel-borne one is not forced here
+    ///   the way this list's other members are). A channel-scoped event
+    ///   appends to THAT room's transcript and drives the live strip ONLY when
+    ///   it is the active room; otherwise it bumps that room's unread (messages only)
     ///   and refreshes the tab bar. A `nil` channel routes to the SESSION
     ///   transcript and behaves exactly as pre-Task-7 (no strip effect unless
     ///   it's one of the room-agnostic strip events — none are).
@@ -925,6 +953,17 @@ public final class ChatSessionModel: @unchecked Sendable {
             let formatted = "\(nick) (\(user)@\(host)) — \(whoChannel)"
             let cb = onUserInfo
             DispatchQueue.main.async { cb?(nick, formatted) }
+
+        // MARK: Sounds (Plan 4b Task 9) — the transcript append above already
+        // happened (channel-scoped or session-scoped, following the wire's
+        // room token like any other event; see `sessionTranscript`'s doc
+        // comment). Playback itself is session-level regardless: fire
+        // `onSound` unconditionally here. No unread bump (a sound is not a
+        // message the user "missed" the way a channel text/action is), and no
+        // `bridge.apply` (sounds render no strip panel — audio-only).
+        case .sound(let nick, let file, _):
+            let cb = onSound
+            DispatchQueue.main.async { cb?(nick, file) }
 
         default:
             break

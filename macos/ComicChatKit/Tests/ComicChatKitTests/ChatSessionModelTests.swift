@@ -641,6 +641,66 @@ extension EngineGlobalStateSelfTests {
             model.shutdown()
             server.stop()
         }
+
+        /// Plan 4b Task 9 — a replayed `.sound` event fires `onSound` and
+        /// lands in the transcript. Wire form VERIFIED against the engine
+        /// parser (not assumed): `cc_selftest.cpp`'s
+        /// `cc_selftest_pv_sound_ctcp` (VECTOR 17) drives exactly this line
+        /// -- a channel PRIVMSG whose payload is the CTCP
+        /// `\x01SOUND "<file>"\x01` form, classified `CC_EV_SOUND` by
+        /// `ircsock.cpp`'s payload-stage classification (protsupp.h:153's
+        /// `ccPayloadSound` comment: "-> CC_EV_SOUND (\x01SOUND \"file\"
+        /// text\x01 CTCP)"). The event carries a room token (it rides a
+        /// channel PRIVMSG, `PRIVMSG #p4 :...`), so per the Task 7
+        /// reviewer's finding (corrected in `sessionTranscript`'s doc
+        /// comment) it lands in THAT ROOM's transcript, not the session
+        /// transcript -- this test pins both halves: the callback fires AND
+        /// the transcript placement is room-scoped.
+        @Test(.timeLimit(.minutes(1)))
+        func inboundSoundFiresOnSoundAndLandsInRoomTranscript() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            let soundBox = SoundReceivedBox()
+            model.onSound = { nick, file in soundBox.append(nick: nick, file: file) }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            try await server.send(":Bob!bob@h PRIVMSG #p4 :\u{01}SOUND \"boing.wav\"\u{01}")
+
+            while soundBox.entries.isEmpty {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(soundBox.entries.contains { $0.nick == "Bob" && $0.file == "boing.wav" })
+
+            let roomTranscript = model.transcript(for: "#p4")
+            #expect(roomTranscript.contains {
+                if case .sound(let nick, let file, _) = $0 { return nick == "Bob" && file == "boing.wav" }
+                return false
+            })
+
+            model.shutdown()
+            server.stop()
+        }
+    }
+}
+
+/// Thread-safe accumulator for `onSound`'s `(nick, file)` callback (Plan 4b
+/// Task 9) — same lock-guarded-box shape as `WhisperRoutingTests`'
+/// `WhisperReceivedBox`.
+private final class SoundReceivedBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [(nick: String, file: String)] = []
+
+    func append(nick: String, file: String) {
+        lock.lock(); defer { lock.unlock() }
+        storage.append((nick, file))
+    }
+
+    var entries: [(nick: String, file: String)] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
     }
 }
 

@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import CoreGraphics
+import AVFoundation
 import ComicChatKit
 
 @Observable @MainActor
@@ -71,6 +72,42 @@ public final class AppState {
     /// formatted)`, mirrored from `ChatSessionModel.onUserInfo`. `nil` clears
     /// any shown popover.
     public var userInfoResult: (nick: String, text: String)?
+
+    // MARK: Sounds (Plan 4b Task 9)
+
+    /// The one live `AVAudioPlayer`, held so playback isn't torn down by ARC
+    /// the instant `playSound` returns (an unretained local player stops
+    /// mid-clip). A new `.sound` event replaces it outright — matching the
+    /// original's one-sound-at-a-time posture, no mixing/queueing.
+    private var soundPlayer: AVAudioPlayer?
+
+    /// Creates the user sounds folder on first launch, if it doesn't already
+    /// exist (D1 §4.2 / spec §5 amendment: it ships EMPTY — no bundled WAVs
+    /// exist anywhere in this repo's trees, so there is nothing to seed it
+    /// with; the user drops files in themselves). Uses `settings.soundsFolder`
+    /// (Task 5's setting, not a hardcoded string) so a user-relocated folder
+    /// is respected on every subsequent launch — `createDirectory` is a no-op
+    /// once the target already exists.
+    public init() {
+        try? FileManager.default.createDirectory(
+            atPath: settings.soundsFolder, withIntermediateDirectories: true)
+    }
+
+    /// Handles one inbound `.sound` event (`ChatSessionModel.onSound`, wired
+    /// in `connect()`) — Plan 4b Task 9. Playback is gated on
+    /// `settings.soundsEnabled`; the status line ALWAYS notes the event
+    /// (`"<nick> played <file>"`), regardless of whether playback is enabled
+    /// or the file resolves — playback is an overlay on top of the always-visible
+    /// status note, never a replacement for it (matches the brief's "visible
+    /// either way" wording).
+    private func playSound(nick: String, file: String) {
+        statusLine = "\(nick) played \(file)"
+        guard settings.soundsEnabled else { return }
+        let folder = URL(fileURLWithPath: settings.soundsFolder)
+        guard let resolved = SoundLibrary(folder: folder).resolve(file) else { return }
+        soundPlayer = try? AVAudioPlayer(contentsOf: resolved)
+        soundPlayer?.play()
+    }
 
     /// Requests a fresh room list — `RoomListWindow`'s Refresh button / the
     /// window's `.task`. Fire-and-forget on the model; the result arrives via
@@ -386,6 +423,8 @@ public final class AppState {
         m.onSelfOp = { [weak self] isOp in Task { @MainActor in self?.selfIsOp = isOp } }
         m.onUserInfo = { [weak self] nick, text in
             Task { @MainActor in self?.userInfoResult = (nick: nick, text: text) } }
+        m.onSound = { [weak self] nick, file in
+            Task { @MainActor in self?.playSound(nick: nick, file: file) } }
         model = m
         do { try await m.start(); showConnectSheet = false }
         catch { statusLine = "Connect failed: \(error)" }
@@ -441,5 +480,7 @@ public final class AppState {
         whisperHistories = [:]
         whisperUnread = [:]
         pendingWhisperPeer = nil
+        soundPlayer?.stop()
+        soundPlayer = nil
     }
 }
