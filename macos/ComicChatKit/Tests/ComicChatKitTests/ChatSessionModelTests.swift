@@ -749,6 +749,210 @@ extension EngineGlobalStateSelfTests {
             model.shutdown()
             server.stop()
         }
+
+        /// Quick-wins batch item 3 (original `UnitsWide`): `ChatConfig
+        /// .panelsPerRow > 0` forces `setViewport`'s resolved column count
+        /// rather than `PanelFit`'s auto-fit scan. At a fixed 600pt width,
+        /// `PanelFit.columns` would auto-fit to some value on its own scan
+        /// (not asserted here — the override's whole point is to NOT depend
+        /// on that); this asserts the override wins: `panelGeometry.perRow
+        /// == 4` regardless of what the auto-fit would have picked.
+        @Test(.timeLimit(.minutes(1)))
+        func panelsPerRowOverrideForcesColumnCount() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art,
+                                                       panelsPerRow: 4))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            model.setViewport(widthPoints: 600, scale: 2.0)
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                model.settleEngineQueue { cont.resume() }
+            }
+
+            #expect(model.panelGeometry?.perRow == 4,
+                    "expected the panelsPerRow=4 override to force 4 columns regardless of PanelFit's own auto-fit for 600pt")
+
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Quick-wins batch item 3 (live change): `setPanelsPerRow` updates
+        /// the override AFTER a viewport is already established and reflows
+        /// at the last-known width — proves the live-change path (the
+        /// AppState observable-mirror precedent's engine-side twin) actually
+        /// takes effect without a fresh `setViewport` call from the caller.
+        @Test(.timeLimit(.minutes(1)))
+        func setPanelsPerRowLiveChangesGeometryAtLastKnownWidth() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            func settle() async {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    model.settleEngineQueue { cont.resume() }
+                }
+            }
+
+            model.setViewport(widthPoints: 600, scale: 2.0)
+            await settle()
+            let autoFitPerRow = model.panelGeometry?.perRow
+
+            model.setPanelsPerRow(2)
+            await settle()
+            #expect(model.panelGeometry?.perRow == 2,
+                    "expected a live setPanelsPerRow(2) call to reflow to 2 columns at the last-known 600pt width (auto-fit had picked \(String(describing: autoFitPerRow)))")
+
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Quick-wins batch item 5 (original CUserInfo m_bIgnored): an
+        /// ignored peer's `.text` is appended to the transcript (the log
+        /// stays canonical — proven via `model.transcript` growing) but does
+        /// NOT grow `panelCount`, either live (the direct render-routing
+        /// guard in `handleLocked`) OR after a forced reflow (the SAME guard
+        /// in `rebuildStripLocked`'s replay loop — proving the doctrine
+        /// comment's warning about the two apply sites needing to agree is
+        /// actually honored). Unignoring + a second reflow DOES render it —
+        /// the log kept it, so unignore is a faithful bonus over the
+        /// original, not just "ignore is permanent."
+        @Test(.timeLimit(.minutes(1)))
+        func ignoredPeerSkipsLiveAndReflowRenderingButTranscriptStaysCanonical() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            func settle() async {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    model.settleEngineQueue { cont.resume() }
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+
+            // Bob joins, then ignore him BEFORE his first message.
+            try await server.send(":Bob!u@h JOIN #p4")
+            try await settle()
+            model.setIgnored("Bob", true)
+            await settle()
+
+            let panelsBeforeIgnoredSay = model.panelCount
+            let transcriptBeforeIgnoredSay = model.transcript.count
+
+            try await server.send(":Bob!u@h PRIVMSG #p4 :hello while ignored")
+            // Poll the TRANSCRIPT (not panelCount, which this asserts stays
+            // put) so this doesn't just race a fixed sleep.
+            var attempts = 0
+            while model.transcript.count <= transcriptBeforeIgnoredSay, attempts < 400 {
+                try await Task.sleep(nanoseconds: 25_000_000)
+                attempts += 1
+            }
+            #expect(model.transcript.count > transcriptBeforeIgnoredSay,
+                    "expected the ignored peer's line to still land in the canonical transcript")
+            #expect(model.panelCount == panelsBeforeIgnoredSay,
+                    "expected an ignored peer's live .text to NOT grow panelCount")
+
+            // Force a reflow (viewport change) — the SAME guard must apply to
+            // rebuildStripLocked's replay loop, or the ignored line would
+            // resurrect from the transcript.
+            model.setViewport(widthPoints: 500, scale: 2.0)
+            await settle()
+            #expect(model.panelCount == panelsBeforeIgnoredSay,
+                    "expected the ignored peer's transcript-recorded line to stay skipped across a forced reflow")
+
+            // Unignore + reflow again: the log kept it, so it renders now.
+            model.setIgnored("Bob", false)
+            await settle()
+            model.setViewport(widthPoints: 640, scale: 2.0)
+            await settle()
+            #expect(model.panelCount > panelsBeforeIgnoredSay,
+                    "expected unignore + a reflow to render the previously-skipped line from the canonical transcript")
+
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Quick-wins batch item 5: `setIgnored` folds case (original
+        /// `CUserInfo m_bIgnored` posture, "fold like nick comparisons
+        /// elsewhere") — ignoring "bob" (lowercase) still silences a
+        /// "Bob"-cased peer's live rendering.
+        @Test(.timeLimit(.minutes(1)))
+        func ignoreFoldsNickCase() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            func settle() async {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    model.settleEngineQueue { cont.resume() }
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+
+            try await server.send(":Bob!u@h JOIN #p4")
+            await settle()
+            model.setIgnored("bob", true)
+            await settle()
+
+            let panelsBefore = model.panelCount
+            try await server.send(":Bob!u@h PRIVMSG #p4 :hello from Bob")
+            let transcriptBefore = model.transcript.count
+            var attempts = 0
+            while model.transcript.count <= transcriptBefore, attempts < 400 {
+                try await Task.sleep(nanoseconds: 25_000_000)
+                attempts += 1
+            }
+            #expect(model.panelCount == panelsBefore,
+                    "expected setIgnored(\"bob\") to also silence the differently-cased \"Bob\" peer")
+
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Quick-wins batch item 6 (Room > Set Topic…): `model.setTopic`
+        /// fires the wire TOPIC command; the server's `.topicChanged` confirm
+        /// is what actually updates `RoomInfo.topic` (tracked model-side in
+        /// `RoomBox.topic`, `handleLocked`'s `.topicChanged` case) — proves
+        /// the round trip end to end over a real loopback server, matching
+        /// this suite's own `liveLoopRendersAndSends` posture.
+        @Test(.timeLimit(.minutes(1)))
+        func setTopicRoundTripsIntoRoomInfo() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            #expect(model.roomInfos.first?.topic == "",
+                    "expected no topic before any .topicChanged has arrived")
+
+            try await model.setTopic("#p4", topic: "welcome to the rig")
+            _ = try await waitForReceivedLine(server, containing: "TOPIC")
+            try await server.send(":Mac!mac@h TOPIC #p4 :welcome to the rig")
+
+            var attempts = 0
+            while model.roomInfos.first?.topic != "welcome to the rig", attempts < 400 {
+                try await Task.sleep(nanoseconds: 25_000_000)
+                attempts += 1
+            }
+            #expect(model.roomInfos.first?.topic == "welcome to the rig",
+                    "expected the server's .topicChanged confirm to land in RoomInfo.topic")
+
+            model.shutdown()
+            server.stop()
+        }
     }
 }
 

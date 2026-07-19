@@ -67,4 +67,18 @@ struct SettingsStoreTests {
         #expect(reloaded.character == "armando")
         #expect(reloaded.backdrop == "clouds")
     }
+
+    /// Quick-wins batch item 3: `panelsPerRow` defaults to 0 ("automatic")
+    /// and round-trips through UserDefaults like every other property here.
+    @Test func panelsPerRowDefaultsToAutomaticAndRoundTrips() {
+        let defaults = freshDefaults()
+        let store = SettingsStore(defaults: defaults)
+        #expect(store.panelsPerRow == 0)
+
+        store.panelsPerRow = 4
+        #expect(store.panelsPerRow == 4)
+
+        let reloaded = SettingsStore(defaults: defaults)
+        #expect(reloaded.panelsPerRow == 4)
+    }
 }

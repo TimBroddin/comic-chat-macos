@@ -35,13 +35,21 @@ public struct ChatConfig: Sendable {
     /// documented default; matches `SettingsStore.autoDownloadAvatars`'s own
     /// "never set" default).
     public var autoDownloadAvatars: Bool
+    /// Quick-wins batch item 3 (original `UnitsWide`): a user-forced
+    /// panels-per-row override, `0` (default) meaning "automatic" —
+    /// `setViewport`'s existing `PanelFit.columns(forViewportWidthTwips:)`
+    /// derivation, unchanged. When `> 0`, `setViewport` uses this value as
+    /// `columns` directly instead (unit width is still computed from the
+    /// viewport via `PanelFit.unitPanelTwips(viewportWidthTwips:columns:)`,
+    /// just fed this forced column count rather than the auto-fit one).
+    public var panelsPerRow: Int
 
     public init(host: String, port: UInt16, nick: String, room: String,
                 encoding: WireEncoding = .cp1252, characterName: String = "anna",
                 backdropName: String = "field", artDir: String,
                 userName: String? = nil, realName: String? = nil,
                 sendComicsData: Bool = true, acceptWhispers: Bool = true,
-                autoDownloadAvatars: Bool = true) {
+                autoDownloadAvatars: Bool = true, panelsPerRow: Int = 0) {
         self.host = host
         self.port = port
         self.nick = nick
@@ -55,6 +63,7 @@ public struct ChatConfig: Sendable {
         self.sendComicsData = sendComicsData
         self.acceptWhispers = acceptWhispers
         self.autoDownloadAvatars = autoDownloadAvatars
+        self.panelsPerRow = panelsPerRow
     }
 }
 
@@ -103,6 +112,13 @@ struct RoomBox {
     var lastImage: CGImage?
     var lastSizePoints: CGSize = .zero
     var unread: Int = 0
+    /// Quick-wins batch item 6: this room's current topic, updated from
+    /// `handleLocked`'s `.topicChanged` case (the model already sees that
+    /// event — no need to read `session.room(_:).topic` on-queue, which
+    /// would trap the same way `session.ownNick`/`session.room(_:)` do
+    /// elsewhere on this type, per `currentOwnNick`'s doc comment). Empty
+    /// until a `.topicChanged` has actually arrived for this room.
+    var topic: String = ""
 }
 
 /// A room's tab-bar summary (Plan 4b Task 7). `Identifiable` by `name` so
@@ -112,11 +128,18 @@ public struct RoomInfo: Sendable, Equatable, Identifiable {
     public let name: String
     public let unread: Int
     public let isActive: Bool
+    /// Quick-wins batch item 6: the room's current topic (from `.topicChanged`,
+    /// tracked model-side in `roomTopics` — see that property's doc comment
+    /// for why NOT `session.room(_:).topic` directly), empty until a
+    /// `.topicChanged` has actually arrived for this room. Drives the sidebar
+    /// row's subtitle.
+    public let topic: String
 
-    public init(name: String, unread: Int, isActive: Bool) {
+    public init(name: String, unread: Int, isActive: Bool, topic: String = "") {
         self.name = name
         self.unread = unread
         self.isActive = isActive
+        self.topic = topic
     }
 }
 
@@ -149,11 +172,25 @@ public struct MemberRow: Sendable, Equatable, Identifiable {
     public let nick: String
     public let isOp: Bool
     public let avatarName: String
+    /// Quick-wins batch item 4: mirrors `ProtocolSession.RoomMember.isAway`
+    /// (set from an inbound `.awayPeer` event — see `emitMembers`'s doc
+    /// comment for how live this actually is: there is no corresponding
+    /// "no longer away" wire event this port's `ProtocolEvent` surface
+    /// carries, so a peer's row stays badged away for the rest of the
+    /// session once set, display-only either way).
+    public let isAway: Bool
+    /// Quick-wins batch item 5 (original CUserInfo m_bIgnored): whether this
+    /// nick is in `ChatSessionModel.ignoredNicks` — drives the member grid's
+    /// slashed-eye badge. Display-only annotation; the actual filtering
+    /// happens in `handleLocked`/`rebuildStripLocked`, not here.
+    public let isIgnored: Bool
 
-    public init(nick: String, isOp: Bool, avatarName: String) {
+    public init(nick: String, isOp: Bool, avatarName: String, isAway: Bool = false, isIgnored: Bool = false) {
         self.nick = nick
         self.isOp = isOp
         self.avatarName = avatarName
+        self.isAway = isAway
+        self.isIgnored = isIgnored
     }
 }
 
@@ -476,6 +513,75 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// this section.
     private var inFlightAvatarDownloads: Set<String> = []
 
+    // MARK: Ignore (quick-wins batch item 5, original CUserInfo m_bIgnored)
+
+    /// Engine-queue-owned, session-scoped (not per-room — the original's
+    /// per-user ignore flag is global to the user, not scoped to a channel)
+    /// set of ignored nicks, keyed by a case-folded form (`ignoreKey(_:)`)
+    /// so "Ignore Bob" also silences "BOB"/"bob" — the same case-insensitive
+    /// posture nick comparisons use elsewhere on this type (e.g.
+    /// `caseInsensitiveCompare` in `handleLocked`'s `.appearsAs` case).
+    ///
+    /// DOCTRINE (binding, load-bearing — read before touching either
+    /// apply site below): ignore is a VIEW-side filter over the log, NOT a
+    /// drop-at-ingest rule. Events from an ignored nick are still appended to
+    /// `_transcript`/`sessionTranscript` above in `handleLocked` (the log
+    /// stays canonical — an unignore later must be able to render the
+    /// skipped history, and `.text`/`.action`/`.whisper`/`.sound`'s transcript
+    /// bookkeeping/whisper-box routing/unread counting are all UNCHANGED by
+    /// ignore). The filter applies ONLY at the two RENDER-ROUTING sites that
+    /// turn a transcript entry into a strip panel: `handleLocked`'s own
+    /// live `applyToBridgeLocked`/`recomposeLocked` calls (the `.text`/
+    /// `.action` cases route through `handleRoomMessageStripEffect`, guarded
+    /// below) AND `rebuildStripLocked`'s replay loop (a reflow re-derives the
+    /// ENTIRE strip from the transcript from scratch — without the SAME guard
+    /// there, an ignored nick's already-transcript-recorded lines would
+    /// silently resurrect on the very next viewport resize/tab switch, since
+    /// replay has no memory of what live rendering chose to skip). Both sites
+    /// must agree, or ignore becomes a flaky "sometimes filtered" feature
+    /// instead of a real view.
+    private var ignoredNicks: Set<String> = []
+
+    /// Case-fold for `ignoredNicks` keys — plain ASCII lowercase, matching
+    /// the `caseInsensitiveCompare` posture used for nick comparisons
+    /// elsewhere on this type (`roomKey(_:)`'s own RFC-1459 `[]\^`<->`{}|~`
+    /// extended fold is a CHANNEL-name rule, not applicable to a bare nick).
+    private func ignoreKey(_ nick: String) -> String { nick.lowercased() }
+
+    /// Toggles whether `nick` is ignored (quick-wins batch item 5's member
+    /// context-menu action). Fire-and-forget: hops onto the engine queue,
+    /// mutates `ignoredNicks`, then reflows the ACTIVE room so the change is
+    /// visible immediately — an unignore must re-render the nick's history
+    /// (the log kept it, per the doctrine above), and an ignore must retract
+    /// any of the nick's panels already showing on the live strip. Reusing
+    /// `rebuildStripLocked` (the same "replay is the reflow" machinery
+    /// `setViewport`/`setActiveRoom` already use) guarantees the two apply
+    /// sites (live + replay) are re-derived from the SAME transcript with the
+    /// SAME guard, rather than trying to surgically patch the already-composed
+    /// strip.
+    public func setIgnored(_ nick: String, _ ignored: Bool) {
+        engineQueue.async { [weak self] in
+            guard let self, !self.isShutDown else { return }
+            let key = self.ignoreKey(nick)
+            if ignored {
+                self.ignoredNicks.insert(key)
+            } else {
+                self.ignoredNicks.remove(key)
+            }
+            guard !self.activeRoom.isEmpty else { return }
+            self.rebuildStripLocked(for: self.activeRoom, resetAnnounce: false)
+        }
+    }
+
+    /// Thread-safe snapshot check — `MemberRow.isIgnored`'s source
+    /// (`emitMembers`'s detached `Task` cannot touch engine-queue state
+    /// directly, so the ignored-set membership is captured on-queue at
+    /// snapshot time, same posture as `announcedAvatarNames`/`ownCharacterName`
+    /// in that method).
+    public var ignoredNicksSnapshot: Set<String> {
+        engineQueue.sync { ignoredNicks }
+    }
+
     // MARK: Room list (Plan 4b Task 8)
 
     /// Engine-queue-owned accumulator for the current `.roomListBegin` ->
@@ -631,6 +737,16 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// same `engineQueue.sync` read-through pattern as `transcript`.
     public var panelCount: Int32 {
         engineQueue.sync { strip?.panelCount ?? 0 }
+    }
+
+    /// Thread-safe snapshot of the strip's current panel geometry
+    /// (`Strip.panelGeometry`), `nil` if no strip has been built yet. Quick-wins
+    /// batch item 3: lets a test observe `setViewport`'s resolved `perRow`
+    /// directly (whether auto-fit or `config.panelsPerRow`-forced) rather than
+    /// re-deriving it from `PanelFit` itself — same `engineQueue.sync`
+    /// read-through posture as `panelCount`.
+    public var panelGeometry: (unitW: Int32, unitH: Int32, perRow: Int32, hInter: Int32, vInter: Int32)? {
+        engineQueue.sync { strip?.panelGeometry }
     }
 
     /// Plan 4b Task 10: the config snapshot `conversationFile()` needs — read
@@ -1105,12 +1221,24 @@ public final class ChatSessionModel: @unchecked Sendable {
             // background room's unread. An OWN message (`!fromServer` — the
             // synthetic self-say into a background room) renders but never
             // bumps unread (you don't have unread from yourself).
-            handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedKey,
-                                         isMessage: !isWhisper && fromServer)
+            //
+            // Quick-wins batch item 5 (ignore, doctrine comment on
+            // `ignoredNicks`): an ignored nick's `.text` still appended to the
+            // transcript above (the log stays canonical) but is skipped HERE,
+            // at render-routing — no strip panel, no unread bump. Never
+            // applies to our OWN nick (`ignoredNicks` can't contain
+            // `currentOwnNick` via the UI, but this guard costs nothing and
+            // documents the invariant explicitly).
+            if !ignoredNicks.contains(ignoreKey(nick)) {
+                handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedKey,
+                                             isMessage: !isWhisper && fromServer)
+            }
 
-        case .action:
-            handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedKey,
-                                         isMessage: fromServer)
+        case .action(let nick, _, _):
+            if !ignoredNicks.contains(ignoreKey(nick)) {
+                handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedKey,
+                                             isMessage: fromServer)
+            }
 
         case .whisper(let nick, _, let text, _):
             // Plan 4b Task 4: the IRCX WHISPER verb path -- see
@@ -1140,7 +1268,16 @@ public final class ChatSessionModel: @unchecked Sendable {
             // nil` fallback entirely. A whisper does NOT bump unread either
             // way.
             whisperBoxRoutingLocked(nick: nick, text: text)
-            if isActiveRoom { applyToBridgeLocked(ev); recomposeLocked() }
+            // Quick-wins batch item 5 (ignore): the whisper BOX still shows
+            // the line unconditionally (`whisperBoxRoutingLocked` above,
+            // unaffected — ignore is a STRIP-rendering filter, not a
+            // whisper-box one; a whisper box is an explicit private
+            // conversation the user opened, distinct from the ambient strip
+            // an ignore is meant to declutter). Only the room-scoped strip
+            // balloon is skipped for an ignored nick.
+            if isActiveRoom, !ignoredNicks.contains(ignoreKey(nick)) {
+                applyToBridgeLocked(ev); recomposeLocked()
+            }
 
         case .userJoined:
             // A peer joining is strip-relevant (renders a JOIN panel) AND
@@ -1166,6 +1303,20 @@ public final class ChatSessionModel: @unchecked Sendable {
             // Server-wide: the peer left every room at once — refresh the
             // active room's sidebar.
             emitMembers(for: activeRoom)
+
+        // Quick-wins batch item 6: track the room's topic model-side (the
+        // simplest path per the brief — reading `session.room(_:).topic`
+        // on-queue would trap, same hazard `currentOwnNick`'s doc comment
+        // documents for `session.ownNick`). The transcript append above
+        // already recorded this event; this just mirrors it into the
+        // `RoomBox` for `roomInfosLocked()`'s snapshot. `scopedKey` is nil
+        // only if the token-resolution race left this session-scoped (should
+        // not happen for a real topic reply — defensive no-op either way).
+        case .topicChanged(_, let topic):
+            if let key = scopedKey {
+                rooms[key]?.topic = topic
+                emitRooms()
+            }
 
         case .statusLine(let text):
             emitStatus(text)
@@ -1253,6 +1404,14 @@ public final class ChatSessionModel: @unchecked Sendable {
         // message the user "missed" the way a channel text/action is), and no
         // `bridge.apply` (sounds render no strip panel — audio-only).
         case .sound(let nick, let file, _):
+            // Quick-wins batch item 5 (ignore): a `.sound` renders no strip
+            // panel at all (audio-only — no `bridge.apply` above either), so
+            // its only "render" effect IS this playback callback; skipping it
+            // for an ignored nick is this event kind's equivalent of the
+            // `.text`/`.action`/`.whisper` strip-routing guards above. The
+            // transcript append already happened unconditionally (the log
+            // stays canonical, matching the ignore doctrine).
+            guard !ignoredNicks.contains(ignoreKey(nick)) else { break }
             let cb = onSound
             DispatchQueue.main.async { cb?(nick, file) }
 
@@ -1559,6 +1718,13 @@ public final class ChatSessionModel: @unchecked Sendable {
         // room-scoped, authoritative source whenever it IS populated.
         let announcedAvatarNames = bridge?.announcedAvatarNames ?? [:]
         let ownCharacterName = config.characterName
+        // Quick-wins batch item 5: snapshotted here, on the engine queue
+        // (same posture as `announcedAvatarNames`/`ownCharacterName` above —
+        // the detached `Task` below must not touch engine-queue state
+        // itself), so `MemberRow.isIgnored` can be derived without a second
+        // `engineQueue.sync` round-trip from inside that `Task`.
+        let ignoredSnapshot = ignoredNicks
+        let foldIgnore = { (nick: String) in ignoredSnapshot.contains(nick.lowercased()) }
         Task { [session, onMembers, onSelfOp] in
             // Only the ACTIVE room's membership drives the one sidebar — a
             // background room's churn updates `session.room(room)` (read on
@@ -1575,7 +1741,8 @@ public final class ChatSessionModel: @unchecked Sendable {
                         avatarName = announcedAvatarNames[member.nick] ?? ""
                     }
                 }
-                return MemberRow(nick: member.nick, isOp: member.isOp, avatarName: avatarName)
+                return MemberRow(nick: member.nick, isOp: member.isOp, avatarName: avatarName,
+                                 isAway: member.isAway, isIgnored: foldIgnore(member.nick))
             }
             let selfIsOp = members[ownNick]?.isOp == true
             DispatchQueue.main.async {
@@ -1596,7 +1763,8 @@ public final class ChatSessionModel: @unchecked Sendable {
     private func roomInfosLocked() -> [RoomInfo] {
         roomOrder.compactMap { key in
             guard let box = rooms[key] else { return nil }
-            return RoomInfo(name: box.displayName, unread: box.unread, isActive: key == activeRoom)
+            return RoomInfo(name: box.displayName, unread: box.unread, isActive: key == activeRoom,
+                            topic: box.topic)
         }
     }
 
@@ -1902,6 +2070,15 @@ public final class ChatSessionModel: @unchecked Sendable {
         try await session.invite(channel, nick: nick)
     }
 
+    /// Quick-wins batch item 6 (Room menu's "Set Topic…"): thin pass-through
+    /// over `ProtocolSession.setTopic` — the server's `.topicChanged` confirm
+    /// is what actually updates `RoomBox.topic` (`handleLocked`'s case above),
+    /// not this call directly, matching every other room-op's "fire the wire
+    /// command, the event confirms it" shape on this type.
+    public func setTopic(_ channel: String, topic: String) async throws {
+        try await session.setTopic(channel, topic: topic)
+    }
+
     public func ban(_ channel: String, pattern: String, banning: Bool) async throws {
         try await session.ban(channel, pattern: pattern, banning: banning)
     }
@@ -2139,24 +2316,75 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// not per-strip), `setPanelGeometry` with the new geometry, re-add the
     /// backdrop and self participant, build a fresh bridge, re-`apply` the
     /// ENTIRE transcript in order, then recompose.
+    /// Quick-wins batch item 3: when `config.panelsPerRow > 0`, `setViewport`
+    /// uses it as `columns` directly instead of `PanelFit`'s auto-fit scan —
+    /// this closure recomputes `columns`/`unit` from the CURRENT
+    /// `config.panelsPerRow` each time it runs (rather than capturing a value
+    /// at call time), matching `setPanelsPerRow`'s own doc comment: a live
+    /// setting change re-runs exactly this geometry derivation at the
+    /// CURRENT width, so the two entry points (a real resize vs. a settings
+    /// change) share one source of truth for "what geometry follows from the
+    /// current width + override".
     public func setViewport(widthPoints: CGFloat, scale: CGFloat) {
-        let viewportTwips = Int32((widthPoints * 20).rounded())
-        let columns = PanelFit.columns(forViewportWidthTwips: viewportTwips)
-        let unit = PanelFit.unitPanelTwips(viewportWidthTwips: viewportTwips, columns: columns)
-
         engineQueue.async { [weak self] in
             guard let self, !self.isShutDown else { return }
-            self.currentScale = scale
-            if self.didSetViewport, columns == self.currentColumns, unit == self.currentUnitTwips {
-                self.recomposeLocked()
-                return
-            }
-            self.didSetViewport = true
-            self.currentColumns = columns
-            self.currentUnitTwips = unit
-            // Reflow the ACTIVE room (Plan 4b Task 7): a viewport change only
-            // affects the one live strip, which the active room owns.
-            self.rebuildStripLocked(for: self.activeRoom, resetAnnounce: true)
+            self.lastViewportWidthPoints = widthPoints
+            self.applyViewportLocked(widthPoints: widthPoints, scale: scale)
+        }
+    }
+
+    /// ENGINE QUEUE ONLY. The shared geometry-derive-then-reflow-if-changed
+    /// body `setViewport`/`setPanelsPerRow` both drive — factored out
+    /// (quick-wins batch item 3) so a live panels-per-row change re-runs
+    /// EXACTLY this logic rather than a hand-duplicated copy that could drift.
+    /// When `config.panelsPerRow > 0`, it is used as `columns` directly
+    /// instead of `PanelFit`'s auto-fit scan (unit width is still derived from
+    /// the viewport via `PanelFit.unitPanelTwips(viewportWidthTwips:columns:)`,
+    /// just fed this forced column count).
+    private func applyViewportLocked(widthPoints: CGFloat, scale: CGFloat) {
+        let viewportTwips = Int32((widthPoints * 20).rounded())
+        let columns = config.panelsPerRow > 0
+            ? Int32(config.panelsPerRow)
+            : PanelFit.columns(forViewportWidthTwips: viewportTwips)
+        let unit = PanelFit.unitPanelTwips(viewportWidthTwips: viewportTwips, columns: columns)
+        currentScale = scale
+        if didSetViewport, columns == currentColumns, unit == currentUnitTwips {
+            recomposeLocked()
+            return
+        }
+        didSetViewport = true
+        currentColumns = columns
+        currentUnitTwips = unit
+        // Reflow the ACTIVE room (Plan 4b Task 7): a viewport change only
+        // affects the one live strip, which the active room owns.
+        rebuildStripLocked(for: activeRoom, resetAnnounce: true)
+    }
+
+    /// The last width `setViewport` was called with (points), engine-queue-
+    /// owned — `setPanelsPerRow` replays a geometry recompute at THIS width
+    /// (a settings change carries no width of its own; the last real viewport
+    /// call is the only width this model knows). `0` until the first
+    /// `setViewport` call (matches `didSetViewport`'s own "nothing to redo
+    /// yet" gate below).
+    private var lastViewportWidthPoints: CGFloat = 0
+
+    /// Quick-wins batch item 3 (live change, Task 3's "AppState observes the
+    /// setting change… update config… re-run the setViewport logic" plumbing):
+    /// updates `config.panelsPerRow` and, if a viewport has already been
+    /// established, immediately re-derives columns/unit at the LAST KNOWN
+    /// width via `applyViewportLocked` and reflows if the geometry actually
+    /// changed — same "no-op if unchanged, else full reflow" shape
+    /// `setViewport` itself has, since both now call the identical helper. A
+    /// no-op before any `setViewport` has run (`didSetViewport == false` —
+    /// there is no live strip/width yet for a settings change to affect; the
+    /// NEW override still takes effect on the next real `setViewport` call,
+    /// e.g. the window's own layout pass).
+    public func setPanelsPerRow(_ perRow: Int) {
+        engineQueue.async { [weak self] in
+            guard let self, !self.isShutDown else { return }
+            self.config.panelsPerRow = perRow
+            guard self.didSetViewport, self.lastViewportWidthPoints > 0 else { return }
+            self.applyViewportLocked(widthPoints: self.lastViewportWidthPoints, scale: self.currentScale)
         }
     }
 
@@ -2194,9 +2422,40 @@ public final class ChatSessionModel: @unchecked Sendable {
         guard (try? setUpStripLocked(isReflow: true)) != nil else { return }
         guard bridge != nil else { return }
         for ev in rooms[room]?.transcript ?? [] {
+            // Quick-wins batch item 5 (ignore doctrine, `ignoredNicks`'s own
+            // doc comment): a reflow re-derives the ENTIRE strip from the
+            // transcript from scratch, so the SAME ignore guard `handleLocked`
+            // applies live (`.text`/`.action`/`.whisper`/`.sound`) must also
+            // apply HERE — otherwise an ignored nick's already-transcript-
+            // recorded lines would resurrect on the very next viewport
+            // resize/tab switch, since replay has no memory of what live
+            // rendering chose to skip. `.sound` needs no entry here (it was
+            // never applied to the strip in the first place — audio-only,
+            // no bridge.apply either live or replayed).
+            if isEventFromIgnoredNickLocked(ev) { continue }
             applyToBridgeLocked(ev)
         }
         recomposeLocked()
+    }
+
+    /// ENGINE QUEUE ONLY. Whether `ev` is one of the ignore-filterable strip
+    /// events (`.text`/`.action`/`.whisper`) authored by a currently-ignored
+    /// nick — the shared predicate `rebuildStripLocked`'s replay loop uses so
+    /// it can't drift from `handleLocked`'s own per-case guards above (both
+    /// apply sites must agree, per `ignoredNicks`'s doc comment). Any other
+    /// event kind (joins/parts/`.appearsAs`/etc.) is never filtered by
+    /// ignore — only the three message-shaped kinds carry an "author" whose
+    /// ambient chatter ignore is meant to declutter.
+    private func isEventFromIgnoredNickLocked(_ ev: ProtocolEvent) -> Bool {
+        let authorNick: String?
+        switch ev {
+        case .text(let nick, _, _, _, _, _): authorNick = nick
+        case .action(let nick, _, _): authorNick = nick
+        case .whisper(let nick, _, _, _): authorNick = nick
+        default: authorNick = nil
+        }
+        guard let authorNick else { return false }
+        return ignoredNicks.contains(ignoreKey(authorNick))
     }
 
     // MARK: - room management (Plan 4b Task 7)

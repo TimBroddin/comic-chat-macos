@@ -60,6 +60,15 @@ public final class AppState {
     public var comicMode = true {
         didSet { settings.comicMode = comicMode }
     }
+    /// Quick-wins batch item 2 (the original's double-click-opens-Options-at-
+    /// the-character-page gesture, bodycam.cpp:351): which `SettingsScene` tab
+    /// is preselected the next time Settings opens. Bound to the
+    /// `TabView`'s `selection:` in `SettingsScene` — `PosePreviewPane`'s
+    /// double-click gesture (and the Member/View menu's "Choose Character…"
+    /// item, `AppCommands`) sets this to `.characters` BEFORE calling
+    /// `openSettings()`, so the sheet lands directly on the character page
+    /// rather than whatever tab was last showing.
+    public var settingsTab: SettingsTab = .persona
     /// Plan 4b Task 8: widened from `[String]` to `[MemberRow]` (nick/isOp/
     /// avatarName), mirrored from `ChatSessionModel.onMembers` on the main
     /// thread — `ChatWindow`'s member `List` reads this directly.
@@ -87,13 +96,15 @@ public final class AppState {
 
     // MARK: Rooms (Plan 4b Task 7: true multi-room)
 
-    /// The joined rooms in tab order, mirrored from
-    /// `ChatSessionModel.onRoomsChanged` on the main thread — `RoomTabBar`'s
-    /// data source (tab name + unread badge + active flag).
+    /// The joined rooms in join order, mirrored from
+    /// `ChatSessionModel.onRoomsChanged` on the main thread — `RoomSidebar`'s
+    /// data source (quick-wins batch item 1: name/topic/unread badge/active
+    /// flag; the sidebar replaced the original tab bar this mirror was built
+    /// for, but the mirror itself is unchanged).
     public var rooms: [RoomInfo] = []
-    /// The active room's name (the tab currently owning the one live strip),
+    /// The active room's name (the room currently owning the one live strip),
     /// or `nil` before connect. Derived from `rooms` (the active one), kept as
-    /// a convenience for the tab bar's selection binding.
+    /// a convenience for `RoomSidebar`'s selection binding.
     public var activeRoom: String? { rooms.first { $0.isActive }?.name }
     /// The active room name as of the LAST `onRoomsChanged` delivery (Fix
     /// round 1, review Important #1) — lets `handleRoomsChanged` detect when
@@ -101,12 +112,18 @@ public final class AppState {
     /// e.g. an unread-count bump) so it clears `selectedMembers` exactly
     /// once per real switch, not on every snapshot.
     private var lastKnownActiveRoom: String?
-    /// Bound to the Enter Room sheet's text field (⌘J / RoomTabBar "+").
+    /// Bound to the Enter Room sheet's text field (⌘J / `RoomSidebar`'s "+").
     public var showEnterRoomSheet = false
     public var enterRoomText = ""
     /// Bound to the Create Room… sheet's text field (Room menu, Plan 4b Task 8).
     public var showCreateRoomSheet = false
     public var createRoomText = ""
+    /// Bound to the Set Topic… sheet's text field (quick-wins batch item 6,
+    /// Room menu). Seeded from the active room's CURRENT topic when the sheet
+    /// opens (`setTopic`'s call site in `AppCommands`), so editing starts from
+    /// what's already there rather than a blank field.
+    public var showSetTopicSheet = false
+    public var setTopicText = ""
     /// The self avatar's live pose preview (Plan 4b Task 3) — updated after
     /// every emotion-wheel drag or typing-preview via `ChatSessionModel.onSelfPose`.
     public var selfPoseImage: CGImage?
@@ -410,6 +427,17 @@ public final class AppState {
         }
     }
 
+    /// Sets the ACTIVE room's topic (quick-wins batch item 6, Room menu's
+    /// "Set Topic…") — fires the wire TOPIC command; `RoomInfo.topic` (the
+    /// sidebar's subtitle) updates once the server's `.topicChanged` confirm
+    /// comes back (`ChatSessionModel.handleLocked`'s own case), not from this
+    /// call directly, matching every other room-op's "fire and let the event
+    /// confirm it" shape.
+    public func setTopic(_ topic: String) {
+        guard let model, let room = activeRoom else { return }
+        Task { try? await model.setTopic(room, topic: topic) }
+    }
+
     /// Toggles the session-scoped Away state (Plan 4b Task 8: the Room menu's
     /// Away toggle) — optimistic local flip (see `isAway`'s doc comment).
     public func toggleAway() {
@@ -637,8 +665,8 @@ public final class AppState {
     }
 
     /// Joins an ADDITIONAL room on the same connection (Plan 4b Task 7) — the
-    /// Enter Room sheet / ⌘J / RoomTabBar "+". Normalizes a bare name to a
-    /// channel (`#`-prefixed) the way the connect sheet's room field does.
+    /// Enter Room sheet / ⌘J / `RoomSidebar`'s "+". Normalizes a bare name to
+    /// a channel (`#`-prefixed) the way the connect sheet's room field does.
     public func joinRoom(_ raw: String) {
         guard let channel = normalizedChannel(raw), let model else { return }
         Task { try? await model.joinRoom(channel) }
@@ -706,7 +734,13 @@ public final class AppState {
                              acceptWhispers: settings.acceptWhispers,
                              // Plan 4b Task 6: gates the .appearsAs-triggered
                              // avatar auto-download.
-                             autoDownloadAvatars: settings.autoDownloadAvatars)
+                             autoDownloadAvatars: settings.autoDownloadAvatars,
+                             // Quick-wins batch item 3 (original UnitsWide):
+                             // seeds the session with whatever override was
+                             // last persisted; a live Settings change after
+                             // connect goes through `setPanelsPerRow` instead
+                             // (`ComicSettingsView`'s binding), not this seed.
+                             panelsPerRow: settings.panelsPerRow)
 
         // Offline demo hook (Task 12): `--replay-fixture <path>` starts a
         // FixtureReplayServer over the given capture-shaped .jsonl and
@@ -822,6 +856,8 @@ public final class AppState {
         enterRoomText = ""
         showCreateRoomSheet = false
         createRoomText = ""
+        showSetTopicSheet = false
+        setTopicText = ""
         roomList = []
         selfIsOp = false
         isAway = false
@@ -876,4 +912,17 @@ public final class AppState {
             serverMessages.removeFirst(serverMessages.count - serverMessagesCap)
         }
     }
+}
+
+/// The `SettingsScene`'s tab identity (quick-wins batch item 2) — one case
+/// per `SettingsScene` `TabView` page, in the same order they're declared
+/// there. `AppState.settingsTab`'s type; `Hashable` so it can back a
+/// `TabView(selection:)` binding.
+public enum SettingsTab: Hashable {
+    case persona
+    case characters
+    case backdrop
+    case comic
+    case sounds
+    case advanced
 }

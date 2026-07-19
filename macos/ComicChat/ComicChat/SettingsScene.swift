@@ -22,21 +22,36 @@ struct SettingsScene: View {
     @Environment(AppState.self) private var appState
 
     var body: some View {
-        TabView {
+        @Bindable var state = appState
+        // Quick-wins batch item 2 (the original's double-click-opens-Options-
+        // at-the-character-page gesture, bodycam.cpp:351): `selection:` bound
+        // to `AppState.settingsTab` so `PosePreviewPane`'s double-click gesture
+        // (and the Member/View menu's "Choose Character…" item) can preselect
+        // the Character tab BEFORE calling `openSettings()`.
+        TabView(selection: $state.settingsTab) {
             PersonaSettingsView()
                 .tabItem { Label("Persona", systemImage: "person.crop.circle") }
+                .tag(SettingsTab.persona)
 
             CharacterPickerView()
                 .tabItem { Label("Character", systemImage: "theatermasks") }
+                .tag(SettingsTab.characters)
 
             BackdropPickerView()
                 .tabItem { Label("Backdrop", systemImage: "photo.on.rectangle") }
+                .tag(SettingsTab.backdrop)
+
+            ComicSettingsView()
+                .tabItem { Label("Comic", systemImage: "square.grid.2x2") }
+                .tag(SettingsTab.comic)
 
             SoundsSettingsView()
                 .tabItem { Label("Sounds", systemImage: "speaker.wave.2") }
+                .tag(SettingsTab.sounds)
 
             AdvancedSettingsView()
                 .tabItem { Label("Advanced", systemImage: "gearshape.2") }
+                .tag(SettingsTab.advanced)
         }
         .frame(minWidth: 420, minHeight: 340)
     }
@@ -70,6 +85,47 @@ private struct PersonaSettingsView: View {
         Binding(
             get: { appState.settings[keyPath: keyPath] },
             set: { appState.settings[keyPath: keyPath] = $0 }
+        )
+    }
+}
+
+/// Comic tab (quick-wins batch item 3, original `UnitsWide`): a Picker for
+/// `SettingsStore.panelsPerRow` — Automatic (0) or a forced 1...5 column count
+/// (`PanelFit`'s own `FitPanelsWide` cap, `PanelFit.columns`'s `1...5` scan
+/// range). Live change: writes through `appState.settings.panelsPerRow`
+/// (persisted) AND, when a session is already live, calls
+/// `ChatSessionModel.setPanelsPerRow` for an immediate reflow — the same
+/// "persist + live-apply if connected" shape `CharacterPickerView.select`
+/// already uses for `changeCharacter`.
+///
+/// NOTE (out of THIS batch's scope, per the brief): the comic FONT setting
+/// needs a new engine entry point that doesn't exist yet — ticketed
+/// separately, not attempted here.
+private struct ComicSettingsView: View {
+    @Environment(AppState.self) private var appState
+
+    var body: some View {
+        Form {
+            Picker("Panels Per Row", selection: panelsPerRowBinding) {
+                Text("Automatic").tag(0)
+                Text("1").tag(1)
+                Text("2").tag(2)
+                Text("3").tag(3)
+                Text("4").tag(4)
+                Text("5").tag(5)
+            }
+        }
+        .padding()
+        .frame(minWidth: 360, minHeight: 280)
+    }
+
+    private var panelsPerRowBinding: Binding<Int> {
+        Binding(
+            get: { appState.settings.panelsPerRow },
+            set: { newValue in
+                appState.settings.panelsPerRow = newValue
+                appState.model?.setPanelsPerRow(newValue)
+            }
         )
     }
 }

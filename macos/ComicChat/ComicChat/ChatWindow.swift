@@ -5,6 +5,23 @@ import ComicChatKit
 /// comic strip + compose bar + status line on the left, member sidebar on
 /// the right. Replaces `ContentRoot` as the app's root view.
 ///
+/// Quick-wins batch item 1 (the user's explicit ask: "a macOS sidebar instead
+/// of tabs"): the root is now a `NavigationSplitView` — a native rooms
+/// SIDEBAR (`RoomSidebar`, replacing the retired `RoomTabBar.swift`) as the
+/// split view's own sidebar column, with the ORIGINAL two-pane layout (strip+
+/// compose+status | member grid+pose+wheel) as its `detail`. The sidebar is
+/// collapsible for free via the standard toolbar toggle `NavigationSplitView`
+/// already supplies. PRESERVED from the tab-bar era: active-room semantics
+/// (`RoomSidebar`'s selection binding drives `appState.setActiveRoom`, same
+/// call the old tab tap made), unread clearing on activation (unchanged —
+/// `ChatSessionModel.setActiveRoom` zeroes the newly-active room's unread
+/// itself, upstream of any UI), the `handleRoomsChanged` selection-clear
+/// chokepoint (untouched — this view only ever calls `setActiveRoom`, the
+/// same entry point the tab bar called), and the `--replay-fixture`
+/// single-room path (the sidebar always renders, even with exactly one room —
+/// matching the retired tab bar's own "always renders the single tab"
+/// posture, so the fixture demo still shows a consistent affordance).
+///
 /// `ComicStripView` construction (review correction to this task's brief):
 /// `ComicStripView` takes plain `let image`/`sizePoints`/`model` — it does
 /// NOT read `AppState` via `@Environment` (see that type's own doc comment:
@@ -20,68 +37,66 @@ struct ChatWindow: View {
 
     var body: some View {
         @Bindable var state = appState
-        HSplitView {
-            VStack(spacing: 0) {
-                // Plan 4b Task 7: the room tab bar sits above the one live
-                // strip — tabs with unread badges + close, a "+" to enter a
-                // room. Only shown once connected (there's at least one room).
-                if !appState.rooms.isEmpty {
-                    RoomTabBar()
+        NavigationSplitView {
+            RoomSidebar()
+        } detail: {
+            HSplitView {
+                VStack(spacing: 0) {
+                    // Plan 4b Task 11: the View menu ("Comic Strip view ⌘1" /
+                    // "Plain Text view ⌘2", `AppCommands`) swaps this for
+                    // `TranscriptTextView` — same event log, two renderings, one
+                    // shown at a time (never both).
+                    if appState.comicMode {
+                        ComicStripView(image: appState.stripImage,
+                                        sizePoints: appState.stripSizePoints,
+                                        model: appState.model)
+                    } else {
+                        TranscriptTextView(attributedText: appState.transcriptText)
+                    }
                     Divider()
+                    ComposeBar(composeText: $composeText, model: appState.model,
+                              selectedMembers: appState.selectedMembers)
+                    Text(appState.statusLine)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8).padding(.bottom, 4)
                 }
-                // Plan 4b Task 11: the View menu ("Comic Strip view ⌘1" /
-                // "Plain Text view ⌘2", `AppCommands`) swaps this for
-                // `TranscriptTextView` — same event log, two renderings, one
-                // shown at a time (never both).
-                if appState.comicMode {
-                    ComicStripView(image: appState.stripImage,
-                                    sizePoints: appState.stripSizePoints,
-                                    model: appState.model)
-                } else {
-                    TranscriptTextView(attributedText: appState.transcriptText)
-                }
-                Divider()
-                ComposeBar(composeText: $composeText, model: appState.model,
-                          selectedMembers: appState.selectedMembers)
-                Text(appState.statusLine)
-                    .font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 8).padding(.bottom, 4)
-            }
-            // Original layout (chatview.cpp:333-378, the user's screenshot):
-            // the member ICON GRID at the top, the large full-body self-pose
-            // pane in the middle, the COMPACT emotion wheel in a short pane at
-            // the bottom. Parameter-passing contract: this parent body reads
-            // `appState.*`; each child takes plain values.
-            VStack(spacing: 0) {
-                // (1) Member grid — a 2-column icon grid, scrollable. The grid
-                // SELECTION is still the original's canonical talk-to state
-                // (`AppState.selectedMembers` feeds `ComposeBar`'s send as
-                // `addressees`, Plan 4b Task 8 / D1 §1.5): a cell tap toggles
-                // that nick in the set (visible highlight), preserved from the
-                // List's `selection:` semantics.
-                MemberGrid(members: appState.members)
-                Divider()
-                // (2) The large full-body self-pose pane (head + torso
-                // composited by DrawBody, live-fix 7). Plain `CGImage?` value.
-                PosePreviewPane(poseImage: appState.selfPoseImage)
-                    .frame(maxHeight: .infinity)
+                // Original layout (chatview.cpp:333-378, the user's screenshot):
+                // the member ICON GRID at the top, the large full-body self-pose
+                // pane in the middle, the COMPACT emotion wheel in a short pane at
+                // the bottom. Parameter-passing contract: this parent body reads
+                // `appState.*`; each child takes plain values.
+                VStack(spacing: 0) {
+                    // (1) Member grid — a 2-column icon grid, scrollable. The grid
+                    // SELECTION is still the original's canonical talk-to state
+                    // (`AppState.selectedMembers` feeds `ComposeBar`'s send as
+                    // `addressees`, Plan 4b Task 8 / D1 §1.5): a cell tap toggles
+                    // that nick in the set (visible highlight), preserved from the
+                    // List's `selection:` semantics.
+                    MemberGrid(members: appState.members)
+                    Divider()
+                    // (2) The large full-body self-pose pane (head + torso
+                    // composited by DrawBody, live-fix 7). Plain `CGImage?` value.
+                    PosePreviewPane(poseImage: appState.selfPoseImage)
+                        .frame(maxHeight: .infinity)
+                        .padding(8)
+                    Divider()
+                    // (3) The compact emotion wheel, in a short fixed-height pane
+                    // (~1/4 the column, matching the original's compact bulls-eye
+                    // pane). Wheel-only now — the pose moved up to (2).
+                    BodyCamView(onEmotion: { angle, intensity in
+                        appState.model?.setEmotion(angle: angle, intensity: intensity)
+                    })
+                    .frame(height: 140)
                     .padding(8)
-                Divider()
-                // (3) The compact emotion wheel, in a short fixed-height pane
-                // (~1/4 the column, matching the original's compact bulls-eye
-                // pane). Wheel-only now — the pose moved up to (2).
-                BodyCamView(onEmotion: { angle, intensity in
-                    appState.model?.setEmotion(angle: angle, intensity: intensity)
-                })
-                .frame(height: 140)
-                .padding(8)
+                }
+                .frame(minWidth: 180, maxWidth: 240)
             }
-            .frame(minWidth: 180, maxWidth: 240)
         }
         .frame(minWidth: 640, minHeight: 480)
         .sheet(isPresented: $state.showConnectSheet) { ConnectSheet() }
         .sheet(isPresented: $state.showCreateRoomSheet) { CreateRoomSheet() }
+        .sheet(isPresented: $state.showSetTopicSheet) { SetTopicSheet() }
         .popover(item: userInfoBinding) { info in
             VStack(alignment: .leading, spacing: 8) {
                 Text(info.nick).font(.headline)
@@ -234,6 +249,16 @@ private struct MemberGrid: View {
                             }
                             Button("Get Info…") { appState.getInfo(row.nick) }
                             Divider()
+                            // Quick-wins batch item 5 (original per-member
+                            // ignore, CUserInfo m_bIgnored): toggles the
+                            // engine-queue-owned `ignoredNicks` set — the
+                            // model itself handles the live reflow (both apply
+                            // sites, per that property's doctrine comment);
+                            // this menu item only flips the flag.
+                            Button(row.isIgnored ? "Unignore" : "Ignore") {
+                                appState.model?.setIgnored(row.nick, !row.isIgnored)
+                            }
+                            Divider()
                             Button("Kick…") { appState.kick(row.nick) }
                                 .disabled(!appState.selfIsOp)
                             Button("Ban…") { appState.ban("\(row.nick)!*@*") }
@@ -293,6 +318,31 @@ private struct MemberGridCell: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                         .frame(width: 40, height: 40)
                 }
+                // Quick-wins batch item 4: away badge (mirrors
+                // `ProtocolSession.RoomMember.isAway`, set from an inbound
+                // `.awayPeer` event — display-only, see `MemberRow.isAway`'s
+                // doc comment for how "live" this actually is: there is no
+                // wire event that ever clears it back to false within this
+                // port's event surface).
+                if row.isAway {
+                    Image(systemName: "moon.zzz.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .help("Away")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                        .frame(width: 40, height: 40)
+                }
+                // Quick-wins batch item 5 (original CUserInfo m_bIgnored): a
+                // slashed-eye badge on ignored cells — display-only; the
+                // actual filtering happens engine-side.
+                if row.isIgnored {
+                    Image(systemName: "eye.slash.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .help("Ignored")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                        .frame(width: 40, height: 40)
+                }
             }
             Text("@\(row.nick)")
                 .font(.caption)
@@ -310,9 +360,118 @@ private struct MemberGridCell: View {
     }
 }
 
+/// The rooms SIDEBAR (quick-wins batch item 1, replacing the retired
+/// `RoomTabBar`): a native `List` of joined rooms — SF Symbol `number` +
+/// the room's display name + the topic (if any) as a secondary, truncated
+/// subtitle line, with an unread-count `.badge()`. Selection is bound to the
+/// active room (`AppState.activeRoom`/`setActiveRoom`, the exact same
+/// chokepoint the old tab tap drove — `handleRoomsChanged`'s
+/// selection-clear posture is entirely unaffected by this view swap). A
+/// context menu per row offers "Leave Room"; a toolbar "+" button opens the
+/// existing Enter Room… sheet (the tab bar's "+" twin, unchanged sheet type).
+///
+/// Always renders (even for exactly one room, e.g. the `--replay-fixture`
+/// path) — matching the retired tab bar's own "always renders the single
+/// tab" posture, so the sidebar stays a consistent affordance rather than
+/// popping in/out as rooms are joined/left.
+struct RoomSidebar: View {
+    @Environment(AppState.self) private var appState
+
+    var body: some View {
+        @Bindable var state = appState
+        List(appState.rooms, selection: activeRoomBinding) { room in
+            VStack(alignment: .leading, spacing: 2) {
+                Label(room.name, systemImage: "number")
+                if !room.topic.isEmpty {
+                    Text(room.topic)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .badge(room.unread)
+            .tag(room.name)
+            .contextMenu {
+                Button("Leave Room") { appState.leaveRoom(room.name) }
+            }
+        }
+        .navigationSplitViewColumnWidth(min: 160, ideal: 200)
+        .toolbar {
+            ToolbarItem {
+                Button {
+                    appState.enterRoomText = ""
+                    appState.showEnterRoomSheet = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .help("Enter Room… (⌘J)")
+            }
+        }
+        .sheet(isPresented: $state.showEnterRoomSheet) {
+            EnterRoomSheet()
+        }
+    }
+
+    /// A `Binding<String?>` over the active room's NAME, driving
+    /// `AppState.setActiveRoom` on selection — the sidebar's twin of the
+    /// retired tab bar's `onSelect: { appState.setActiveRoom(room.name) }`.
+    /// Setting `nil` (a `List` selection can clear, e.g. via ⌘-click-to-
+    /// deselect) is a no-op: there is always exactly one active room while
+    /// any room is joined, and `setActiveRoom` has no "deactivate" mode of
+    /// its own to route a `nil` to.
+    private var activeRoomBinding: Binding<String?> {
+        Binding(
+            get: { appState.activeRoom },
+            set: { newValue in
+                guard let newValue else { return }
+                appState.setActiveRoom(newValue)
+            }
+        )
+    }
+}
+
+/// The Enter Room sheet (Plan 4b Task 7, moved here from the retired
+/// `RoomTabBar.swift` — quick-wins batch item 1): a single channel-name field
+/// that joins an ADDITIONAL room on the current connection. Shared by
+/// `RoomSidebar`'s "+" toolbar button and the Room > Enter Room… ⌘J command
+/// (both flip `AppState.showEnterRoomSheet`).
+struct EnterRoomSheet: View {
+    @Environment(AppState.self) private var appState
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        @Bindable var state = appState
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Enter Room")
+                .font(.headline)
+            TextField("Channel (e.g. #comics)", text: $state.enterRoomText)
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 240)
+                .onSubmit(join)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Join") { join() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(appState.enterRoomText.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(20)
+    }
+
+    private func join() {
+        let text = appState.enterRoomText
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        appState.joinRoom(text)
+        dismiss()
+    }
+}
+
 /// The Create Room… sheet (Plan 4b Task 8, Room menu): a single channel-name
 /// field that creates (and goes to) a new room. Mirrors `EnterRoomSheet`'s
-/// shape (`RoomTabBar.swift`).
+/// shape (moved here from the retired `RoomTabBar.swift`).
 struct CreateRoomSheet: View {
     @Environment(AppState.self) private var appState
     @Environment(\.dismiss) private var dismiss
@@ -342,6 +501,42 @@ struct CreateRoomSheet: View {
         let text = appState.createRoomText
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         appState.createRoom(text)
+        dismiss()
+    }
+}
+
+/// The Set Topic… sheet (quick-wins batch item 6, Room menu): an
+/// alert-with-textfield over the ACTIVE room's topic — the createRoom sheet's
+/// same shape (a single text field + Cancel/action buttons), seeded from the
+/// room's CURRENT topic (`AppCommands`' call site sets `setTopicText` before
+/// presenting) rather than starting blank, since editing an existing topic is
+/// the common case.
+struct SetTopicSheet: View {
+    @Environment(AppState.self) private var appState
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        @Bindable var state = appState
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Set Topic")
+                .font(.headline)
+            TextField("Topic", text: $state.setTopicText)
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 280)
+                .onSubmit(setTopic)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Set") { setTopic() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+    }
+
+    private func setTopic() {
+        appState.setTopic(appState.setTopicText)
         dismiss()
     }
 }

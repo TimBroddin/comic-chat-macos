@@ -71,8 +71,21 @@ struct BodyCamView: View {
 /// bordered pane. A plain-value `Image` from `AppState.selfPoseImage` (the
 /// parameter-passing contract: the parent reads `appState`, this child takes
 /// the plain `CGImage?`). Shows nothing until a self pose has been emitted.
+///
+/// Quick-wins batch item 2 (the original's own gesture, bodycam.cpp:351:
+/// double-click opens Options at the character page): a double-click here
+/// opens `SettingsScene` preselected to the Character tab. This DOES read
+/// `AppState`/`openSettings` via `@Environment` (unlike the plain `poseImage`
+/// rendering parameter above) — the parameter-passing contract's "read
+/// `appState` in the parent, pass plain values down" rule exists specifically
+/// for `ComicStripView`'s `NSViewRepresentable` (`updateNSView` has no
+/// documented guarantee it re-runs on an `@Observable` read INSIDE it); a
+/// gesture handler has no such constraint, since it's not part of `body`'s
+/// rendering path at all.
 struct PosePreviewPane: View {
     var poseImage: CGImage?
+    @Environment(AppState.self) private var appState
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         ZStack {
@@ -91,5 +104,10 @@ struct PosePreviewPane: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            appState.settingsTab = .characters
+            openSettings()
+        }
     }
 }

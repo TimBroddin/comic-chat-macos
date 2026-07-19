@@ -84,6 +84,22 @@ public struct SettingsStore {
         nonmutating set { defaults.set(newValue, forKey: Keys.comicMode) }
     }
 
+    /// Quick-wins batch item 3 (original `UnitsWide`, pageview.cpp): a
+    /// user-forced panels-per-row column count, `0` (default) meaning
+    /// "automatic" — `PanelFit.columns(forViewportWidthTwips:)`'s own
+    /// viewport-fit arithmetic, unchanged. `1...5` matches the original's
+    /// `FitPanelsWide` cap (`PanelFit.columns`'s own `1...5` scan range) —
+    /// forcing a value outside that range would ask `ChatSessionModel
+    /// .setViewport` for a column count `PanelFit.unitPanelTwips` was never
+    /// exercised at, so the Settings Picker only ever writes 0...5 here.
+    public var panelsPerRow: Int {
+        get {
+            guard defaults.object(forKey: Keys.panelsPerRow) != nil else { return 0 }
+            return defaults.integer(forKey: Keys.panelsPerRow)
+        }
+        nonmutating set { defaults.set(newValue, forKey: Keys.panelsPerRow) }
+    }
+
     // MARK: Protocol (Plan 4b Task 5)
 
     /// Gates `ChatSessionModel.send`'s outbound cooked pose annotations: when
@@ -157,6 +173,7 @@ public struct SettingsStore {
         static let realName = "persona.realName"
         static let backdrop = "comic.backdrop"
         static let comicMode = "view.comicMode"
+        static let panelsPerRow = "comic.panelsPerRow"
         static let sendComicsData = "protocol.sendComicsData"
         static let acceptWhispers = "protocol.acceptWhispers"
         static let soundsEnabled = "sounds.enabled"

@@ -11,6 +11,7 @@ import AppKit
 struct AppCommands: Commands {
     var appState: AppState
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -102,6 +103,15 @@ struct AppCommands: Commands {
             }
             .disabled(appState.model == nil)
 
+            // Quick-wins batch item 6: seeds the sheet's text field from the
+            // ACTIVE room's CURRENT topic (`RoomInfo.topic`, already mirrored
+            // model-side from `.topicChanged`) rather than starting blank.
+            Button("Set Topic…") {
+                appState.setTopicText = appState.rooms.first(where: \.isActive)?.topic ?? ""
+                appState.showSetTopicSheet = true
+            }
+            .disabled(appState.model == nil || appState.activeRoom == nil)
+
             Divider()
 
             // Plan 4b Task 8: session-scoped Away toggle.
@@ -130,6 +140,18 @@ struct AppCommands: Commands {
                 openWindow(id: "whispers")
             }
             .disabled(appState.model == nil)
+
+            Divider()
+
+            // Quick-wins batch item 2 (the original's own gesture,
+            // bodycam.cpp:351: double-click the pose pane opens Options at
+            // the character page): a menu-driven twin of that gesture, for
+            // discoverability — same `settingsTab` preselect + `openSettings()`
+            // call `PosePreviewPane`'s double-click makes.
+            Button("Choose Character…") {
+                appState.settingsTab = .characters
+                openSettings()
+            }
         }
 
         // Live-fix 4 (Tim's request: "show the MOTD like the original
