@@ -41,34 +41,40 @@ private final class ImagesBox: @unchecked Sendable {
     }
 }
 
-/// Thread-safe accumulator for `onMembers`'s captured `[String]` (same
-/// lock-guarded-box shape as `ImagesBox` above — `onMembers` is also a
-/// `@Sendable` closure called on the main thread via `DispatchQueue.main.async`,
-/// while the test body reads it from its own task). Keeps the FULL history of
-/// delivered snapshots (not just the latest), in delivery order, so a test
-/// can assert on which snapshot arrived LAST — `emitMembers`'s detached-`Task`
-/// pattern means a slow earlier snapshot can be delivered after a later one,
-/// and only the history captures whether that actually happened.
+/// Thread-safe accumulator for `onMembers`'s captured `[MemberRow]` (Plan 4b
+/// Task 8: widened from `[String]` — same lock-guarded-box shape as
+/// `ImagesBox` above — `onMembers` is also a `@Sendable` closure called on the
+/// main thread via `DispatchQueue.main.async`, while the test body reads it
+/// from its own task). Keeps the FULL history of delivered snapshots (not
+/// just the latest), in delivery order, so a test can assert on which
+/// snapshot arrived LAST — `emitMembers`'s detached-`Task` pattern means a
+/// slow earlier snapshot can be delivered after a later one, and only the
+/// history captures whether that actually happened. `get()`/`history()`
+/// expose the NICK lists (`[String]`/`[[String]]`) — every existing assertion
+/// at this file's call sites only ever cared about nick membership/ordering,
+/// never `isOp`/`avatarName`, so projecting to nicks here preserves those
+/// assertions' exact strength while keeping `set(_:)` itself typed against
+/// the real `onMembers` payload.
 private final class MembersBox: @unchecked Sendable {
     private let lock = NSLock()
-    private var storage: [String] = []
-    private var deliveryHistory: [[String]] = []
+    private var storage: [MemberRow] = []
+    private var deliveryHistory: [[MemberRow]] = []
 
-    func set(_ nicks: [String]) {
+    func set(_ rows: [MemberRow]) {
         lock.lock(); defer { lock.unlock() }
-        storage = nicks
-        deliveryHistory.append(nicks)
+        storage = rows
+        deliveryHistory.append(rows)
     }
 
     func get() -> [String] {
         lock.lock(); defer { lock.unlock() }
-        return storage
+        return storage.map(\.nick)
     }
 
-    /// Every snapshot delivered so far, in delivery order.
+    /// Every snapshot delivered so far, in delivery order (nick lists).
     func history() -> [[String]] {
         lock.lock(); defer { lock.unlock() }
-        return deliveryHistory
+        return deliveryHistory.map { $0.map(\.nick) }
     }
 }
 
@@ -126,7 +132,7 @@ extension EngineGlobalStateSelfTests {
             let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
                                                        nick: "Mac", room: "#p4", artDir: art))
             let members = MembersBox()
-            model.onMembers = { nicks in members.set(nicks) }
+            model.onMembers = { rows in members.set(rows) }
             try await model.start()
             try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
             // a peer joins mid-session
@@ -328,7 +334,7 @@ extension EngineGlobalStateSelfTests {
             let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
                                                        nick: "Mac", room: "#p4", artDir: art))
             let members = MembersBox()
-            model.onMembers = { nicks in members.set(nicks) }
+            model.onMembers = { rows in members.set(rows) }
             try await model.start()
             try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
 

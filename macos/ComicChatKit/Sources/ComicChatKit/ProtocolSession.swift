@@ -670,6 +670,87 @@ public final class ProtocolSession: @unchecked Sendable {
         }
     }
 
+    // MARK: Room ops (Plan 4b Task 8) — mirrors `setTopic`'s exact shape:
+    // `onQueueGated` + `roomTokenFor` + `withEncodedCString`/`withOptionalEncodedCString`
+    // for user text. `setAway` is the one exception — session-scoped, no room
+    // token (`cc_session_away`'s signature carries none, comicchat.h:586).
+
+    /// Creates (and, per the engine's `cc_session_create_room` -> JOIN
+    /// semantics, joins) `channel` with optional creation modes/max-users/key.
+    public func createRoom(_ channel: String, modes: String? = nil, maxUsers: UInt32 = 0, key: String? = nil) async throws {
+        try await onQueueGated { s in
+            let rc = channel.withCString { chanPtr in
+                self.withOptionalEncodedCString(modes) { modesPtr in
+                    self.withOptionalEncodedCString(key) { keyPtr in
+                        cc_session_create_room(s, chanPtr, modesPtr, maxUsers, keyPtr)
+                    }
+                }
+            }
+            guard rc == 0 else { throw ProtocolSessionError.commandFailed("createRoom(\(channel)) failed") }
+        }
+    }
+
+    public func kick(_ channel: String, nick: String, reason: String? = nil) async throws {
+        try await onQueueGated { s in
+            guard let token = self.roomTokenFor(channel) else {
+                throw ProtocolSessionError.commandFailed("kick: unknown channel \(channel)")
+            }
+            let rc = self.withEncodedCString(nick) { nickPtr in
+                self.withOptionalEncodedCString(reason) { reasonPtr in
+                    cc_session_kick(s, token, nickPtr, reasonPtr)
+                }
+            }
+            guard rc == 0 else { throw ProtocolSessionError.commandFailed("kick failed") }
+        }
+    }
+
+    public func invite(_ channel: String, nick: String) async throws {
+        try await onQueueGated { s in
+            guard let token = self.roomTokenFor(channel) else {
+                throw ProtocolSessionError.commandFailed("invite: unknown channel \(channel)")
+            }
+            let rc = self.withEncodedCString(nick) { nickPtr in
+                cc_session_invite(s, token, nickPtr)
+            }
+            guard rc == 0 else { throw ProtocolSessionError.commandFailed("invite failed") }
+        }
+    }
+
+    public func ban(_ channel: String, pattern: String, banning: Bool) async throws {
+        try await onQueueGated { s in
+            guard let token = self.roomTokenFor(channel) else {
+                throw ProtocolSessionError.commandFailed("ban: unknown channel \(channel)")
+            }
+            let rc = self.withEncodedCString(pattern) { patternPtr in
+                cc_session_ban(s, token, patternPtr, banning ? 1 : 0)
+            }
+            guard rc == 0 else { throw ProtocolSessionError.commandFailed("ban failed") }
+        }
+    }
+
+    public func setRoomMode(_ channel: String, mode: UInt32, maxUsers: UInt32, password: String? = nil) async throws {
+        try await onQueueGated { s in
+            guard let token = self.roomTokenFor(channel) else {
+                throw ProtocolSessionError.commandFailed("setRoomMode: unknown channel \(channel)")
+            }
+            let rc = self.withOptionalEncodedCString(password) { passwordPtr in
+                cc_session_set_mode(s, token, mode, maxUsers, passwordPtr)
+            }
+            guard rc == 0 else { throw ProtocolSessionError.commandFailed("setRoomMode failed") }
+        }
+    }
+
+    /// Session-scoped (no room token — `cc_session_away`'s signature carries
+    /// none, comicchat.h:586).
+    public func setAway(_ isAway: Bool, message: String? = nil) async throws {
+        try await onQueueGated { s in
+            let rc = self.withOptionalEncodedCString(message) { messagePtr in
+                cc_session_away(s, isAway ? 1 : 0, messagePtr)
+            }
+            guard rc == 0 else { throw ProtocolSessionError.commandFailed("setAway failed") }
+        }
+    }
+
     /// Run `body` on `sessionQueue` with the CX_DISCONNECTED guard applied:
     /// throws `.notConnected` instead of touching `cSession` if the session
     /// isn't in the `.connected` state. `body` runs synchronously on the

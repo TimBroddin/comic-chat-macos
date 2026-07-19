@@ -26,5 +26,12 @@ struct ComicChatApp: App {
         Settings {
             SettingsScene().environment(appState)
         }
+
+        // Plan 4b Task 8: the room list browser (`CRoomList`'s LIST browser,
+        // reborn) — a fixed `id` `Window` scene, same precedent as
+        // "Whispers" above (opened via Room > Room List…).
+        Window("Room List", id: "roomList") {
+            RoomListWindow().environment(appState)
+        }
     }
 }

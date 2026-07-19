@@ -33,7 +33,8 @@ struct ChatWindow: View {
                                 sizePoints: appState.stripSizePoints,
                                 model: appState.model)
                 Divider()
-                ComposeBar(composeText: $composeText, model: appState.model)
+                ComposeBar(composeText: $composeText, model: appState.model,
+                          selectedMembers: appState.selectedMembers)
                 Text(appState.statusLine)
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -41,14 +42,25 @@ struct ChatWindow: View {
             }
             // Original layout (chatview.cpp:333-378): members over bodycam.
             VStack(spacing: 0) {
-                List(appState.members, id: \.self) { nick in
-                    Text(nick)
+                // Plan 4b Task 8 (D1 §1.5): the List's SELECTION is the
+                // original's canonical talk-to state — `AppState.selectedMembers`
+                // feeds `ComposeBar`'s send as `addressees`.
+                List(appState.members, selection: $state.selectedMembers) { row in
+                    MemberRowView(row: row)
+                        .tag(row.nick)
                         .contextMenu {
                             Button("Whisper…") {
-                                appState.showWhisperBox(peer: nick)
+                                appState.showWhisperBox(peer: row.nick)
                                 openWindow(id: "whispers")
                             }
+                            Button("Get Info…") { appState.getInfo(row.nick) }
+                            Divider()
+                            Button("Kick…") { appState.kick(row.nick) }
+                                .disabled(!appState.selfIsOp)
+                            Button("Ban…") { appState.ban("\(row.nick)!*@*") }
+                                .disabled(!appState.selfIsOp)
                         }
+                        .onAppear { appState.resolveMemberIcon(row.avatarName) }
                 }
                 Divider()
                 BodyCamView(poseImage: appState.selfPoseImage,
@@ -60,6 +72,15 @@ struct ChatWindow: View {
         }
         .frame(minWidth: 640, minHeight: 480)
         .sheet(isPresented: $state.showConnectSheet) { ConnectSheet() }
+        .sheet(isPresented: $state.showCreateRoomSheet) { CreateRoomSheet() }
+        .popover(item: userInfoBinding) { info in
+            VStack(alignment: .leading, spacing: 8) {
+                Text(info.nick).font(.headline)
+                Text(info.text).font(.callout).textSelection(.enabled)
+            }
+            .padding(12)
+            .frame(minWidth: 220)
+        }
         .task {
             // Offline demo hook (Task 12): `--replay-fixture <path>` should
             // demo the app with zero interaction — skip the connect sheet
@@ -121,5 +142,88 @@ struct ChatWindow: View {
                 }
             }
         }
+    }
+
+    /// `.popover(item:)`'s binding over `AppState.userInfoResult` — the
+    /// popover shows while non-`nil` and clears it on dismiss.
+    private var userInfoBinding: Binding<UserInfoItem?> {
+        Binding(
+            get: { appState.userInfoResult.map { UserInfoItem(nick: $0.nick, text: $0.text) } },
+            set: { if $0 == nil { appState.userInfoResult = nil } }
+        )
+    }
+}
+
+/// `Identifiable` wrapper so `AppState.userInfoResult`'s plain tuple can back
+/// a `.popover(item:)`.
+private struct UserInfoItem: Identifiable {
+    var id: String { nick }
+    let nick: String
+    let text: String
+}
+
+/// One member-list row (Plan 4b Task 8): an icon thumbnail (resolved via
+/// `AppState.resolveMemberIcon`/`memberIconCache`; unresolved names show no
+/// icon), the nick, and an op badge for room owners/ops.
+private struct MemberRowView: View {
+    @Environment(AppState.self) private var appState
+    let row: MemberRow
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let icon = appState.memberIconCache[row.avatarName] {
+                Image(decorative: icon, scale: 1)
+                    .resizable()
+                    .frame(width: 20, height: 20)
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+            } else {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.secondary.opacity(0.15))
+                    .frame(width: 20, height: 20)
+            }
+            Text(row.nick)
+            if row.isOp {
+                Image(systemName: "star.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.yellow)
+                    .help("Operator")
+            }
+        }
+    }
+}
+
+/// The Create Room… sheet (Plan 4b Task 8, Room menu): a single channel-name
+/// field that creates (and goes to) a new room. Mirrors `EnterRoomSheet`'s
+/// shape (`RoomTabBar.swift`).
+struct CreateRoomSheet: View {
+    @Environment(AppState.self) private var appState
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        @Bindable var state = appState
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Create Room")
+                .font(.headline)
+            TextField("Channel (e.g. #comics)", text: $state.createRoomText)
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 240)
+                .onSubmit(create)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create") { create() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(appState.createRoomText.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(20)
+    }
+
+    private func create() {
+        let text = appState.createRoomText
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        appState.createRoom(text)
+        dismiss()
     }
 }

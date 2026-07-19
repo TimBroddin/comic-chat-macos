@@ -103,6 +103,43 @@ public struct RoomInfo: Sendable, Equatable, Identifiable {
     }
 }
 
+/// One row of a LIST browser (Plan 4b Task 8 — `CRoomList`'s LIST browser,
+/// D1 §1.6/backlog item 5), built from the accumulated `.roomListBegin` ->
+/// `.roomListItem`×N -> `.roomListEnd` sequence. `Identifiable` by `name`
+/// (room names are unique per server) so `RoomListWindow`'s `Table` can key
+/// on it directly, matching `RoomInfo`/`MemberRow`'s own posture.
+public struct RoomListItem: Sendable, Equatable, Identifiable {
+    public var id: String { name }
+    public let name: String
+    public let users: Int32
+    public let topic: String
+
+    public init(name: String, users: Int32, topic: String) {
+        self.name = name
+        self.users = users
+        self.topic = topic
+    }
+}
+
+/// One member-list row (Plan 4b Task 8: `onMembers`'s payload widens from
+/// `[String]` to `[MemberRow]`) — `nick`/`isOp` (for the op badge + Kick/Ban
+/// gating) plus `avatarName` (for the member-row icon thumbnail, resolved via
+/// the model's art dir at the view layer). `Identifiable` by `nick` so
+/// `ChatWindow`'s `List` can key on it directly, matching `RoomInfo`'s own
+/// `Identifiable`-by-name posture.
+public struct MemberRow: Sendable, Equatable, Identifiable {
+    public var id: String { nick }
+    public let nick: String
+    public let isOp: Bool
+    public let avatarName: String
+
+    public init(nick: String, isOp: Bool, avatarName: String) {
+        self.nick = nick
+        self.isOp = isOp
+        self.avatarName = avatarName
+    }
+}
+
 /// The app's headless, testable core (D1 §3.2's binding recommendation: all
 /// logic lives in ComicChatKit, only chrome lives in the app). Composes every
 /// prior Plan 4a task into one live loop:
@@ -131,7 +168,11 @@ public struct RoomInfo: Sendable, Equatable, Identifiable {
 /// independent point of mutation off the engine queue.
 public final class ChatSessionModel: @unchecked Sendable {
     public var onStripImage: (@Sendable (CGImage, CGSize) -> Void)?
-    public var onMembers: (@Sendable ([String]) -> Void)?
+    /// Plan 4b Task 8: widened from `[String]` to `[MemberRow]` — same
+    /// snapshot+seq-guard delivery as before (`emitMembers`'s doc comment),
+    /// just a richer row (`nick`/`isOp`/`avatarName`) so the sidebar can show
+    /// an op badge + avatar thumbnail without a second round-trip.
+    public var onMembers: (@Sendable ([MemberRow]) -> Void)?
     public var onStatus: (@Sendable (String) -> Void)?
     /// Fired after every emotion-wheel drag (`setEmotion`), typing preview
     /// (`previewTyping`), or (implicitly, via those two) character change,
@@ -151,6 +192,21 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// first), each carrying its current unread count and whether it's the
     /// active room.
     public var onRoomsChanged: (@Sendable ([RoomInfo]) -> Void)?
+    /// Fired ONCE per `requestRoomList()` round-trip (Plan 4b Task 8), on the
+    /// MAIN thread, with the full accumulated `[RoomListItem]` — see
+    /// `roomListAccum`'s doc comment for the accumulate-then-fire-on-end
+    /// mechanics.
+    public var onRoomList: (@Sendable ([RoomListItem]) -> Void)?
+    /// Fired on the MAIN thread for a `getInfo(_:)` WHO reply (Plan 4b Task
+    /// 8): `(nick, formatted)` — there is no `cc_session_whois` builder in the
+    /// outbound surface (comicchat.h:600 has `who` only), so this is backed by
+    /// `.whoResult` (WHO-by-nick), not a whois.
+    public var onUserInfo: (@Sendable (String, String) -> Void)?
+    /// Fired on the MAIN thread whenever the ACTIVE room's own-membership op
+    /// status changes (Plan 4b Task 8) — derived inside `emitMembers`'s
+    /// existing snapshot read, same delivery posture as `onMembers`. Drives
+    /// `AppState.selfIsOp`, which gates the Kick/Ban context-menu items.
+    public var onSelfOp: (@Sendable (Bool) -> Void)?
 
     /// `var` (Plan 4b Task 5): `changeCharacter` updates the model's OWN
     /// notion of `config.characterName` so a subsequent `reflowLocked()` (or
@@ -321,6 +377,19 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// touched ONLY on `engineQueue`, like every other piece of state in
     /// this section.
     private var inFlightAvatarDownloads: Set<String> = []
+
+    // MARK: Room list (Plan 4b Task 8)
+
+    /// Engine-queue-owned accumulator for the current `.roomListBegin` ->
+    /// `.roomListItem`×N -> `.roomListEnd` round-trip (`CC_EV_ROOM_LIST_ITEM`
+    /// is emitted once per LIST reply line, `ircsock.cpp`'s RPL_LIST/322
+    /// handler) — `nil` between round-trips (no LIST in flight) so a stray
+    /// `.roomListItem`/`.roomListEnd` with no preceding `.roomListBegin`
+    /// (shouldn't happen; defensive only) is dropped rather than firing
+    /// `onRoomList` with a garbage partial list. `.roomListBegin` resets it to
+    /// `[]`; each `.roomListItem` appends; `.roomListEnd` fires `onRoomList`
+    /// once with the full array and resets to `nil`.
+    private var roomListAccum: [RoomListItem]?
 
     // MARK: Whisper (Plan 4b Task 4)
 
@@ -798,6 +867,28 @@ public final class ChatSessionModel: @unchecked Sendable {
         case .disconnectedHint(let text):
             emitStatus(text)
 
+        // MARK: Room list (Plan 4b Task 8) — accumulate begin -> items -> end,
+        // fire `onRoomList` once on end. Session-scoped (LIST is not
+        // per-channel), so these fall to `sessionTranscript` above like every
+        // other `channel == nil` event; no strip effect.
+        case .roomListBegin:
+            roomListAccum = []
+        case .roomListItem(let name, let users, let topic):
+            roomListAccum?.append(RoomListItem(name: name, users: users, topic: topic))
+        case .roomListEnd:
+            let items = roomListAccum ?? []
+            roomListAccum = nil
+            let cb = onRoomList
+            DispatchQueue.main.async { cb?(items) }
+
+        // MARK: WHO / Get Info (Plan 4b Task 8) — `getInfo(_:)` is backed by
+        // `who(_:)` + this event (there is no `cc_session_whois` builder in
+        // the outbound surface; comicchat.h:600 has `who` only).
+        case .whoResult(let nick, let user, let host, let whoChannel, _):
+            let formatted = "\(nick) (\(user)@\(host)) — \(whoChannel)"
+            let cb = onUserInfo
+            DispatchQueue.main.async { cb?(nick, formatted) }
+
         default:
             break
         }
@@ -992,21 +1083,37 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// room's snapshot actually shows (the app re-reads on `setActiveRoom`).
     /// Emitting for the event's room keeps `ProtocolSession`'s own per-room
     /// member table the single source of truth and lets a caller filter.
+    ///
+    /// Plan 4b Task 8: the snapshot now builds `[MemberRow]` (nick/isOp/
+    /// avatarName) rather than a bare sorted `[String]` — same snapshot, same
+    /// seq-guard ordering protection, richer row. Also derives OUR OWN op
+    /// status from the same snapshot and fires it via `onSelfOp` (the
+    /// brief's suggested extension point — "simplest: extend `emitMembers`
+    /// to also push `selfIsOp` through a new `onSelfOp`"). `ownNick` is
+    /// captured here (engine-queue-local `currentOwnNick`, NOT
+    /// `session.ownNick` — that accessor's own `sessionQueue.sync` would be a
+    /// same-queue reentrant call from here, the exact hazard this property's
+    /// own doc comment documents) so the detached `Task` doesn't need to
+    /// touch engine-queue state itself.
     private func emitMembers(for room: String) {
         membersSeq += 1                              // engine queue — serialized
         let seq = membersSeq
         let activeAtEmit = activeRoom
-        Task { [session, onMembers] in
+        let ownNick = currentOwnNick
+        Task { [session, onMembers, onSelfOp] in
             // Only the ACTIVE room's membership drives the one sidebar — a
             // background room's churn updates `session.room(room)` (read on
             // its next activation) but must not overwrite the visible list.
             guard room == activeAtEmit else { return }
             let members = session.room(room)?.members ?? [:]
-            let sorted = members.values.filter { !$0.departed }.map(\.nick).sorted()
+            let present = members.values.filter { !$0.departed }.sorted { $0.nick < $1.nick }
+            let rows = present.map { MemberRow(nick: $0.nick, isOp: $0.isOp, avatarName: $0.avatarName) }
+            let selfIsOp = members[ownNick]?.isOp == true
             DispatchQueue.main.async {
                 guard seq > self.appliedMembersSeq else { return }   // stale snapshot — drop
                 self.appliedMembersSeq = seq
-                onMembers?(sorted)
+                onMembers?(rows)
+                onSelfOp?(selfIsOp)
             }
         }
     }
@@ -1268,6 +1375,67 @@ public final class ChatSessionModel: @unchecked Sendable {
         }
     }
 
+    // MARK: - room ops (Plan 4b Task 8)
+    //
+    // Thin pass-throughs over `ProtocolSession`'s own 6 wrappers — `AppState`
+    // (the app layer) talks to `ChatSessionModel`, never `ProtocolSession`
+    // directly (same posture as `send`/`sendWhisper` wrapping `session.say`/
+    // `session.whisper`), so these exist purely to keep that boundary
+    // consistent rather than adding any behavior of their own.
+
+    /// Creates (and, per the engine's implicit-join-on-create semantics,
+    /// joins) a room — the Create Room… sheet's `createRoom` half (paired
+    /// with `goToRoom` to open the tab locally, `AppState.createRoom`'s own
+    /// doc comment).
+    public func createRoom(_ channel: String, modes: String? = nil, maxUsers: UInt32 = 0, key: String? = nil) async throws {
+        try await session.createRoom(channel, modes: modes, maxUsers: maxUsers, key: key)
+    }
+
+    public func kick(_ channel: String, nick: String, reason: String? = nil) async throws {
+        try await session.kick(channel, nick: nick, reason: reason)
+    }
+
+    public func invite(_ channel: String, nick: String) async throws {
+        try await session.invite(channel, nick: nick)
+    }
+
+    public func ban(_ channel: String, pattern: String, banning: Bool) async throws {
+        try await session.ban(channel, pattern: pattern, banning: banning)
+    }
+
+    public func setRoomMode(_ channel: String, mode: UInt32, maxUsers: UInt32, password: String? = nil) async throws {
+        try await session.setRoomMode(channel, mode: mode, maxUsers: maxUsers, password: password)
+    }
+
+    /// Session-scoped Away toggle (Plan 4b Task 8: the Room menu's Away
+    /// item) — no room token, mirrors `ProtocolSession.setAway`'s own
+    /// session-scoped shape.
+    public func setAway(_ isAway: Bool, message: String? = nil) async throws {
+        try await session.setAway(isAway, message: message)
+    }
+
+    // MARK: - room list / Get Info (Plan 4b Task 8)
+
+    /// Requests the server's room list (`CRoomList`'s LIST browser, D1
+    /// §1.6/backlog item 5). The result arrives asynchronously via
+    /// `onRoomList` once the accumulated `.roomListBegin` -> `.roomListItem`×N
+    /// -> `.roomListEnd` sequence completes (`handleLocked`'s `roomListAccum`
+    /// case) — this method only fires the wire LIST, it does not itself
+    /// return the items (mirroring every other fire-the-query/consume-the-
+    /// event-later shape on this type, e.g. `who`/`.whoResult` below).
+    public func requestRoomList() async throws {
+        try await session.list()
+    }
+
+    /// Get Info (Plan 4b Task 8): queries WHO for `nick` — there is NO
+    /// `cc_session_whois` builder in the outbound surface (comicchat.h:600
+    /// has `who` only), so this is implemented over the EXISTING
+    /// `ProtocolSession.who(_:)` + the `.whoResult` event
+    /// (`handleLocked`'s case above formats and fires `onUserInfo`).
+    public func getInfo(_ nick: String) async throws {
+        try await session.who(nick)
+    }
+
     // MARK: - send
 
     /// Sends `text` under `mode` (default `.say`), with COOKED outbound pose
@@ -1296,7 +1464,16 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///   the tab it's showing, and the app leaves this `nil` since the active
     ///   room IS the shown tab. A caller MAY pass an explicit room to send into
     ///   a background room without switching to it.
-    public func send(_ text: String, mode: Strip.Mode = .say, room: String? = nil) async throws {
+    /// - Parameter addressees: Plan 4b Task 8 (D1 §1.5): the member-list
+    ///   selection, appended so existing callers (which never passed this) are
+    ///   unaffected. Threaded into `ann.addressees` when comics-data annotations
+    ///   are being sent at all (`sendComicsData` gate above, unchanged) — the
+    ///   wire `T<nick>` list rides free via the annotation encoder
+    ///   (`Annotations.toCAnnotations`'s existing clip-at-5, D1 §2.1). Passed
+    ///   through as given rather than pre-clipping here: the encoder is the
+    ///   single source of truth for the 5-addressee wire limit.
+    public func send(_ text: String, mode: Strip.Mode = .say, room: String? = nil,
+                     addressees: [String] = []) async throws {
         // `performOnEngineQueue` traps if called while already ON the engine
         // queue (its own doc comment) — `send` is invoked from the UI/main
         // context (ChatWindow's Task { try? await model.send(...) }), never
@@ -1315,6 +1492,7 @@ public final class ChatSessionModel: @unchecked Sendable {
             guard sendComicsData else { return nil }
             guard var a = try? strip?.selfAnnotations() else { return nil }
             a.mode = Self.smMode(for: mode)
+            a.addressees = addressees
             return a
         }
         try await session.say(targetRoom, text: text, annotations: ann,
@@ -1493,6 +1671,22 @@ public final class ChatSessionModel: @unchecked Sendable {
         }
         emitRooms()
         try await session.join(room)
+    }
+
+    /// "Go To" a room from the LIST browser (Plan 4b Task 8, coordinator
+    /// ruling post-multi-room): `joinRoom` + `setActiveRoom` — opens a NEW
+    /// tab, NO part-first (leaving rooms is the tab's own close button, not
+    /// something Go To does on the caller's behalf). `joinRoom`'s
+    /// `ensureRoomBoxLocked` call registers the room's tab-order slot
+    /// synchronously before the wire JOIN is even sent, so `setActiveRoom`'s
+    /// `rooms[room] != nil` guard is already satisfied by the time this calls
+    /// it — the switch does not need to wait for the server's `.selfJoined`
+    /// confirm (mirrors `EnterRoomSheet`'s existing join-then-show posture;
+    /// the strip starts title-only and fills in as the join confirms/messages
+    /// arrive, same as any other freshly joined room).
+    public func goToRoom(_ room: String) async throws {
+        try await joinRoom(room)
+        setActiveRoom(room)
     }
 
     /// Leaves `room` (Plan 4b Task 7). Sends the wire PART, drops the room's

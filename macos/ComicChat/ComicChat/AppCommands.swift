@@ -30,6 +30,27 @@ struct AppCommands: Commands {
             .keyboardShortcut("j", modifiers: .command)
             .disabled(appState.model == nil)
 
+            // Plan 4b Task 8: the LIST browser window.
+            Button("Room List…") {
+                openWindow(id: "roomList")
+            }
+            .disabled(appState.model == nil)
+
+            // Plan 4b Task 8: create (and go to) a new room.
+            Button("Create Room…") {
+                appState.createRoomText = ""
+                appState.showCreateRoomSheet = true
+            }
+            .disabled(appState.model == nil)
+
+            Divider()
+
+            // Plan 4b Task 8: session-scoped Away toggle.
+            Button(appState.isAway ? "Away (On)" : "Away") {
+                appState.toggleAway()
+            }
+            .disabled(appState.model == nil)
+
             Divider()
 
             Button("Leave/Disconnect") {

@@ -9,7 +9,10 @@ public final class AppState {
     public var settings = SettingsStore()
     public var showConnectSheet = true
     public var statusLine = ""
-    public var members: [String] = []
+    /// Plan 4b Task 8: widened from `[String]` to `[MemberRow]` (nick/isOp/
+    /// avatarName), mirrored from `ChatSessionModel.onMembers` on the main
+    /// thread — `ChatWindow`'s member `List` reads this directly.
+    public var members: [MemberRow] = []
     public var stripImage: CGImage?
     public var stripSizePoints: CGSize = .zero
 
@@ -26,9 +29,122 @@ public final class AppState {
     /// Bound to the Enter Room sheet's text field (⌘J / RoomTabBar "+").
     public var showEnterRoomSheet = false
     public var enterRoomText = ""
+    /// Bound to the Create Room… sheet's text field (Room menu, Plan 4b Task 8).
+    public var showCreateRoomSheet = false
+    public var createRoomText = ""
     /// The self avatar's live pose preview (Plan 4b Task 3) — updated after
     /// every emotion-wheel drag or typing-preview via `ChatSessionModel.onSelfPose`.
     public var selfPoseImage: CGImage?
+
+    // MARK: Room list + room ops + member selection (Plan 4b Task 8)
+
+    /// The last-fetched room list (`CRoomList`'s LIST browser), mirrored from
+    /// `ChatSessionModel.onRoomList` — `RoomListWindow`'s `Table` data source.
+    public var roomList: [RoomListItem] = []
+    /// Whether we're the OWNER of the active room (derived from the active
+    /// room's own membership, mirrored from `ChatSessionModel.onSelfOp`) —
+    /// gates the Kick/Ban context-menu items (`.disabled(!selfIsOp)`).
+    public var selfIsOp = false
+    /// Our own away state (Plan 4b Task 8) — mirrors the Room menu's Away
+    /// toggle; no server confirmation event exists for our OWN away state on
+    /// this wire (`.awayPeer` is peer-only, `ProtocolEvents.swift`), so this
+    /// is optimistically flipped by `toggleAway()` itself.
+    public var isAway = false
+    /// The member list's selection (Plan 4b Task 8, D1 §1.5): the original's
+    /// canonical talk-to state. Bound to `ChatWindow`'s member `List`
+    /// selection; `ChatWindow`'s send passes this straight through to
+    /// `ChatSessionModel.send(_:mode:room:addressees:)`.
+    public var selectedMembers: Set<String> = []
+    /// Resolved member-row avatar icon thumbnails, keyed by avatar name
+    /// (Plan 4b Task 8) — populated lazily by `ChatWindow` as rows render
+    /// (`AvatarFile(path:).iconImage()` via the model's art dir), so the same
+    /// icon is decoded once per session rather than once per row-redraw.
+    /// Unresolvable names simply never gain an entry (no icon shown).
+    public var memberIconCache: [String: CGImage] = [:]
+    /// The last `getInfo(_:)` popover result (Plan 4b Task 8) — `(nick,
+    /// formatted)`, mirrored from `ChatSessionModel.onUserInfo`. `nil` clears
+    /// any shown popover.
+    public var userInfoResult: (nick: String, text: String)?
+
+    /// Requests a fresh room list — `RoomListWindow`'s Refresh button / the
+    /// window's `.task`. Fire-and-forget on the model; the result arrives via
+    /// `onRoomList` (mirrored into `roomList` by `connect()`'s callback wiring).
+    public func requestRoomList() {
+        guard let model else { return }
+        Task { try? await model.requestRoomList() }
+    }
+
+    /// "Go To" a room from the LIST browser (Plan 4b Task 8): join + activate
+    /// (opens a NEW tab — no part-first, `ChatSessionModel.goToRoom`'s own doc
+    /// comment). Normalizes a bare name the same way `joinRoom(_:)` does.
+    public func goToRoom(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, let model else { return }
+        let channel = trimmed.hasPrefix("#") || trimmed.hasPrefix("&") ? trimmed : "#" + trimmed
+        Task { try? await model.goToRoom(channel) }
+    }
+
+    /// Creates a room and goes to it (Plan 4b Task 8, the Create Room… sheet):
+    /// `createRoom` (the wire CREATE, which server-side joins us) then
+    /// `goToRoom` opens the tab locally the same way any other join does.
+    public func createRoom(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, let model else { return }
+        let channel = trimmed.hasPrefix("#") || trimmed.hasPrefix("&") ? trimmed : "#" + trimmed
+        Task {
+            try? await model.createRoom(channel)
+            try? await model.goToRoom(channel)
+        }
+    }
+
+    /// Toggles the session-scoped Away state (Plan 4b Task 8: the Room menu's
+    /// Away toggle) — optimistic local flip (see `isAway`'s doc comment).
+    public func toggleAway() {
+        guard let model else { return }
+        let newValue = !isAway
+        isAway = newValue
+        Task { try? await model.setAway(newValue) }
+    }
+
+    /// Kicks `nick` from the active room (Plan 4b Task 8's member context
+    /// menu). No-op with no active room/model.
+    public func kick(_ nick: String) {
+        guard let model, let room = activeRoom else { return }
+        Task { try? await model.kick(room, nick: nick) }
+    }
+
+    /// Bans `pattern` (typically `nick!*@*`) from the active room (Plan 4b
+    /// Task 8's member context menu).
+    public func ban(_ pattern: String) {
+        guard let model, let room = activeRoom else { return }
+        Task { try? await model.ban(room, pattern: pattern, banning: true) }
+    }
+
+    /// Requests Get Info for `nick` (Plan 4b Task 8) — the result arrives via
+    /// `onUserInfo`, mirrored into `userInfoResult`.
+    public func getInfo(_ nick: String) {
+        guard let model else { return }
+        Task { try? await model.getInfo(nick) }
+    }
+
+    /// Resolves (and caches) `avatarName`'s member-row icon thumbnail via the
+    /// model's art dir (Plan 4b Task 8) — `AvatarFile(path:).iconImage()`,
+    /// same lookup shape `ChatSessionModel.setUpStripLocked`'s
+    /// `AvatarResolver` uses, but standalone (no strip participant needed for
+    /// a plain icon lookup). Silently no-ops for an empty name, an
+    /// already-cached name, or a name that fails to resolve (unresolvable
+    /// names get no icon, per the brief).
+    public func resolveMemberIcon(_ avatarName: String) {
+        guard !avatarName.isEmpty, memberIconCache[avatarName] == nil else { return }
+        let dir = artDir
+        Task.detached { [weak self] in
+            let path = dir + "/" + avatarName.lowercased() + ".avb"
+            guard let av = try? AvatarFile(path: path),
+                  let art = try? av.iconImage(),
+                  let cg = art.cgImage() else { return }
+            await MainActor.run { self?.memberIconCache[avatarName] = cg }
+        }
+    }
 
     // MARK: Whisper box (Plan 4b Task 4)
 
@@ -185,13 +301,17 @@ public final class AppState {
         let m = ChatSessionModel(config: cfg)
         m.onStripImage = { [weak self] img, size in
             Task { @MainActor in self?.stripImage = img; self?.stripSizePoints = size } }
-        m.onMembers = { [weak self] nicks in Task { @MainActor in self?.members = nicks } }
+        m.onMembers = { [weak self] rows in Task { @MainActor in self?.members = rows } }
         m.onStatus = { [weak self] s in Task { @MainActor in self?.statusLine = s } }
         m.onSelfPose = { [weak self] img in Task { @MainActor in self?.selfPoseImage = img } }
         m.onWhisper = { [weak self] peer, line in
             Task { @MainActor in self?.recordWhisper(peer: peer, line: line) } }
         m.onRoomsChanged = { [weak self] infos in
             Task { @MainActor in self?.rooms = infos } }
+        m.onRoomList = { [weak self] items in Task { @MainActor in self?.roomList = items } }
+        m.onSelfOp = { [weak self] isOp in Task { @MainActor in self?.selfIsOp = isOp } }
+        m.onUserInfo = { [weak self] nick, text in
+            Task { @MainActor in self?.userInfoResult = (nick: nick, text: text) } }
         model = m
         do { try await m.start(); showConnectSheet = false }
         catch { statusLine = "Connect failed: \(error)" }
@@ -223,6 +343,14 @@ public final class AppState {
         rooms = []
         showEnterRoomSheet = false
         enterRoomText = ""
+        showCreateRoomSheet = false
+        createRoomText = ""
+        roomList = []
+        selfIsOp = false
+        isAway = false
+        selectedMembers = []
+        memberIconCache = [:]
+        userInfoResult = nil
         replayServer?.stop()
         replayServer = nil
         whisperPeers = []
