@@ -76,6 +76,22 @@ private struct PersonaSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            // Plan 4b Batch C: the free-text reply a peer's "# GetInfo" probe
+            // receives (`SettingsStore.profileText` -> `ChatConfig.profileText`
+            // -> `cc_session_send_info_reply`'s "# HeresInfo: <profile>" wire
+            // reply). Unlike nick/real name above, this DOES apply live — it's
+            // read fresh from `config.profileText` at reply time (`handleLocked`'s
+            // `.infoRequest` case), not baked into the USER command at connect.
+            Section {
+                TextEditor(text: profileTextBinding)
+                    .frame(minHeight: 80)
+            } header: {
+                Text("Profile")
+            } footer: {
+                Text("Sent to peers who probe your profile (\"# GetInfo\"). Applies immediately.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding()
         .frame(minWidth: 360, minHeight: 280)
@@ -85,6 +101,21 @@ private struct PersonaSettingsView: View {
         Binding(
             get: { appState.settings[keyPath: keyPath] },
             set: { appState.settings[keyPath: keyPath] = $0 }
+        )
+    }
+
+    /// Plan 4b Batch C: like `ComicSettingsView.panelsPerRowBinding`, this
+    /// writes through to BOTH the persisted setting and (if a session is
+    /// already connected) the live model via `setProfileText` — an already-
+    /// connected peer's NEXT "# GetInfo" probe should see the freshly typed
+    /// profile without requiring a reconnect.
+    private var profileTextBinding: Binding<String> {
+        Binding(
+            get: { appState.settings.profileText },
+            set: { newValue in
+                appState.settings.profileText = newValue
+                appState.model?.setProfileText(newValue)
+            }
         )
     }
 }

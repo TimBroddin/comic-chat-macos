@@ -158,7 +158,7 @@ typedef enum ccPayloadClass {
                             // in-scope event (R20); falls out of OnTextMsg with
                             // no event, but is NEVER produced by ProcessComment
                             // (see ccPayloadHandledNoEvent for that case)
-    ccPayloadHandledNoEvent // ProcessComment's "#" grammar MATCHED a known
+    ccPayloadHandledNoEvent, // ProcessComment's "#" grammar MATCHED a known
                             // prefix (return TRUE in the original) but that
                             // branch's original body is pure R20-dropped
                             // policy/reply-sending with no in-scope event
@@ -173,6 +173,14 @@ typedef enum ccPayloadClass {
                             // path, matching the original's OWN dispatch
                             // exactly (protsupp.cpp:4368's `if (*szMesg != '#'
                             // || !ProcessComment(...)) ProcessSay(...)`).
+    ccPayloadVersionRequest, // -> CC_EV_VERSION_REQUEST (Plan 4b Batch C:
+                            // bare CTCP \x01VERSION\x01 probe, un-suppressed
+                            // from its former ccPayloadSuppressed grouping --
+                            // see ccProcessSay's VERSION-branch doc comment).
+    ccPayloadInfoRequest    // -> CC_EV_INFO_REQUEST (Plan 4b Batch C:
+                            // "# GetInfo" comment probe, un-suppressed from
+                            // ccPayloadHandledNoEvent -- see ccProcessComment's
+                            // GetInfo-branch doc comment).
 } ccPayloadClass;
 
 // Resolver typedef for the payload stage's own nick->ref lookups (R19):

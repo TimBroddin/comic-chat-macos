@@ -140,6 +140,12 @@ public enum ProtocolEvent: Sendable, Codable, Equatable {
     case sound(nick: String, file: String, text: String)
     case awayPeer(nick: String, message: String)
     case appearsAs(nick: String, avatarName: String, url: String)
+    /// Plan 4b Batch C: a peer's bare CTCP `\x01VERSION\x01` probe (Tim opted
+    /// in for VERSION + GetInfo only — see `comicchat.h`'s
+    /// `CC_EV_VERSION_REQUEST` doc comment for the un-suppression citation).
+    case versionRequest(fromNick: String)
+    /// Plan 4b Batch C: a peer's `# GetInfo` comment probe.
+    case infoRequest(fromNick: String)
 
     // room state
     case topicChanged(channel: String, topic: String)
@@ -299,6 +305,10 @@ extension ProtocolEvent {
             result = .appearsAs(nick: str(ev.u.appears_as.nick),
                                avatarName: str(ev.u.appears_as.avatar_name),
                                url: str(ev.u.appears_as.url))
+        case CC_EV_VERSION_REQUEST:
+            result = .versionRequest(fromNick: str(ev.u.version_request.from_nick))
+        case CC_EV_INFO_REQUEST:
+            result = .infoRequest(fromNick: str(ev.u.info_request.from_nick))
         case CC_EV_TOPIC_CHANGED:
             result = .topicChanged(channel: str(ev.u.topic_changed.channel),
                                   topic: str(ev.u.topic_changed.topic))

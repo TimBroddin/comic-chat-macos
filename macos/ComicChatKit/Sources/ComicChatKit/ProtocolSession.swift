@@ -674,6 +674,45 @@ public final class ProtocolSession: @unchecked Sendable {
         }
     }
 
+    /// Outbound CTCP VERSION reply (Plan 4b Batch C, `cc_session_send_version_reply`
+    /// — see that C function's comicchat.h doc comment for the exact wire
+    /// grammar and NOTICE-vs-PRIVMSG citation). `versionText` is THIS port's
+    /// own identification string (not the original's runtime-built one) —
+    /// see `ChatSessionModel`'s version-reply constant.
+    public func sendVersionReply(channel: String, toNick: String, versionText: String) async throws {
+        try await onQueueGated { s in
+            guard let token = self.roomTokenFor(channel) else {
+                throw ProtocolSessionError.commandFailed("sendVersionReply: unknown channel \(channel)")
+            }
+            let rc = self.withEncodedCString(toNick) { toNickPtr in
+                self.withEncodedCString(versionText) { textPtr in
+                    cc_session_send_version_reply(s, token, toNickPtr, textPtr)
+                }
+            }
+            guard rc == 0 else { throw ProtocolSessionError.commandFailed("sendVersionReply failed") }
+        }
+    }
+
+    /// Outbound `# GetInfo` reply (Plan 4b Batch C, `cc_session_send_info_reply`
+    /// — see that C function's comicchat.h doc comment for the exact
+    /// "# HeresInfo: <profile>" wire grammar citation). `profileText` may be
+    /// empty (an honest empty-profile reply — see `ChatSessionModel`'s
+    /// `.infoRequest` case doc comment for the `ID_DEFAULT_PROFILE`
+    /// archaeology-gap note).
+    public func sendInfoReply(channel: String, toNick: String, profileText: String) async throws {
+        try await onQueueGated { s in
+            guard let token = self.roomTokenFor(channel) else {
+                throw ProtocolSessionError.commandFailed("sendInfoReply: unknown channel \(channel)")
+            }
+            let rc = self.withEncodedCString(toNick) { toNickPtr in
+                self.withEncodedCString(profileText) { textPtr in
+                    cc_session_send_info_reply(s, token, toNickPtr, textPtr)
+                }
+            }
+            guard rc == 0 else { throw ProtocolSessionError.commandFailed("sendInfoReply failed") }
+        }
+    }
+
     /// Encodes `s` per `encoding` into a temporary NUL-terminated buffer and
     /// hands `body` a pointer valid for the closure's duration — the
     /// `withCString`-shaped equivalent of `WireCodec.encode`, needed because

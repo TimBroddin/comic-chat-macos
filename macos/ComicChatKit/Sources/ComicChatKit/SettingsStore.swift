@@ -69,6 +69,17 @@ public struct SettingsStore {
         nonmutating set { defaults.set(newValue, forKey: Keys.realName) }
     }
 
+    /// Plan 4b Batch C: the free-text "profile" a peer's `# GetInfo` probe
+    /// receives back (`cc_session_send_info_reply`'s `profile_text`,
+    /// `ChatConfig.profileText`). Empty by default — an empty profile still
+    /// gets an honest reply (see `ChatSessionModel`'s `.infoRequest` handler
+    /// doc comment for the `ID_DEFAULT_PROFILE` archaeology gap this default
+    /// stands in for), it is simply an empty "# HeresInfo: " body.
+    public var profileText: String {
+        get { defaults.string(forKey: Keys.profileText) ?? "" }
+        nonmutating set { defaults.set(newValue, forKey: Keys.profileText) }
+    }
+
     // MARK: Comic
 
     public var backdrop: String {
@@ -186,6 +197,7 @@ public struct SettingsStore {
         static let nick = "persona.nick"
         static let character = "persona.character"
         static let realName = "persona.realName"
+        static let profileText = "persona.profile"
         static let backdrop = "comic.backdrop"
         static let comicMode = "view.comicMode"
         static let panelsPerRow = "comic.panelsPerRow"

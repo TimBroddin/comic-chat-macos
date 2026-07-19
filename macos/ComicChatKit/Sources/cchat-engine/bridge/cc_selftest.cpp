@@ -4887,6 +4887,8 @@ void pvOnEvent(void* ud, const cc_proto_event* ev) {
         case CC_EV_ACTION:         pa = ev->u.action.text; pb = ev->u.action.nick; break;
         case CC_EV_SOUND:          pa = ev->u.sound.file; pb = ev->u.sound.nick; break;
         case CC_EV_APPEARS_AS:     pa = ev->u.appears_as.avatar_name; pb = ev->u.appears_as.url; break;
+        case CC_EV_VERSION_REQUEST: pa = ev->u.version_request.from_nick; break;
+        case CC_EV_INFO_REQUEST:   pa = ev->u.info_request.from_nick; break;
         default: break;
     }
     c->a.push_back(pa); c->b.push_back(pb);
@@ -5523,21 +5525,16 @@ static int cc_selftest_pv_away_peer_ctcp() {
 }
 
 // VECTOR 19 (brief Step 6 equivalent, comment-grammar coverage): the
-// R20-dropped "#" comment branches (GetInfo/HeresInfo/BDrop/BDrop2) all
-// classify as ccPayloadSuppressed (no event) since their original bodies are
-// pure outbound-reply-sending or live-pui-gated policy actions this engine
+// R20-dropped "#" comment branches (HeresInfo/BDrop/BDrop2) all classify as
+// ccPayloadHandledNoEvent (no event) since their original bodies are pure
+// outbound-reply-sending or live-pui-gated policy actions this engine
 // doesn't hold (see ccProcessComment's per-branch comments). Confirms they
 // are silently dropped, not crashes or misrouted events -- matching the
 // original's own "return TRUE, no visible effect for us" shape for a
-// headless peer.
+// headless peer. GetInfo used to be in this group too, but Plan 4b Batch C
+// un-suppressed it (CC_EV_INFO_REQUEST, Tim opted in) -- see
+// cc_selftest_pv_version_and_getinfo_requests below for its own coverage.
 static int cc_selftest_pv_comment_grammar_suppressed() {
-    {
-        PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
-        const char* wire = ":Bob!bob@h PRIVMSG #comicrig :# GetInfo\r\n";
-        cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
-        CC_CHECK(cap.types.empty());
-        cc_session_destroy(s);
-    }
     {
         PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
         const char* wire = ":Bob!bob@h PRIVMSG #comicrig :# HeresInfo: some profile text\r\n";
@@ -5557,6 +5554,47 @@ static int cc_selftest_pv_comment_grammar_suppressed() {
         const char* wire = ":Bob!bob@h PRIVMSG #comicrig :# BDrop2: newbackdrop,http://x/b.bgb\r\n";
         cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
         CC_CHECK(cap.types.empty());
+        cc_session_destroy(s);
+    }
+    return 0;
+}
+
+// VECTOR 19b (Plan 4b Batch C): the two peer probe queries Tim opted back
+// into -- inbound CTCP VERSION and "# GetInfo" -- now DO fire an event,
+// un-suppressed from their former ccPayloadSuppressed/ccPayloadHandledNoEvent
+// classifications (see ccProcessSay's VERSION-branch and ccProcessComment's
+// GetInfo-branch doc comments in protsupp.cpp for the exact citation). Bare
+// \x01VERSION\x01 (no argument text -- the original's ChatGetVersion request
+// grammar, protsupp.cpp:3701-3706) -> CC_EV_VERSION_REQUEST(from_nick); an
+// argument-carrying VERSION reply (e.g. NOTICE'd back to OUR OWN earlier
+// request) stays suppressed, matching the R20 table's still-dropped "else"
+// half. "# GetInfo" -> CC_EV_INFO_REQUEST(from_nick).
+static int cc_selftest_pv_version_and_getinfo_requests() {
+    {
+        PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+        char wire[128];
+        int n = snprintf(wire, sizeof(wire), ":Bob!bob@h PRIVMSG #comicrig :%cVERSION%c\r\n", 0x01, 0x01);
+        cc_session_feed_bytes(s, (const uint8_t*)wire, (size_t)n);
+        int iv = pvFind(cap, CC_EV_VERSION_REQUEST);
+        CC_CHECK(iv >= 0 && cap.a[iv] == "Bob");
+        cc_session_destroy(s);
+    }
+    {
+        // Argument-carrying VERSION (a reply arriving via PRIVMSG, not a bare
+        // probe) stays suppressed -- NOT CC_EV_VERSION_REQUEST.
+        PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+        char wire[128];
+        int n = snprintf(wire, sizeof(wire), ":Bob!bob@h PRIVMSG #comicrig :%cVERSION some reply text%c\r\n", 0x01, 0x01);
+        cc_session_feed_bytes(s, (const uint8_t*)wire, (size_t)n);
+        CC_CHECK(pvFind(cap, CC_EV_VERSION_REQUEST) < 0);
+        cc_session_destroy(s);
+    }
+    {
+        PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+        const char* wire = ":Bob!bob@h PRIVMSG #comicrig :# GetInfo\r\n";
+        cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+        int ii = pvFind(cap, CC_EV_INFO_REQUEST);
+        CC_CHECK(ii >= 0 && cap.a[ii] == "Bob");
         cc_session_destroy(s);
     }
     return 0;
@@ -5675,7 +5713,8 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_pv_sound_ctcp();                        // \x01SOUND "file"\x01 -> CC_EV_SOUND
     cc_selftest_outbound_sound_roundtrip();             // cc_session_send_sound -> wire bytes -> CC_EV_SOUND
     cc_selftest_pv_away_peer_ctcp();                    // \x01AWAY msg\x01 -> CC_EV_AWAY_PEER
-    cc_selftest_pv_comment_grammar_suppressed();        // GetInfo/HeresInfo/BDrop(2) -> no event (R20)
+    cc_selftest_pv_comment_grammar_suppressed();        // HeresInfo/BDrop(2) -> no event (R20)
+    cc_selftest_pv_version_and_getinfo_requests();      // Plan 4b Batch C: VERSION/GetInfo -> CC_EV_VERSION_REQUEST/CC_EV_INFO_REQUEST
     cc_selftest_pv_data_appears_as();                   // DATA-borne "# Appears as" -> CC_EV_APPEARS_AS
     cc_selftest_pv_whisper_action_ctcp();               // WHISPER carrying ACTION -> CC_EV_ACTION
     cc_selftest_draw_text_ellipsis();                   // Plan 4a Task 7: CDC::DrawTextEllipsis

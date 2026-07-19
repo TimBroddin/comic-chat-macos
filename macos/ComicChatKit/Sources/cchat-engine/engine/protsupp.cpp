@@ -889,10 +889,12 @@ static void ccIdentifyWhispers(CUserInfo* pui, BYTE msgType, USHORT &uModes, CDW
 // those checks is DROPPED (R20), not merely stubbed true/false, because
 // there is no engine-side flag to evaluate them against; Swift owns the real
 // ignore/flood/operator state and may suppress the emitted event itself.
-// Grammar branches with NO event in the Task-5a union (GetInfo/HeresInfo
-// probe-reply exchange, BDrop/BDrop2 backdrop-change announcements) are
-// R20-dropped outright (ccPayloadSuppressed) -- listed individually in the
-// task report; only "# Appears as" maps to an event (CC_EV_APPEARS_AS).
+// Grammar branches with NO event in the Task-5a union (HeresInfo probe-reply
+// echo, BDrop/BDrop2 backdrop-change announcements) are R20-dropped outright
+// (ccPayloadHandledNoEvent) -- listed individually in the task report; "#
+// Appears as" maps to an event (CC_EV_APPEARS_AS), and Plan 4b Batch C added
+// a second: "# GetInfo" now maps to CC_EV_INFO_REQUEST (Tim opted back in --
+// see that branch's own doc comment below for the un-suppression detail).
 static ccPayloadResult ccProcessComment(char *szMesg) {
     ccPayloadResult r; memset(&r, 0, sizeof(r));
     // Default to ccPayloadSuppressed (NOT MATCHED, "return FALSE" in the
@@ -945,13 +947,15 @@ static ccPayloadResult ccProcessComment(char *szMesg) {
 
     if (!strncmp(szMesg, GETINFOPREFIX, strlen(GETINFOPREFIX))) {
         // "# GetInfo" (protsupp.cpp:902-924): original replies with
-        // "# HeresInfo: <profile>" over the wire (bChatSendPrivMesg). No
-        // event in the Task-5a union carries a profile-reply send (R20 --
-        // this is an outbound CTCP reply, not a comic-relevant inbound
-        // event); Task 4's cc_session_send_whisper/outbound API is the
-        // mechanism a LATER task could wire this through if ever needed.
-        // MATCHED (original returns TRUE) -> no fallthrough to ProcessSay.
-        r.cls = ccPayloadHandledNoEvent;
+        // "# HeresInfo: <profile>" over the wire (bChatSendPrivMesg).
+        // Plan 4b Batch C (R18-style emit addition, opted in by Tim):
+        // un-suppressed from ccPayloadHandledNoEvent -- CC_EV_INFO_REQUEST
+        // now carries the probe through to Swift, which replies via
+        // cc_session_send_info_reply (comicchat.h) with the user's own
+        // profile text. Still MATCHED (original returns TRUE) -> no
+        // fallthrough to ProcessSay; only the "no event" half of the old
+        // comment is no longer true.
+        r.cls = ccPayloadInfoRequest;
         return r;
     }
 
@@ -1005,19 +1009,26 @@ static ccPayloadResult ccProcessComment(char *szMesg) {
 //     proceeds; Swift may suppress after the fact.
 //   * Every `!pui->Ignored() && !pui->IsFlooding()` gate around ACTION/SOUND
 //     (:1628, 1641, 1651) -- same reasoning, DROPPED.
-//   * VERSION/PING/TIME/EMAIL/URL/NETMEET/CLIENTINFO CTCP branches
-//     (:1659-1810, 1858-1865) -- these are OUTBOUND-REPLY-SENDING or
-//     UI-launching (ReplyVersion/ReplyPing/ReplyTime/ReplyEmail/
-//     ReplyHomePage send a wire reply via GetOutBuff()/theApp session-identity
-//     globals this engine's Task 1 config never modeled; ShowVersion/ShowTime/
-///    ShowEmail/ShowHomePage/DoNetMeetingCX gate on live pui request-info
-//     counters then AddAndExecute a history entry or FLaunchBrowser/
-//     AfxMessageBox a UI action) -- NONE of the four in-scope events
-//     (ACTION/SOUND/AWAY_PEER/APPEARS_AS) cover these; R20-dropped
-//     (ccPayloadSuppressed) rather than invented new event types (brief:
-//     "if you need an event shape not in the union, STOP and return
-//     NEEDS_CONTEXT" -- these seven CTCP verbs have no in-scope event, so
-//     they are dropped, not escalated, per R20's own "drop with note" option).
+//   * PING/TIME/EMAIL/URL/NETMEET/CLIENTINFO CTCP branches
+//     (:1677-1810, 1858-1865) -- these are OUTBOUND-REPLY-SENDING or
+//     UI-launching (ReplyPing/ReplyTime/ReplyEmail/ReplyHomePage send a wire
+//     reply via GetOutBuff()/theApp session-identity globals this engine's
+//     Task 1 config never modeled; ShowTime/ShowEmail/ShowHomePage/
+//     DoNetMeetingCX gate on live pui request-info counters then
+//     AddAndExecute a history entry or FLaunchBrowser/AfxMessageBox a UI
+//     action) -- NONE of the four in-scope events (ACTION/SOUND/AWAY_PEER/
+//     APPEARS_AS) cover these; R20-dropped (ccPayloadSuppressed) rather than
+//     invented new event types (brief: "if you need an event shape not in
+//     the union, STOP and return NEEDS_CONTEXT" -- these six CTCP verbs have
+//     no in-scope event, so they are dropped, not escalated, per R20's own
+//     "drop with note" option). VERSION (:1659-1667) is no longer in this
+//     dropped set -- Plan 4b Batch C added CC_EV_VERSION_REQUEST to the
+//     union and un-suppressed the bare-query branch specifically (Tim opted
+//     in for VERSION + GetInfo only); see ccProcessSay's own VERSION-branch
+//     comment below for the exact split. The original's `else` half of that
+//     same branch (an argument follows the CTCP verb -- ShowVersion, a
+//     UI/history action) has no in-scope event and stays R20-dropped exactly
+//     as before.
 //   * `fileDCCID`/`xvchatID` (:1718-1815) -- DCC file transfer (filesend.cpp,
 //     explicitly out of scope this plan per the roadmap) and X-VCHAT
 //     (ignored by the original itself, "ignore X-VCHAT CTCPs"). DROPPED.
@@ -1209,8 +1220,33 @@ static ccPayloadResult ccProcessSay(const char* szNickname, CUserInfo* pui, char
         return r;
     }
 
-    if (strnicmp(szMesg, versionID, g_nVersionLen) == 0 ||
-        strnicmp(szMesg, pingID, g_nPingLen) == 0 ||
+    if (strnicmp(szMesg, versionID, g_nVersionLen) == 0) {
+        // Plan 4b Batch C (R18-style emit addition, opted in by Tim):
+        // un-suppressed out of the former combined VERSION/PING/TIME/.../
+        // X-VCHAT ccPayloadSuppressed grouping below (this branch used to be
+        // the first disjunct of that `if`; split out here so VERSION alone
+        // gets an event while the other eight verbs stay exactly as
+        // suppressed as before -- see this file's own R20 table comment
+        // above ProcessSay, and the still-suppressed `if` immediately below).
+        // Grammar (original protsupp.cpp:1659-1667): only the BARE
+        // `\x01VERSION\x01` query form (no argument text, i.e. the byte
+        // right after "VERSION" is the closing 0x01) triggers a reply --
+        // the original's `else` branch (an argument follows: either our own
+        // earlier VERSION request's reply text arriving via ShowVersion, or
+        // a malformed probe) is a UI-launching/history-writing path with no
+        // in-scope event, so it stays suppressed here exactly as the
+        // R20 table already documented for this whole verb before this
+        // batch (that `else` half was never part of the "answer" ask).
+        const char *szOffset = szMesg + g_nVersionLen;
+        if (*szOffset == 0x01) {
+            r.cls = ccPayloadVersionRequest;
+            return r;
+        }
+        r.cls = ccPayloadSuppressed;
+        return r;
+    }
+
+    if (strnicmp(szMesg, pingID, g_nPingLen) == 0 ||
         strnicmp(szMesg, timeID, g_nTimeLen) == 0 ||
         strnicmp(szMesg, fileDCCID, g_nFileDCCLen) == 0 ||
         strnicmp(szMesg, emailID, g_nEmailLen) == 0 ||
@@ -1219,12 +1255,14 @@ static ccPayloadResult ccProcessSay(const char* szNickname, CUserInfo* pui, char
         strnicmp(szMesg, clientInfoID, g_nClientInfoLen) == 0 ||
         strnicmp(szMesg, xvchatID, g_nXVChatLen) == 0 ||
         (*szMesg == 0x01 && szMesg[1] == '*')) {
-        // VERSION/PING/TIME/DCC/EMAIL/URL/NETMEET/CLIENTINFO/X-VCHAT + the
+        // PING/TIME/DCC/EMAIL/URL/NETMEET/CLIENTINFO/X-VCHAT + the
         // "until NOTICE'ed" reply-collection framing -- R20-dropped per the
         // function header comment (outbound-reply-sending or UI-launching,
         // no in-scope event). Also covers the original's bare
         // `*szMesg==0x01 -> goto exitCheckFlood` catch-all (any other CTCP
-        // verb): same net effect, suppressed.
+        // verb): same net effect, suppressed. VERSION was split out above
+        // (Plan 4b Batch C) -- everything else here is untouched, still
+        // documented-silent per the task brief's explicit scope fence.
         r.cls = ccPayloadSuppressed;
         return r;
     }

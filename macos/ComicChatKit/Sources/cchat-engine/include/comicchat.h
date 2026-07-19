@@ -655,6 +655,15 @@ typedef enum cc_proto_event_type {
     CC_EV_NICK_REJECTED,      /* 431/432/433 -> Swift retries */
     CC_EV_AUTH_UNSUPPORTED,   /* SSPI path dropped (R21) */
     CC_EV_STATUS_LINE,        /* catch-all status text (permissive: unknown numerics) */
+    /* Plan 4b Batch C: peer probe queries the original answered silently
+     * on the wire (ReplyVersion/the GetInfo "# HeresInfo:" reply) but this
+     * port previously R20-suppressed with no event at all. Tim opted back
+     * in for these two specifically -- see protsupp.cpp's ccProcessSay/
+     * ccProcessComment doc comments at the exact suppression sites these
+     * un-suppress (cited there by line number). Append-only, per this
+     * header's own contract; PING/TIME/EMAIL/URL/CLIENTINFO stay dropped. */
+    CC_EV_VERSION_REQUEST,    /* bare CTCP \x01VERSION\x01 probe -> from_nick */
+    CC_EV_INFO_REQUEST,       /* "# GetInfo" comment probe -> from_nick */
 } cc_proto_event_type;
 
 typedef struct cc_proto_event {
@@ -712,6 +721,9 @@ typedef struct cc_proto_event {
         struct { int32_t kind; const char* bad_nick; } nick_rejected;  /* CC_EV_NICK_REJECTED */
         struct { int32_t dummy; } auth_unsupported;                    /* CC_EV_AUTH_UNSUPPORTED */
         struct { const char* text; } status_line;                      /* CC_EV_STATUS_LINE */
+        /* Plan 4b Batch C (see the enum's own doc comment above). */
+        struct { const char* from_nick; } version_request;             /* CC_EV_VERSION_REQUEST */
+        struct { const char* from_nick; } info_request;                /* CC_EV_INFO_REQUEST */
     } u;
 } cc_proto_event;
 
@@ -949,6 +961,53 @@ int32_t cc_session_announce_avatar(cc_session* s, uint32_t room_token,
  * tolerating an absent optional field rather than failing. */
 int32_t cc_session_send_sound(cc_session* s, uint32_t room_token,
                               const char* file, const char* text /*nullable*/);
+
+/* Plan 4b Batch C: un-suppressing the two peer probe queries (see
+ * CC_EV_VERSION_REQUEST/CC_EV_INFO_REQUEST's doc comment). Both builders
+ * follow cc_session_announce_avatar's save/restore g_session reentrancy
+ * pattern (that function's own doc comment has the full "why save/restore,
+ * not unconditional-null" reasoning) -- Swift's handleLocked fires these
+ * fire-and-forget from a detached Task off the on_event callback's own
+ * frame, the same posture Task 9's reply-announce already established, so
+ * an unconditional null-on-exit (cc_session_send_sound's simpler posture)
+ * would also be safe here; save/restore is used anyway to match the
+ * explicit precedent the task brief named.
+ *
+ * cc_session_send_version_reply: the original's CRoomInfo::ReplyVersion
+ * (v2.5-beta-1-modern/protsupp.cpp:1126-1163 -- READ-ONLY reference).
+ * Wire grammar (byte-exact reproduction of that sprintf):
+ *   \x01VERSION <version_text>\x01
+ * sent as a NOTICE (bAsNotice=TRUE in the original, unlike the GetInfo
+ * reply below) via bChatSendPrivMesg. `version_text` is caller-supplied
+ * (this port sends its OWN identification string, not the original's
+ * runtime "Microsoft Chat 2.5 (3.0) (comics mode)" — see
+ * ChatSessionModel's version-reply constant for the exact text and why).
+ *
+ * cc_session_send_info_reply: the original's GetInfo-branch reply
+ * (v2.5-beta-1-modern/protsupp.cpp:910-921 -- READ-ONLY reference). Wire
+ * grammar (byte-exact reproduction of that sprintf, HERESINFOPREFIX =
+ * " HeresInfo: ", ircproto.h:85):
+ *   # HeresInfo: <profile_text>
+ * sent as a plain PRIVMSG (bAsNotice=FALSE in the original) via
+ * bChatSendPrivMesg. Built as a single pre-composed string (like
+ * cc_session_announce_avatar's ccBuildAnnounceAvatar) and sent with
+ * uModes=0 rather than routed through bChatSendToTarget's BM_HERESINFO
+ * chunking branch (ircproto.cpp:626-630) -- that branch exists to let the
+ * ORIGINAL's caller pass a bare profile string and have bChatSendToTarget
+ * prepend the "# HeresInfo: " prefix itself; here the prefix is already
+ * part of the one string this builder hands to bChatSendPrivMesg, so the
+ * BM_HERESINFO prefix-stripping path is not needed (same "build the full
+ * line ourselves, send with uModes=0" posture cc_session_announce_avatar
+ * already established for the structurally analogous "# Appears as").
+ *
+ * Both: 0 = ok, non-zero on a NULL session, NULL/empty `to_nick`, or an
+ * unknown/unregistered room_token. `version_text`/`profile_text` NULL is
+ * treated as "" (empty reply body), matching cc_session_send_sound's NULL-
+ * text posture. */
+int32_t cc_session_send_version_reply(cc_session* s, uint32_t room_token,
+                                      const char* to_nick, const char* version_text);
+int32_t cc_session_send_info_reply(cc_session* s, uint32_t room_token,
+                                   const char* to_nick, const char* profile_text);
 
 #ifdef __cplusplus
 }

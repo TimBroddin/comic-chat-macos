@@ -598,6 +598,69 @@ int32_t cc_session_send_sound(cc_session* h, uint32_t room_token, const char* fi
     return rc;
 }
 
+// --- cc_session_send_version_reply / cc_session_send_info_reply (Plan 4b
+// Batch C) --------------------------------------------------------------
+// See comicchat.h's doc comment for both functions' full grammar citation
+// and reentrancy rationale (cc_session_announce_avatar's save/restore
+// g_session precedent).
+
+int32_t cc_session_send_version_reply(cc_session* h, uint32_t room_token, const char* to_nick, const char* version_text) {
+    CCSession* s = reinterpret_cast<CCSession*>(h);
+    if (!s || !to_nick || !*to_nick) return 1;
+    CCSession* prevSession = g_session;
+    g_session = s;
+    int32_t rc = 1;
+    if (ccSessionSelectRoom(s, room_token)) {
+        // Original (protsupp.cpp:1137-1138): sprintf(GetOutBuff(), "%c%.*s
+        // %s %s%c", 0x01, g_nVersionLen-1, versionID+1, strVersion, strMode,
+        // 0x01) -- i.e. \x01VERSION <version_text>\x01 with a single space
+        // before the caller-supplied text (this port's own identification
+        // string takes the place of the original's runtime-built "<product>
+        // (<mode>)" pair -- see ChatSessionModel's version-reply constant).
+        char payload[512];
+        int n = snprintf(payload, sizeof(payload), "%c%.*s %s%c", 0x01,
+                          g_nVersionLen - 1, versionID + 1,
+                          version_text ? version_text : "", 0x01);
+        if (n < 0) n = 0;
+        if ((size_t)n >= sizeof(payload)) n = (int)sizeof(payload) - 1;
+        // bAsNotice=TRUE (unlike the GetInfo reply below) -- matches the
+        // original's VERIFY(bChatSendPrivMesg(..., TRUE)) at protsupp.cpp:1139.
+        BOOL ok = s->proto.bChatSendPrivMesg(to_nick, nullptr, payload, nullptr, TRUE, 0, ccSessionGetOwnIdentity);
+        rc = ok ? 0 : 1;
+    }
+    g_session = prevSession;
+    return rc;
+}
+
+int32_t cc_session_send_info_reply(cc_session* h, uint32_t room_token, const char* to_nick, const char* profile_text) {
+    CCSession* s = reinterpret_cast<CCSession*>(h);
+    if (!s || !to_nick || !*to_nick) return 1;
+    CCSession* prevSession = g_session;
+    g_session = s;
+    int32_t rc = 1;
+    if (ccSessionSelectRoom(s, room_token)) {
+        // Original (protsupp.cpp:919): sprintf(GetOutBuff(), "#%s%s",
+        // HERESINFOPREFIX, strProfile) -- i.e. "# HeresInfo: <profile>"
+        // (HERESINFOPREFIX = " HeresInfo: ", ircproto.h:85). Built as one
+        // pre-composed string (like cc_session_announce_avatar's
+        // ccBuildAnnounceAvatar) and sent with uModes=0 rather than routed
+        // through bChatSendToTarget's BM_HERESINFO prefix-stripping branch --
+        // see comicchat.h's doc comment for the full "why uModes=0" reasoning.
+        char payload[512];
+        int n = snprintf(payload, sizeof(payload), "#%s%s", HERESINFOPREFIX,
+                          profile_text ? profile_text : "");
+        if (n < 0) n = 0;
+        if ((size_t)n >= sizeof(payload)) n = (int)sizeof(payload) - 1;
+        // bAsNotice=FALSE -- matches the original's VERIFY(bChatSendPrivMesg(
+        // ..., FALSE, BM_HERESINFO)) at protsupp.cpp:920 (uModes differs --
+        // see the doc comment above -- but bAsNotice is reproduced exactly).
+        BOOL ok = s->proto.bChatSendPrivMesg(to_nick, nullptr, payload, nullptr, FALSE, 0, ccSessionGetOwnIdentity);
+        rc = ok ? 0 : 1;
+    }
+    g_session = prevSession;
+    return rc;
+}
+
 int32_t cc_session_send_whisper(cc_session* h, uint32_t room_token, const cc_annotations* ann, const char* text, const char* const* nicks, int32_t nick_count) {
     CCSession* s = reinterpret_cast<CCSession*>(h);
     if (!s || !text || !nicks || nick_count <= 0) return 1;

@@ -695,6 +695,20 @@ static void ccHandleCommand(CCSession& sess, char *szLine, PIRCPARSE pParse)
 						ev.u.appears_as.url = (LPCTSTR)res.avatarUrl;
 						ccEmitProtoEvent(&ev);
 						break;
+					case ccPayloadInfoRequest:
+						// Plan 4b Batch C: "# GetInfo" comment probe arriving
+						// out-of-band via IRCX DATA instead of PRIVMSG (rare,
+						// but OnDataMsg's own "# " dispatch reaches the same
+						// ccProcessComment this classification comes from --
+						// see OnDataMsg's doc comment above). VERSION never
+						// reaches this switch: it's a ccProcessSay/CTCP
+						// classification, and OnDataMsg only ever calls
+						// ccProcessComment or ProcessUDIData, never
+						// ccProcessSay.
+						ev.type = CC_EV_INFO_REQUEST;
+						ev.u.info_request.from_nick = pParse->nick;
+						ccEmitProtoEvent(&ev);
+						break;
 					default:
 						// ccPayloadSuppressed (an unrecognized "# " comment
 						// grammar arrived via DATA) -- no event, matching the
@@ -1005,6 +1019,18 @@ static void ccHandleCommand(CCSession& sess, char *szLine, PIRCPARSE pParse)
 							ev.u.appears_as.url = (LPCTSTR)res.avatarUrl;
 							ccEmitProtoEvent(&ev);
 							break;
+						case ccPayloadVersionRequest:
+							// Plan 4b Batch C: bare CTCP \x01VERSION\x01 probe.
+							ev.type = CC_EV_VERSION_REQUEST;
+							ev.u.version_request.from_nick = pParse->nick;
+							ccEmitProtoEvent(&ev);
+							break;
+						case ccPayloadInfoRequest:
+							// Plan 4b Batch C: "# GetInfo" comment probe.
+							ev.type = CC_EV_INFO_REQUEST;
+							ev.u.info_request.from_nick = pParse->nick;
+							ccEmitProtoEvent(&ev);
+							break;
 						default:
 							// ccPayloadSuppressed/ccPayloadData (DATA-only class,
 							// never returned by OnTextMsg) -- no event, matching
@@ -1225,6 +1251,22 @@ static void ccHandleCommand(CCSession& sess, char *szLine, PIRCPARSE pParse)
 						ev.u.appears_as.nick = pParse->nick;
 						ev.u.appears_as.avatar_name = (LPCTSTR)res.avatarName;
 						ev.u.appears_as.url = (LPCTSTR)res.avatarUrl;
+						ccEmitProtoEvent(&ev);
+						break;
+					case ccPayloadVersionRequest:
+						// Plan 4b Batch C: bare CTCP \x01VERSION\x01 probe
+						// arriving over WHISPER (rare, but OnTextMsg's own
+						// grammar doesn't exclude it -- see this site's own
+						// doc comment above on WHISPER routing through
+						// OnTextMsg like any other msgType).
+						ev.type = CC_EV_VERSION_REQUEST;
+						ev.u.version_request.from_nick = pParse->nick;
+						ccEmitProtoEvent(&ev);
+						break;
+					case ccPayloadInfoRequest:
+						// Plan 4b Batch C: "# GetInfo" comment probe over WHISPER.
+						ev.type = CC_EV_INFO_REQUEST;
+						ev.u.info_request.from_nick = pParse->nick;
 						ccEmitProtoEvent(&ev);
 						break;
 					default:

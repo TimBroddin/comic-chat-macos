@@ -858,6 +858,12 @@ public final class AppState {
                              // `nil` (own_user falls back to nick, same as
                              // before this task).
                              realName: settings.realName.isEmpty ? nil : settings.realName,
+                             // Plan 4b Batch C: seeds the session with
+                             // whatever profile text was last persisted; a
+                             // live Settings edit after connect goes through
+                             // `setProfileText` instead (`PersonaSettingsView`'s
+                             // binding), not this seed.
+                             profileText: settings.profileText,
                              sendComicsData: settings.sendComicsData,
                              acceptWhispers: settings.acceptWhispers,
                              // Plan 4b Task 6: gates the .appearsAs-triggered

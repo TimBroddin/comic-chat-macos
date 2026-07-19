@@ -21,6 +21,11 @@ public struct ChatConfig: Sendable {
     /// preserves the pre-Task-5 nick-fallback behavior.
     public var userName: String?
     public var realName: String?
+    /// Plan 4b Batch C: the free-text reply body a peer's `# GetInfo` probe
+    /// receives (`SettingsStore.profileText`'s plumbed-through value). Empty
+    /// string (default) is a legal, honest reply — see
+    /// `ChatSessionModel`'s `.infoRequest` case for the exact wire behavior.
+    public var profileText: String
     /// Gates `send(_:mode:)`'s outbound cooked pose annotations: `false` ->
     /// `annotations: nil` (peers then run text inference — the original's
     /// ComicsData toggle semantics). `true` (default) matches every prior
@@ -60,6 +65,7 @@ public struct ChatConfig: Sendable {
                 encoding: WireEncoding = .cp1252, characterName: String = "anna",
                 backdropName: String = "field", artDir: String,
                 userName: String? = nil, realName: String? = nil,
+                profileText: String = "",
                 sendComicsData: Bool = true, acceptWhispers: Bool = true,
                 autoDownloadAvatars: Bool = true, panelsPerRow: Int = 0,
                 autoReconnect: Bool = true) {
@@ -73,6 +79,7 @@ public struct ChatConfig: Sendable {
         self.artDir = artDir
         self.userName = userName
         self.realName = realName
+        self.profileText = profileText
         self.sendComicsData = sendComicsData
         self.acceptWhispers = acceptWhispers
         self.autoDownloadAvatars = autoDownloadAvatars
@@ -288,6 +295,16 @@ public enum ReconnectState: Sendable, Equatable {
 /// the login-continuation a single serialized owner, avoiding a second,
 /// independent point of mutation off the engine queue.
 public final class ChatSessionModel: @unchecked Sendable {
+    /// Plan 4b Batch C: this port's own CTCP VERSION reply text, sent via
+    /// `session.sendVersionReply` for a `.versionRequest` event. NOT the
+    /// original's runtime-built "Microsoft Chat 2.5 (3.0) (comics mode)"
+    /// (`GetVersionString`/`IDS_COMICS_MODE`, protsupp.cpp:1126-1138 — see
+    /// `cc_session_send_version_reply`'s comicchat.h doc comment) — this is a
+    /// different, honest client identifying itself as what it actually is, a
+    /// static constant rather than a fabricated impersonation of the
+    /// original's exact string.
+    public static let versionReplyText = "Microsoft Comic Chat for macOS (open-source port) - comicchat 2.5 engine"
+
     public var onStripImage: (@Sendable (CGImage, CGSize) -> Void)?
     /// Plan 4b Task 8: widened from `[String]` to `[MemberRow]` — same
     /// snapshot+seq-guard delivery as before (`emitMembers`'s doc comment),
@@ -532,6 +549,19 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// 8's `toNick:` announce) — guards the "first `.appearsAs` from an
     /// unseen nick" rule so a nick's later avatar changes don't re-announce.
     private var announcedBackTo: Set<String> = []
+    /// Plan 4b Batch C: last-reply timestamp per nick, shared by BOTH
+    /// `.versionRequest` and `.infoRequest` (one dict, not two — a peer
+    /// hammering us with alternating VERSION/GetInfo probes is still one
+    /// "nick spamming probes" case, not two independent budgets). A
+    /// deliberate MODERN guard the original never had (its own
+    /// ReplyVersion/GetInfo-reply branches only gated on ignore/flood
+    /// flags, never a probe-specific cooldown) — added per the task brief's
+    /// explicit ask ("one reply per nick per 10s"), engine-queue-local like
+    /// `announcedBackTo` above since both are read/written only from
+    /// `handleLocked` (ENGINE QUEUE ONLY).
+    private var lastProbeReplyAt: [String: Date] = [:]
+    /// The rate-limit window `lastProbeReplyAt` enforces (Plan 4b Batch C).
+    private static let probeReplyCooldown: TimeInterval = 10
     /// Own-say echo dedup (4a final-review carryover, Plan 4b Task 1): some
     /// IRC servers echo a client's own PRIVMSG back to the sender. `send(_:)`
     /// already renders the own line immediately via a synthetic local
@@ -1648,9 +1678,59 @@ public final class ChatSessionModel: @unchecked Sendable {
         case .awayPeer:
             emitMembers(for: activeRoom)
 
+        // Plan 4b Batch C: answer the two peer probes Tim opted back into
+        // (VERSION/GetInfo — see `comicchat.h`'s `CC_EV_VERSION_REQUEST`/
+        // `CC_EV_INFO_REQUEST` doc comments for the un-suppression
+        // citation). Both follow the SAME shape as `.appearsAs`'s own
+        // reply-announce just above: resolve a channel to send the private
+        // reply through (`ccSessionSelectRoom`, which every outbound builder
+        // needs a room_token for, requires SOME registered room even for a
+        // reply that is itself a private PRIVMSG/NOTICE to one nick — there
+        // is no session-wide "no room" send path), fire-and-forget via a
+        // detached `Task`, and rate-limit per nick (see `lastProbeReplyAt`'s
+        // own doc comment for why one shared dict covers both cases).
+        case .versionRequest(let fromNick):
+            replyToProbeIfDueLocked(fromNick, scopedRoom: scopedRoom) { channel in
+                Task { [session] in
+                    try? await session.sendVersionReply(channel: channel, toNick: fromNick,
+                                                        versionText: Self.versionReplyText)
+                }
+                self.emitStatus("Sent version info to \(fromNick)")
+            }
+
+        case .infoRequest(let fromNick):
+            replyToProbeIfDueLocked(fromNick, scopedRoom: scopedRoom) { channel in
+                let profile = self.config.profileText
+                Task { [session] in
+                    try? await session.sendInfoReply(channel: channel, toNick: fromNick, profileText: profile)
+                }
+                self.emitStatus("Sent profile info to \(fromNick)")
+            }
+
         default:
             break
         }
+    }
+
+    /// ENGINE QUEUE ONLY (Plan 4b Batch C). Shared plumbing for
+    /// `.versionRequest`/`.infoRequest`: resolves a channel to reply through
+    /// (`scopedRoom` if this probe arrived room-scoped, else the active
+    /// room's display name — same fallback `.appearsAs`'s reply-announce
+    /// uses just above) and enforces the per-nick 10s cooldown
+    /// (`lastProbeReplyAt`). Skips silently (no reply, no status line) if
+    /// there's no channel to send through OR the nick replied to within the
+    /// last `probeReplyCooldown` seconds — a deliberate modern anti-spam
+    /// guard the original never had (see `lastProbeReplyAt`'s doc comment).
+    private func replyToProbeIfDueLocked(_ fromNick: String, scopedRoom: String? = nil,
+                                         _ send: (String) -> Void) {
+        let now = Date()
+        if let last = lastProbeReplyAt[fromNick], now.timeIntervalSince(last) < Self.probeReplyCooldown {
+            return
+        }
+        let channel = scopedRoom ?? rooms[activeRoom]?.displayName ?? ""
+        guard !channel.isEmpty else { return }
+        lastProbeReplyAt[fromNick] = now
+        send(channel)
     }
 
     /// ENGINE QUEUE ONLY. A channel-scoped strip message (`.text`/`.action`):
@@ -2770,6 +2850,19 @@ public final class ChatSessionModel: @unchecked Sendable {
             self.config.panelsPerRow = perRow
             guard self.didSetViewport, self.lastViewportWidthPoints > 0 else { return }
             self.applyViewportLocked(widthPoints: self.lastViewportWidthPoints, scale: self.currentScale)
+        }
+    }
+
+    /// Plan 4b Batch C: updates `config.profileText` live (no reflow needed —
+    /// unlike `setPanelsPerRow` above, this value is only ever READ at
+    /// `.infoRequest` reply time, `handleLocked`'s own case, never affects
+    /// the strip). Lets the Persona tab's profile `TextEditor` write straight
+    /// through to an already-connected session, same "Settings edit applies
+    /// immediately" posture as `changeCharacter`/`changeBackdrop`.
+    public func setProfileText(_ text: String) {
+        engineQueue.async { [weak self] in
+            guard let self, !self.isShutDown else { return }
+            self.config.profileText = text
         }
     }
 
