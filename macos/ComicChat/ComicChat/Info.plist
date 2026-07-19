@@ -24,5 +24,27 @@
 	<string>NSApplication</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Comic Chat</string>
+	<!--
+	  Live-fix 2 (Plan 4b, crypthome.com live-reproduced): a real avatar
+	  announce on the wire ("# Appears as Belle'sBotTinkerBelle.http://www
+	  .mermeliz.com/anneseeker/dl/Belle'sBotTinkerBelle.AVB") points at a
+	  plain-HTTP URL -- App Transport Security blocked AvatarDownloader's
+	  fetch outright. The 1998-era community avatar-art ecosystem this app
+	  interoperates with (fan sites hosting .AVB/.BGB files) predates HTTPS
+	  entirely and has no TLS-serving successor to migrate to; this is a
+	  personal interop client for a legacy protocol, not an App Store
+	  submission subject to ATS's App Store Review Guidelines carve-outs, so
+	  a blanket exception (rather than a per-domain NSExceptionDomains list,
+	  which would need updating for every new avatar-hosting site a user
+	  encounters) is the correct scope here. AvatarDownloader (ComicChatKit)
+	  runs its URLSession fetch in-process inside THIS app (the Kit has no
+	  separate process of its own), so this app's Info.plist is the one that
+	  governs the request -- there is no other ATS boundary to configure.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

@@ -131,5 +131,16 @@ struct AppCommands: Commands {
             }
             .disabled(appState.model == nil)
         }
+
+        // Live-fix 4 (Tim's request: "show the MOTD like the original
+        // client"): appended to the standard Window menu (not gated on a
+        // live session — the console is a running log across the whole app
+        // session, so it's openable even while disconnected to review
+        // earlier messages).
+        CommandGroup(after: .windowArrangement) {
+            Button("Server Messages") {
+                openWindow(id: "server-console")
+            }
+        }
     }
 }

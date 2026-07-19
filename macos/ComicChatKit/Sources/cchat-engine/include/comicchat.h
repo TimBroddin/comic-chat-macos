@@ -643,6 +643,26 @@ typedef struct cc_proto_event {
 uint32_t cc_session_register_room(cc_session* s, const char* channel);
 /* Look up a room_token's channel name; "" if token is unknown/out of range. */
 const char* cc_session_room_channel(cc_session* s, uint32_t room_token);
+/* Live-fix 1 (Plan 4b): overwrites an ALREADY-registered token's channel
+ * string in place (the SAME token, no new registration) -- for the one case
+ * `cc_session_register_room` cannot handle: a server that echoes a join
+ * confirm using DIFFERENT case than the channel name Swift originally
+ * registered (e.g. we `JOIN #crypt`, the server's JOIN echo/every subsequent
+ * PRIVMSG names `#Crypt`). IRC channel names are case-insensitive
+ * (RFC 1459 Section 2.3.1), but every channel-name comparison in this engine
+ * (`ccSessionRoomTokenForChannel`'s `==` scan, this file's own doc comment
+ * on cc_session_register_room) is a byte-exact C-string compare with no
+ * folding -- so a token registered under one casing silently fails to
+ * resolve ANY inbound wire line naming that same room under a different
+ * casing (its cc_proto_event arrives with room_token == CC_ROOM_TOKEN_NONE,
+ * i.e. looking session-scoped rather than room-scoped, to every downstream
+ * consumer). Swift calls this once it learns the server's authoritative
+ * casing (the join confirm) so the ENGINE's own channel table -- not just
+ * Swift's bookkeeping -- agrees with the server from that point on. No-op
+ * (returns non-zero) if room_token is out of range; channel must be the
+ * WIRE-encoded channel name, matching cc_session_register_room's own
+ * contract. */
+int32_t cc_session_update_room_channel(cc_session* s, uint32_t room_token, const char* channel);
 
 int32_t cc_session_join(cc_session* s, const char* channel, const char* key /*nullable*/);
 int32_t cc_session_part(cc_session* s, uint32_t room_token, const char* reason /*nullable*/);

@@ -81,7 +81,22 @@ public struct WhisperLine: Sendable, Equatable {
 /// active. Background rooms cache their last composed image (`lastImage`) so a
 /// tab switch away and back is instant, and count `unread` MESSAGES (only
 /// `.text`/`.action`/whisper-carried content — NOT joins/parts/names).
+///
+/// Live-fix 1 (crypthome.com, live-reproduced): `rooms`/`roomOrder` are keyed
+/// by `ChatSessionModel.roomKey(_:)` — a case-folded canonical form — NOT the
+/// raw channel string, since IRC channel names are case-insensitive
+/// (RFC 1459 §2.3.1) but our own bookkeeping used to be byte-exact, so a
+/// server that echoes `JOIN #crypt` back as `#Crypt` (a real, observed
+/// behavior) created a SECOND room box for the same channel. `displayName`
+/// carries the presentation-form name shown in the tab bar/strip title/wire
+/// calls — seeded from whatever casing FIRST created the box (typically our
+/// own locally-typed room name) and updated to the SERVER's casing the
+/// moment a `.selfJoined` confirm (or any other authoritative server-cased
+/// channel payload) arrives for it, so the UI ends up showing the server's
+/// canonical form, matching the original 1998 client's own display
+/// convention (it always showed whatever casing the server used).
 struct RoomBox {
+    var displayName: String
     var transcript: [ProtocolEvent] = []
     var lastImage: CGImage?
     var lastSizePoints: CGSize = .zero
@@ -216,6 +231,27 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// `AVAudioPlayer` + `SoundLibrary` resolution; this Kit stays
     /// AVFoundation-free.
     public var onSound: (@Sendable (String, String) -> Void)?
+    /// Live-fix 3 (crypthome.com, live-reproduced: `432 Anonymous :Reserved
+    /// name` dead-ended the session with only a transient status line).
+    /// Fired on the MAIN thread from the `.nickRejected` case — `(badNick,
+    /// humanText)`, where `humanText` is a ready-to-show sentence (not just
+    /// the raw wire reason) so the app layer can present it directly (an
+    /// alert, per the app-side wiring). The session is NOT torn down here —
+    /// the app layer owns disconnecting/reopening the connect sheet (mirrors
+    /// `onStatus`/every other "surface it, app decides what to do" callback
+    /// on this type).
+    public var onNickRejected: (@Sendable (String, String) -> Void)?
+    /// Live-fix 4 (Tim's request: "show the MOTD like the original client";
+    /// also fixes error-notes being clobbered by the next status line).
+    /// Fired on the MAIN thread with ONE formatted line for each of
+    /// `.motd`/`.statusLine`/`.error`/`.disconnectedHint` — the running
+    /// server-messages console (`ServerConsoleWindow`) accumulates these
+    /// separately from `onStatus` (which only ever shows the LATEST line,
+    /// clobbering whatever came before it). Fires IN ADDITION to the
+    /// existing `onStatus`/`emitStatus` calls those same cases already make
+    /// — this is an additional accumulating view onto the same information,
+    /// not a replacement.
+    public var onServerMessage: (@Sendable (String) -> Void)?
 
     /// `var` (Plan 4b Task 5): `changeCharacter` updates the model's OWN
     /// notion of `config.characterName` so a subsequent `reflowLocked()` (or
@@ -246,7 +282,9 @@ public final class ChatSessionModel: @unchecked Sendable {
 
     // MARK: Engine-queue-owned state (touched ONLY on `engineQueue`)
 
-    /// Per-room state (Plan 4b Task 7: true multi-room), keyed by channel,
+    /// Per-room state (Plan 4b Task 7: true multi-room), keyed by
+    /// `roomKey(_:)` (live-fix 1 — see that method's doc comment for why this
+    /// is a case-folded canonical form rather than the raw channel string),
     /// engine-queue-owned. Each room's `transcript` is the canonical event log
     /// for THAT room — every `ProtocolEvent` scoped to it, in arrival order,
     /// INCLUDING the synthetic self-say events `send(_:)` injects and the
@@ -254,14 +292,54 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// EVERY room's transcript — clarification 1). The ACTIVE room's
     /// transcript is what `setViewport`'s reflow replays against (D2 §2.3:
     /// "the transcript = the event log; reflow = destroy strip -> recreate ->
-    /// re-apply transcript"). `roomOrder` preserves join order for the tab bar.
+    /// re-apply transcript"). `roomOrder` preserves join order for the tab bar
+    /// (also canonical keys — resolve `rooms[key]!.displayName` for anything
+    /// user-visible).
     private var rooms: [String: RoomBox] = [:]
-    /// Join order (initial room first) — the order `RoomTabBar` shows tabs.
+    /// Join order (initial room first), canonical keys — the order
+    /// `RoomTabBar` shows tabs (via `roomInfosLocked()`, which resolves each
+    /// key's `displayName`).
     private var roomOrder: [String] = []
-    /// The channel whose transcript currently owns the ONE live strip. Seeded
-    /// from `config.room` in `start()`. `setActiveRoom` swaps it (destroy strip
-    /// -> rebuild from the new room's transcript -> recompose).
+    /// The CANONICAL KEY (`roomKey(_:)`) of the room whose transcript
+    /// currently owns the ONE live strip. Seeded from `roomKey(config.room)`
+    /// in `start()`. `setActiveRoom` swaps it (destroy strip -> rebuild from
+    /// the new room's transcript -> recompose). Always look up
+    /// `rooms[activeRoom]?.displayName` for anything user-visible (the strip
+    /// title, wire calls) — `activeRoom` itself is a lookup key, not
+    /// necessarily what the server or user typed.
     private var activeRoom: String = ""
+
+    /// Live-fix 1 (crypthome.com, live-reproduced — `JOIN #crypt` echoed back
+    /// as `#Crypt` created a permanently-empty second tab): canonicalizes a
+    /// channel name for internal room-bookkeeping keys (`rooms`/`roomOrder`/
+    /// `activeRoom`), matching IRC's case-insensitive channel-name rule
+    /// (RFC 1459 §2.3.1: channels fold ASCII letters AND `[]\^` <->`{}|~`).
+    /// This is Swift-side-only: the C engine's own room-token table
+    /// (`bridge/cc_session.cpp`'s `cc_session_register_room`/
+    /// `ccSessionIsJoinedChannel`) does a byte-exact `==` comparison with NO
+    /// folding of its own (verified — no `tolower`/casemap helper exists
+    /// anywhere in `engine/ircsock.cpp`'s channel-comparison call sites), so
+    /// there is nothing on the engine side to "match" — the engine simply
+    /// keys its token table off whatever string Swift hands
+    /// `cc_session_register_room` via `ProtocolSession.join(_:)`. As long as
+    /// THIS type always calls `session.join`/`.part`/etc. with a single
+    /// consistent per-room string (this fix uses `displayName`, updated to
+    /// the server's own casing on `.selfJoined` — see `RoomBox`'s doc
+    /// comment), the engine's separate token table stays internally
+    /// consistent with no folding needed there.
+    private func roomKey(_ channel: String) -> String {
+        var folded = channel.lowercased()
+        // RFC 1459 §2.3.1's extended fold: `[]\^` <-> `{}|~` are the
+        // lowercase/uppercase pairs for the four punctuation characters IRC
+        // permits in a nick/channel name (a nick-casing rule channels
+        // inherit). `String.lowercased()` above already folds ASCII letters;
+        // this closes the remaining four characters case-insensitivity would
+        // otherwise miss (e.g. a server that echoes `#a-team[mac]` back as
+        // `#A-Team{MAC}` must still resolve to the same room).
+        let foldMap: [Character: Character] = ["[": "{", "]": "}", "\\": "|", "^": "~"]
+        folded = String(folded.map { foldMap[$0] ?? $0 })
+        return folded
+    }
     /// Session-scoped event log (Plan 4b Task 7, clarification 2): whisper/
     /// status/login/error events (token 0 — `channel == nil`) that belong to
     /// no single room. Kept for Task 10 (save) / Task 11 (text view), which
@@ -500,9 +578,12 @@ public final class ChatSessionModel: @unchecked Sendable {
     }
 
     /// Thread-safe snapshot of `room`'s event log (Plan 4b Task 7), or `[]` if
-    /// that room isn't joined. Task 10/11 read this per-room.
+    /// that room isn't joined. Task 10/11 read this per-room. `room` is
+    /// case-folded via `roomKey(_:)` (live-fix 1) so a caller can pass either
+    /// the display-cased name (e.g. from `RoomInfo.name`) or any other casing
+    /// and still resolve the same room.
     public func transcript(for room: String) -> [ProtocolEvent] {
-        engineQueue.sync { rooms[room]?.transcript ?? [] }
+        engineQueue.sync { rooms[roomKey(room)]?.transcript ?? [] }
     }
 
     /// Thread-safe snapshot of the session-scoped event log (Plan 4b Task 7,
@@ -520,9 +601,14 @@ public final class ChatSessionModel: @unchecked Sendable {
         engineQueue.sync { roomInfosLocked() }
     }
 
-    /// Thread-safe snapshot of the active room's name (Plan 4b Task 7).
+    /// Thread-safe snapshot of the active room's DISPLAY name (Plan 4b Task
+    /// 7; live-fix 1 — `activeRoom` itself is now a case-folded lookup key,
+    /// not necessarily what the server or user typed, so this resolves
+    /// `rooms[activeRoom]?.displayName` rather than returning the key
+    /// directly. Falls back to the raw key if the active room somehow has no
+    /// box (shouldn't happen — defensive only).
     public var currentRoom: String {
-        engineQueue.sync { activeRoom }
+        engineQueue.sync { rooms[activeRoom]?.displayName ?? activeRoom }
     }
 
     /// Thread-safe snapshot of our own current nick (final-review Important
@@ -591,10 +677,16 @@ public final class ChatSessionModel: @unchecked Sendable {
             // Seed the initial room (Plan 4b Task 7) BEFORE building the strip:
             // `activeRoom`/`rooms[activeRoom]` must exist so `_transcript`
             // (now the active room's transcript) and the strip title resolve.
-            self.activeRoom = self.config.room
-            if self.rooms[self.config.room] == nil {
-                self.rooms[self.config.room] = RoomBox()
-                self.roomOrder = [self.config.room]
+            // Live-fix 1: `activeRoom`/`rooms` key on `roomKey(config.room)`
+            // (case-folded); `displayName` starts as the raw, locally-typed
+            // `config.room` and is updated to the server's own casing the
+            // moment `.selfJoined` confirms the join (`handleLocked`'s
+            // `.selfJoined` case, via `ensureRoomBoxLocked`).
+            let key = self.roomKey(self.config.room)
+            self.activeRoom = key
+            if self.rooms[key] == nil {
+                self.rooms[key] = RoomBox(displayName: self.config.room)
+                self.roomOrder = [key]
             }
             try self.setUpStripLocked(isReflow: false)
         }
@@ -654,11 +746,14 @@ public final class ChatSessionModel: @unchecked Sendable {
         // (`recomposeLocked` skips while `panelCount == 0`), exactly the gap
         // `FixtureReplayServerTests` exercises (a fixture with a login/join
         // sequence but no chat message at all).
-        // Title = the ACTIVE room (Plan 4b Task 7). On a fresh `start()`,
-        // `activeRoom` was just seeded to `config.room`; on a reflow or a
-        // `setActiveRoom` rebuild, it is the room whose transcript is about to
-        // be replayed — so the strip's starring panel names the right room.
-        try newStrip.setTitle(activeRoom)
+        // Title = the ACTIVE room's DISPLAY name (Plan 4b Task 7; live-fix 1:
+        // `activeRoom` is now a case-folded lookup key, not necessarily what
+        // the server/user typed — resolve `displayName` for anything shown to
+        // the user). On a fresh `start()`, `activeRoom` was just seeded to
+        // `roomKey(config.room)`; on a reflow or a `setActiveRoom` rebuild, it
+        // is the room whose transcript is about to be replayed — so the
+        // strip's starring panel names the right room.
+        try newStrip.setTitle(rooms[activeRoom]?.displayName ?? activeRoom)
         // extraDirs (Plan 4b Task 6): the user characters dir is searched
         // BEFORE comicartDir (D1 §4.3) — a downloaded avatar shadows a
         // same-named bundled one, and (the reflow-coherence payoff) a
@@ -797,20 +892,51 @@ public final class ChatSessionModel: @unchecked Sendable {
         // payload channel keeps `.selfJoined` in its room's transcript
         // regardless of that timing (verified: FixtureReplayServerTests, whose
         // fixture sends the JOIN echo immediately after 001).
-        let scopedRoom = channel ?? intrinsicChannel(of: ev)
-        let isActiveRoom = (scopedRoom != nil && scopedRoom == activeRoom)
+        //
+        // Live-fix 1: `scopedRoom` is the DISPLAY-cased channel string exactly
+        // as it arrived on the wire (or from the event's own payload) — NOT a
+        // lookup key. `scopedKey` is its case-folded form (`roomKey(_:)`),
+        // used for every `rooms[...]` dictionary touch below; `scopedRoom`
+        // itself is kept around only for wire calls that need the actual
+        // channel string (`session.announceAvatar`, etc.) and, via
+        // `ensureRoomBoxLocked`, to update a room's `displayName` to the
+        // server's own casing.
+        //
+        // ORDER FLIPPED from the token-resolved-first shape the doc comment
+        // above describes (live-fix 1 addendum): `intrinsicChannel(of: ev)`
+        // is preferred FIRST for `.selfJoined`/`.selfParted` specifically.
+        // `channel` (the token-resolved string) is `cc_session_room_channel`'s
+        // return value, which is whatever string THIS SIDE originally passed
+        // to `cc_session_register_room` (i.e. `join(_:)`'s caller-supplied
+        // name, frozen at registration time — the engine's own channel table
+        // never updates it). The event's OWN payload channel, in contrast, is
+        // the ACTUAL wire bytes the server just sent (`ircsock.cpp`'s JOIN
+        // handler assigns `ev.u.self_joined.channel = pParse->args[1]`
+        // verbatim) — which is exactly the server's authoritative casing this
+        // fix needs to update `displayName` from. Using the token-resolved
+        // channel here (the pre-fix/pre-addendum shape) would silently keep
+        // showing whatever casing WE originally typed forever, since it never
+        // changes once registered — defeating the fix for the very case it
+        // targets (server echoes back a DIFFERENT case than what we joined
+        // with). Every other event type is unaffected: `intrinsicChannel`
+        // returns `nil` for anything but `.selfJoined`/`.selfParted`, so the
+        // `??` falls through to the token-resolved `channel` exactly as
+        // before for every other case.
+        let scopedRoom = intrinsicChannel(of: ev) ?? channel
+        let scopedKey = scopedRoom.map(roomKey)
+        let isActiveRoom = (scopedKey != nil && scopedKey == activeRoom)
         // `.selfParted` for a room we already dropped (via `leaveRoom`, which
         // removes the box BEFORE the server's part-confirm echo lands) must
         // NOT re-create the box (which would re-add a phantom tab). It routes
         // to the session transcript instead and the `.selfParted` case below
         // is a no-op for an already-gone room.
         let isPartOfDepartedRoom: Bool = {
-            if case .selfParted(let ch) = ev { return rooms[ch] == nil }
+            if case .selfParted(let ch) = ev { return rooms[roomKey(ch)] == nil }
             return false
         }()
-        if let room = scopedRoom, !isPartOfDepartedRoom {
+        if let room = scopedRoom, let key = scopedKey, !isPartOfDepartedRoom {
             ensureRoomBoxLocked(room)
-            rooms[room]!.transcript.append(ev)
+            rooms[key]!.transcript.append(ev)
         } else {
             sessionTranscript.append(ev)
         }
@@ -828,12 +954,16 @@ public final class ChatSessionModel: @unchecked Sendable {
             // this just ensures the box exists and announces our avatar IN
             // THAT CHANNEL (clarification 1: the per-CRoomInfo announce goes
             // to the joined channel, not a hard-coded `config.room`).
+            // `ensureRoomBoxLocked` also updates `displayName` to the
+            // server's own casing here (live-fix 1) — this IS the join
+            // confirm, the authoritative moment the server's casing is known.
             ensureRoomBoxLocked(joinedChannel)
+            let joinedKey = roomKey(joinedChannel)
             let name = config.characterName.capitalized
             Task { [session] in
                 try? await session.announceAvatar(channel: joinedChannel, name: name)
             }
-            if joinedChannel == activeRoom { recomposeLocked() }
+            if joinedKey == activeRoom { recomposeLocked() }
             emitRooms()
 
         case .selfParted(let partedChannel):
@@ -845,10 +975,11 @@ public final class ChatSessionModel: @unchecked Sendable {
             // part / self-kick the app didn't drive) — drop it the same way
             // `leaveRoom` does: remove the box/tab, and if it was active,
             // fall back to another room or clear the strip.
-            if rooms[partedChannel] != nil {
-                let wasActive = (partedChannel == activeRoom)
-                rooms.removeValue(forKey: partedChannel)
-                roomOrder.removeAll { $0 == partedChannel }
+            let partedKey = roomKey(partedChannel)
+            if rooms[partedKey] != nil {
+                let wasActive = (partedKey == activeRoom)
+                rooms.removeValue(forKey: partedKey)
+                roomOrder.removeAll { $0 == partedKey }
                 if wasActive {
                     if let fallback = roomOrder.first {
                         rebuildStripLocked(for: fallback, resetAnnounce: false)
@@ -912,11 +1043,18 @@ public final class ChatSessionModel: @unchecked Sendable {
             if !isOwnAnnounce, !announcedBackTo.contains(nick) {
                 announcedBackTo.insert(nick)
                 let name = config.characterName.capitalized
-                let announceChannel = scopedRoom ?? activeRoom
-                // Final-review minor: `activeRoom` can be "" (no room joined
-                // yet, or the last room just left) — a reply-announce with an
-                // empty channel has nowhere sensible to go on the wire, so
-                // skip it rather than sending a malformed announce.
+                // Live-fix 1: `activeRoom` is a case-folded LOOKUP KEY, not a
+                // real channel string — sending it straight to the wire (the
+                // pre-fix shape) would announce into a channel that may not
+                // even exist in that exact casing. Resolve the active room's
+                // DISPLAY name (the actual, server-known channel string)
+                // instead; `scopedRoom` (the wire-cased channel this event
+                // itself arrived on) is preferred when available.
+                let announceChannel = scopedRoom ?? rooms[activeRoom]?.displayName ?? ""
+                // Final-review minor: the resolved channel can be "" (no room
+                // joined yet, or the last room just left) — a reply-announce
+                // with an empty channel has nowhere sensible to go on the
+                // wire, so skip it rather than sending a malformed announce.
                 if !announceChannel.isEmpty {
                     Task { [session] in
                         try? await session.announceAvatar(channel: announceChannel, toNick: nick, name: name)
@@ -957,11 +1095,11 @@ public final class ChatSessionModel: @unchecked Sendable {
             // background room's unread. An OWN message (`!fromServer` — the
             // synthetic self-say into a background room) renders but never
             // bumps unread (you don't have unread from yourself).
-            handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedRoom,
+            handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedKey,
                                          isMessage: !isWhisper && fromServer)
 
         case .action:
-            handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedRoom,
+            handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedKey,
                                          isMessage: fromServer)
 
         case .whisper(let nick, _, let text, _):
@@ -1001,7 +1139,7 @@ public final class ChatSessionModel: @unchecked Sendable {
             // its next activation (transcript already appended). A join does
             // NOT bump unread (clarification 3).
             if isActiveRoom { applyToBridgeLocked(ev); recomposeLocked() }
-            if let room = scopedRoom { emitMembers(for: room) }
+            if let key = scopedKey { emitMembers(for: key) }
 
         case .nickChanged(_, let newNick, let isSelf):
             if isSelf {
@@ -1012,7 +1150,7 @@ public final class ChatSessionModel: @unchecked Sendable {
             emitMembers(for: activeRoom)
 
         case .userParted, .kicked, .names, .endOfNames:
-            emitMembers(for: scopedRoom ?? activeRoom)
+            emitMembers(for: scopedKey ?? activeRoom)
 
         case .userQuit:
             // Server-wide: the peer left every room at once — refresh the
@@ -1021,8 +1159,10 @@ public final class ChatSessionModel: @unchecked Sendable {
 
         case .statusLine(let text):
             emitStatus(text)
+            emitServerMessage(text)
         case .error(let code, let text):
             emitStatus("error \(code): \(text)")
+            emitServerMessage("error \(code): \(text)")
             // Final-review minor: if the server ERRORS a LIST request instead
             // of ever sending `.roomListBegin`/`.roomListEnd`,
             // `roomListRequestInFlight` (set true the moment the wire LIST
@@ -1040,6 +1180,37 @@ public final class ChatSessionModel: @unchecked Sendable {
             roomListRequestInFlight = false
         case .disconnectedHint(let text):
             emitStatus(text)
+            emitServerMessage(text)
+
+        // Live-fix 4: the original client showed MOTD/LUSER text in its
+        // status window — this port never surfaced `.motd` anywhere
+        // (`default: break`, pre-fix). `luser`/`motd` are two SEPARATE
+        // accumulated text blocks off the wire (see `ProtocolEvent.motd`'s
+        // originating LUSERS/MOTD reply sequence, `ircsock.cpp`); join
+        // whichever are non-empty into one console line rather than firing
+        // twice for what's conceptually one server greeting.
+        case .motd(let luser, let motd):
+            let parts = [luser, motd].filter { !$0.isEmpty }
+            guard !parts.isEmpty else { break }
+            emitServerMessage(parts.joined(separator: "\n"))
+
+        // Live-fix 3 (crypthome.com, live-reproduced: `432 Anonymous
+        // :Reserved name` dead-ended the session with only a transient
+        // status line — nothing routed the app to a clear next step). Fires
+        // BOTH the existing status-line surface (`emitStatus`/
+        // `emitServerMessage`, matching every other error-shaped event above)
+        // AND the dedicated `onNickRejected` callback the app layer uses to
+        // alert + reopen the connect sheet — `handleLocked` itself does NOT
+        // disconnect; the session is left exactly as the engine/server left
+        // it (typically already unusable — the app layer's job is deciding
+        // what "surface it" means for the user, mirroring every other
+        // session-scoped notice on this type).
+        case .nickRejected(_, let badNick):
+            let text = "Nickname '\(badNick)' was rejected by the server (reserved/in use). Choose another."
+            emitStatus(text)
+            emitServerMessage(text)
+            let cb = onNickRejected
+            DispatchQueue.main.async { cb?(badNick, text) }
 
         // MARK: Room list (Plan 4b Task 8) — accumulate begin -> items -> end,
         // fire `onRoomList` once on end. Session-scoped (LIST is not
@@ -1117,8 +1288,18 @@ public final class ChatSessionModel: @unchecked Sendable {
     }
 
     /// ENGINE QUEUE ONLY. Ensures a `RoomBox` and its tab-order slot exist for
-    /// `room` (idempotent). Used defensively wherever an event might reference
-    /// a room the normal join flow hasn't registered yet.
+    /// `room` (idempotent, keyed via `roomKey(room)` — live-fix 1). Used
+    /// defensively wherever an event might reference a room the normal join
+    /// flow hasn't registered yet.
+    ///
+    /// Live-fix 1: `room` is the DISPLAY-cased channel string as it arrived
+    /// (from the server, from a local join request, ...). If a box already
+    /// exists under this key (e.g. seeded locally by `start()`/`joinRoom`
+    /// with our own typed casing), this ALSO updates its `displayName` to
+    /// `room` — the freshest-seen casing wins, which in practice means the
+    /// server's own `.selfJoined` confirm (the authoritative source) always
+    /// ends up overwriting whatever casing we originally typed, matching the
+    /// original 1998 client's own display convention.
     ///
     /// Final-review Important #2: this is the SINGLE chokepoint every room
     /// box is actually created through after `start()`'s own initial-room
@@ -1144,14 +1325,17 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// fresh self-participant is already seeded with), so the guard is a
     /// direct translation of "only seed when there's something to seed."
     private func ensureRoomBoxLocked(_ room: String) {
-        if rooms[room] == nil {
-            var box = RoomBox()
+        let key = roomKey(room)
+        if rooms[key] == nil {
+            var box = RoomBox(displayName: room)
             if config.characterName != initialCharacterName {
                 box.transcript.append(.appearsAs(nick: currentOwnNick,
                                                   avatarName: config.characterName.capitalized, url: ""))
             }
-            rooms[room] = box
-            roomOrder.append(room)
+            rooms[key] = box
+            roomOrder.append(key)
+        } else {
+            rooms[key]!.displayName = room
         }
     }
 
@@ -1333,6 +1517,14 @@ public final class ChatSessionModel: @unchecked Sendable {
         let seq = membersSeq
         let activeAtEmit = activeRoom
         let ownNick = currentOwnNick
+        // Live-fix 1: `room` is a case-folded LOOKUP KEY (every call site now
+        // passes `scopedKey`/`activeRoom`, not the raw wire-cased channel) —
+        // but `ProtocolSession.room(_:)` is keyed by whatever DISPLAY string
+        // `session.join(...)` was actually called with (`ProtocolSession`'s
+        // own `rooms` dict has no folding of its own). Resolve the display
+        // name here, on the engine queue, before handing it to the detached
+        // `Task` below (which must not touch `self`'s engine-queue state).
+        let displayRoom = rooms[room]?.displayName ?? room
         // Live-fix (Tim's screenshot report): gray placeholder rows because
         // `member.avatarName` (`RoomMember`, `ProtocolSession`'s room-scoped
         // state) reads empty in two known cases: (1) OUR OWN row, always —
@@ -1362,7 +1554,7 @@ public final class ChatSessionModel: @unchecked Sendable {
             // background room's churn updates `session.room(room)` (read on
             // its next activation) but must not overwrite the visible list.
             guard room == activeAtEmit else { return }
-            let members = session.room(room)?.members ?? [:]
+            let members = session.room(displayRoom)?.members ?? [:]
             let present = members.values.filter { !$0.departed }.sorted { $0.nick < $1.nick }
             let rows = present.map { member -> MemberRow in
                 var avatarName = member.avatarName
@@ -1387,11 +1579,14 @@ public final class ChatSessionModel: @unchecked Sendable {
 
     /// ENGINE QUEUE ONLY. Builds the current `[RoomInfo]` (tab order, unread,
     /// active flag). Reads `roomOrder`/`rooms`/`activeRoom` — all engine-queue
-    /// state.
+    /// state. Live-fix 1: `roomOrder`'s entries are case-folded KEYS; `name`
+    /// resolves each box's `displayName` (the server-cased/user-facing form)
+    /// so `RoomTabBar`/every other UI consumer of `RoomInfo.name` shows the
+    /// server's own casing, never the lowercased lookup key.
     private func roomInfosLocked() -> [RoomInfo] {
-        roomOrder.compactMap { name in
-            guard let box = rooms[name] else { return nil }
-            return RoomInfo(name: name, unread: box.unread, isActive: name == activeRoom)
+        roomOrder.compactMap { key in
+            guard let box = rooms[key] else { return nil }
+            return RoomInfo(name: box.displayName, unread: box.unread, isActive: key == activeRoom)
         }
     }
 
@@ -1407,6 +1602,18 @@ public final class ChatSessionModel: @unchecked Sendable {
     private func emitStatus(_ text: String) {
         DispatchQueue.main.async { [onStatus] in
             onStatus?(text)
+        }
+    }
+
+    /// Live-fix 4: fires `onServerMessage` on the MAIN thread with one
+    /// already-formatted console line. Separate from `emitStatus` — `onStatus`
+    /// only ever shows the LATEST line (the app's `statusLine` is a single
+    /// `String`, overwritten each call), which is exactly the "error-notes
+    /// clobbered by the next status line" bug this fix addresses; the server
+    /// console instead ACCUMULATES every line via this callback.
+    private func emitServerMessage(_ text: String) {
+        DispatchQueue.main.async { [onServerMessage] in
+            onServerMessage?(text)
         }
     }
 
@@ -1794,8 +2001,20 @@ public final class ChatSessionModel: @unchecked Sendable {
         // `setActiveRoom` mutate them ON the engine queue) — so a bare
         // off-queue read here would race those writes. All needed values are
         // read inside this SAME `performOnEngineQueue` call.
+        //
+        // Live-fix 1: `room` (a caller-supplied name, e.g. from `RoomInfo
+        // .name`/any other casing) is resolved to that room's DISPLAY name
+        // via `roomKey(_:)` -> `rooms[key]?.displayName` — `targetRoom` must
+        // be the actual wire-cased channel string (`session.say` and the
+        // synthetic event's `channel:` both need this, not a lookup key). A
+        // room the caller names that isn't actually joined falls back to the
+        // raw caller string (matches the pre-fix behavior of just using
+        // whatever was passed — `session.say` itself will fail with
+        // `.commandFailed` for an unknown channel, same as before).
         let (sendComicsData, targetRoom): (Bool, String) = session.performOnEngineQueue { [self] in
-            (config.sendComicsData, room ?? activeRoom)
+            let resolvedRoom = room.map { rooms[roomKey($0)]?.displayName ?? $0 }
+                ?? (rooms[activeRoom]?.displayName ?? activeRoom)
+            return (config.sendComicsData, resolvedRoom)
         }
         let ann: Annotations? = session.performOnEngineQueue { [self] in
             guard sendComicsData else { return nil }
@@ -1863,11 +2082,17 @@ public final class ChatSessionModel: @unchecked Sendable {
         // whispering FROM) — the wire form is still a plain PRIVMSG to `peer`
         // (`cc_session_send_whisper`), the room only scopes the token/
         // annotations context.
+        // Live-fix 1: `activeRoom` is a case-folded LOOKUP KEY — resolve the
+        // active room's DISPLAY name for the wire call (`session.whisper`'s
+        // `channel:` resolves a token via `ProtocolSession`'s own
+        // `rooms[channel]`, keyed by whatever display string `session.join`
+        // was actually called with).
         let (ann, room): (Annotations?, String) = session.performOnEngineQueue { [self] in
-            guard var a = try? strip?.selfAnnotations() else { return (nil, activeRoom) }
+            let displayRoom = rooms[activeRoom]?.displayName ?? activeRoom
+            guard var a = try? strip?.selfAnnotations() else { return (nil, displayRoom) }
             a.mode = Self.smMode(for: .whisper)
             a.addressees = [peer]
-            return (a, activeRoom)
+            return (a, displayRoom)
         }
         try await session.whisper(to: [peer], text: text, channel: room, annotations: ann)
         engineQueue.async { [weak self] in
@@ -1974,11 +2199,20 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// the tab-order slot immediately so the tab appears before the confirm
     /// lands (the room shows with 0 unread until its first message). Does NOT
     /// switch to the new room — the caller decides when to `setActiveRoom`.
+    ///
+    /// Live-fix 1: if `room` case-folds (`roomKey(_:)`) to an ALREADY-joined
+    /// room, this is a no-op on the wire (no redundant JOIN sent — the server
+    /// already considers us a member under whatever casing it confirmed
+    /// originally) rather than creating a second box/tab for the same
+    /// channel under different casing.
     public func joinRoom(_ room: String) async throws {
-        engineQueue.sync {
+        let alreadyJoined = engineQueue.sync { () -> Bool in
+            if self.rooms[self.roomKey(room)] != nil { return true }
             self.ensureRoomBoxLocked(room)
+            return false
         }
         emitRooms()
+        guard !alreadyJoined else { return }
         try await session.join(room)
     }
 
@@ -2002,15 +2236,23 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// box/tab, and — if it was the active room — activates another surviving
     /// room (falling back to the first in tab order) or clears the strip if it
     /// was the last one.
+    ///
+    /// Live-fix 1: `room` (a caller-supplied name — typically `RoomInfo.name`,
+    /// the display form) is resolved to its DISPLAY name for the wire PART
+    /// (`session.part` requires the exact channel string `session.join`
+    /// registered a token for) and case-folded (`roomKey(_:)`) for every
+    /// internal `rooms`/`roomOrder`/`activeRoom` lookup.
     public func leaveRoom(_ room: String) async throws {
-        try await session.part(room)
+        let key = roomKey(room)
+        let wireChannel = engineQueue.sync { self.rooms[key]?.displayName ?? room }
+        try await session.part(wireChannel)
         var newActive: String? = nil
         var wasActive = false
         engineQueue.sync {
-            guard self.rooms[room] != nil else { return }
-            wasActive = (room == self.activeRoom)
-            self.rooms.removeValue(forKey: room)
-            self.roomOrder.removeAll { $0 == room }
+            guard self.rooms[key] != nil else { return }
+            wasActive = (key == self.activeRoom)
+            self.rooms.removeValue(forKey: key)
+            self.roomOrder.removeAll { $0 == key }
             if wasActive {
                 newActive = self.roomOrder.first
             }
@@ -2038,10 +2280,17 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// reflow machinery, `rebuildStripLocked`), zero the new room's unread,
     /// recompose, and refresh the tab bar + member sidebar. A no-op if `room`
     /// is already active or not joined.
+    ///
+    /// Live-fix 1: `room` (a caller-supplied name — `RoomInfo.name`, any other
+    /// casing, or an already-canonical key from an internal call site like
+    /// `leaveRoom`'s fallback) is case-folded via `roomKey(_:)` before every
+    /// lookup — folding an already-canonical key is idempotent, so internal
+    /// callers that already pass a key are unaffected.
     public func setActiveRoom(_ room: String) {
+        let key = roomKey(room)
         engineQueue.async { [weak self] in
             guard let self, !self.isShutDown else { return }
-            guard self.rooms[room] != nil, room != self.activeRoom else { return }
+            guard self.rooms[key] != nil, key != self.activeRoom else { return }
             // Stash the outgoing room's last composed image (cached for an
             // instant switch-back — the app can show it while the new room
             // rebuilds, though `rebuildStripLocked` is fast enough that the
@@ -2054,11 +2303,11 @@ public final class ChatSessionModel: @unchecked Sendable {
             }
             // Rebuild the strip from the new room's transcript (title = new
             // room name, via `activeRoom` set inside `rebuildStripLocked`).
-            self.rebuildStripLocked(for: room, resetAnnounce: false)
+            self.rebuildStripLocked(for: key, resetAnnounce: false)
             // Zero the newly-active room's unread.
-            self.rooms[room]?.unread = 0
+            self.rooms[key]?.unread = 0
             self.emitRooms()
-            self.emitMembers(for: room)
+            self.emitMembers(for: key)
         }
     }
 

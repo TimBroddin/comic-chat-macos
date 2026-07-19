@@ -88,6 +88,51 @@ struct AvatarDownloaderTests {
         #expect(!result.lastPathComponent.contains(".."))
     }
 
+    // MARK: - Live-fix 2 (crypthome.com real announce): apostrophe + uppercase extension
+
+    /// Live-reproduced real-world announce: "# Appears as
+    /// Belle'sBotTinkerBelle.http://www.mermeliz.com/anneseeker/dl/
+    /// Belle'sBotTinkerBelle.AVB" -- the announced NAME carries an apostrophe
+    /// (a legal HFS+/APFS filename character, but worth a direct test given
+    /// `sanitizedFileName`'s job is exactly to make an announced name
+    /// filesystem-safe) and the URL's own path component ends in the
+    /// uppercase extension ".AVB" (not ".avb") -- `sanitizedFileName`'s
+    /// extension check (`cleaned.lowercased().hasSuffix(".avb")`) must be
+    /// extension-insensitive so it doesn't double-append a second ".avb"
+    /// suffix onto a name that (if it already carried a bare, uppercase-cased
+    /// extension) would already end in one.
+    @Test func sanitizedFileNameHandlesApostropheAndUppercaseExtension() {
+        // The announced NAME itself never carries an extension in practice
+        // (`.appearsAs`'s `avatarName` is the bare display name off the "#
+        // Appears as <name>" grammar, not the URL's path) -- this asserts the
+        // apostrophe survives untouched (original casing preserved) and the
+        // bare ".avb" gets appended.
+        #expect(AvatarDownloader.sanitizedFileName(for: "Belle'sBotTinkerBelle") == "Belle'sBotTinkerBelle.avb")
+
+        // Extension-insensitive: a name that ALREADY ends in an
+        // uppercase-cased ".AVB" must not gain a second suffix -- the
+        // extension check itself is case-insensitive even though the rest of
+        // the name keeps its original casing.
+        #expect(AvatarDownloader.sanitizedFileName(for: "Belle'sBotTinkerBelle.AVB") == "Belle'sBotTinkerBelle.AVB")
+    }
+
+    /// End-to-end: fetch a real `.avb` fixture using this exact live-observed
+    /// name (apostrophe included) and confirm the downloaded file lands under
+    /// the sanitized name inside `dir` and parses as a valid avatar.
+    @Test func fetchHandlesApostropheInAnnouncedName() async throws {
+        let downloader = AvatarDownloader()
+        let source = URL(fileURLWithPath: fixture("armando.avb"))
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let result = try await downloader.fetch(name: "Belle'sBotTinkerBelle", url: source, into: dir)
+
+        #expect(result.lastPathComponent == "Belle'sBotTinkerBelle.avb")
+        #expect(result.deletingLastPathComponent().standardizedFileURL == dir.standardizedFileURL)
+        let parsed = try AvatarFile(path: result.path)
+        #expect(parsed.poseCount > 0)
+    }
+
     // MARK: - Retry
 
     // Injects a URLSession pointed at a nonexistent file:// URL -- fetch must

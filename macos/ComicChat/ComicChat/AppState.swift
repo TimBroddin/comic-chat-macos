@@ -12,6 +12,14 @@ public final class AppState {
     public var settings = SettingsStore()
     public var showConnectSheet = true
     public var statusLine = ""
+    /// Live-fix 4 (Tim's request: "show the MOTD like the original client";
+    /// also fixes error-notes being clobbered by the next status line) — the
+    /// accumulating server-messages console (`ServerConsoleWindow`), mirrored
+    /// from `ChatSessionModel.onServerMessage` on the main thread. Capped at
+    /// `serverMessagesCap` (drop-oldest) so a long session's console doesn't
+    /// grow unbounded.
+    public var serverMessages: [String] = []
+    private let serverMessagesCap = 500
     /// Plan 4b Task 11: an `@Observable`-TRACKED mirror of
     /// `settings.comicMode`. `SettingsStore` is a thin `UserDefaults`
     /// wrapper with no change notification of its own (unlike this class,
@@ -733,6 +741,10 @@ public final class AppState {
             Task { @MainActor in self?.userInfoResult = (nick: nick, text: text) } }
         m.onSound = { [weak self] nick, file in
             Task { @MainActor in self?.playSound(nick: nick, file: file) } }
+        m.onNickRejected = { [weak self] badNick, text in
+            Task { @MainActor in self?.handleNickRejected(badNick: badNick, text: text) } }
+        m.onServerMessage = { [weak self] text in
+            Task { @MainActor in self?.appendServerMessage(text) } }
         model = m
         do { try await m.start(); showConnectSheet = false }
         catch {
@@ -810,5 +822,33 @@ public final class AppState {
         pendingWhisperPeer = nil
         soundPlayer?.stop()
         soundPlayer = nil
+    }
+
+    /// Live-fix 3 (crypthome.com, live-reproduced: `432 Anonymous :Reserved
+    /// name` dead-ended the session with only a transient status line).
+    /// `ChatSessionModel.onNickRejected` routes here: shows an alert
+    /// explaining the rejection, then tears down the now-dead session and
+    /// reopens the connect sheet (mirrors the failed-connect teardown path
+    /// in `connect()`'s own `catch` block — same "no half-connected limbo"
+    /// posture, just triggered by a LATER server reply instead of the
+    /// initial `start()` throwing).
+    private func handleNickRejected(badNick: String, text: String) {
+        let alert = NSAlert()
+        alert.messageText = "Nickname Rejected"
+        alert.informativeText = text
+        alert.alertStyle = .warning
+        alert.runModal()
+        disconnect()
+        showConnectSheet = true
+    }
+
+    /// Live-fix 4: `ChatSessionModel.onServerMessage` routes here —
+    /// appends one line to the accumulating server-messages console,
+    /// dropping the oldest once `serverMessagesCap` is exceeded.
+    private func appendServerMessage(_ text: String) {
+        serverMessages.append(text)
+        if serverMessages.count > serverMessagesCap {
+            serverMessages.removeFirst(serverMessages.count - serverMessagesCap)
+        }
     }
 }

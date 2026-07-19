@@ -42,5 +42,15 @@ struct ComicChatApp: App {
         Window("Transcript", id: "transcriptViewer") {
             TranscriptViewerWindow().environment(appState)
         }
+
+        // Live-fix 4 (Tim's request: "show the MOTD like the original
+        // client"): the accumulating server-messages console — a fixed `id`
+        // `Window` scene, same precedent as "whispers"/"roomList"/
+        // "transcriptViewer" above. `AppState.serverMessages` is the data
+        // source; no per-open hand-off parameter needed (it just shows
+        // whatever has accumulated so far).
+        Window("Server Messages", id: "server-console") {
+            ServerConsoleWindow().environment(appState)
+        }
     }
 }

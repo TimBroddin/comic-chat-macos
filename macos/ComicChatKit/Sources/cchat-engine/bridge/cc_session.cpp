@@ -144,6 +144,18 @@ const char* cc_session_room_channel(cc_session* h, uint32_t room_token) {
     return s->channels[room_token].c_str();
 }
 
+// Live-fix 1 (Plan 4b): see comicchat.h's doc comment for the full rationale
+// -- overwrites s->channels[room_token] IN PLACE (same token, no new
+// registration), so ccSessionRoomTokenForChannel's byte-exact scan (and this
+// function's own cc_session_room_channel) agree with whatever casing the
+// server most recently confirmed for this room.
+int32_t cc_session_update_room_channel(cc_session* h, uint32_t room_token, const char* channel) {
+    CCSession* s = reinterpret_cast<CCSession*>(h);
+    if (!s || !channel || room_token == CC_ROOM_TOKEN_NONE || room_token >= s->channels.size()) return 1;
+    s->channels[room_token] = channel;
+    return 0;
+}
+
 // Sets proto.m_strChannel from room_token, returns FALSE if the token is
 // unresolvable (caller should then fail the whole outbound call). Every
 // per-room outbound C function below calls this first.

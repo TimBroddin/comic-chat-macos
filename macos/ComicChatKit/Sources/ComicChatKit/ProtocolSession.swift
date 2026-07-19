@@ -956,10 +956,58 @@ public final class ProtocolSession: @unchecked Sendable {
             // never registered (shouldn't happen; defensive only) by falling
             // back to `roomToken` off the event itself if the local lookup
             // is somehow empty.
-            var state = rooms[channel] ?? RoomState(channel: channel, roomToken: roomToken)
-            if roomTokenToChannel[roomToken] == nil {
-                roomTokenToChannel[roomToken] = channel
+            //
+            // Live-fix 1 (Plan 4b, crypthome.com live-reproduced): IRC channel
+            // names are case-insensitive (RFC 1459 Section 2.3.1), but a
+            // server's JOIN-confirm can echo DIFFERENT case than what we
+            // joined with (e.g. we `join("#crypt")`, the server echoes
+            // `#Crypt`). CRITICAL WRINKLE: the ENGINE resolves THIS VERY
+            // event's OWN `roomToken` via the same byte-exact
+            // `ccSessionRoomTokenForChannel` scan (ircsock.cpp's JOIN
+            // handler) — so for exactly this differently-cased-echo case,
+            // `roomToken` itself already arrives as `CC_ROOM_TOKEN_NONE`
+            // (unresolvable against our original registration), NOT the
+            // token `join()` actually registered. `roomTokenToChannel[roomToken]`
+            // is therefore useless here (token 0 is never assigned to a real
+            // channel) — instead, scan `roomTokenToChannel` for whichever
+            // (token, oldChannel) pair matches `channel` CASE-INSENSITIVELY;
+            // that is the room this JOIN confirm is actually for. If found
+            // (and the casing genuinely differs), RENAME: move
+            // `rooms[oldChannel]` to the new key (so the room's already-
+            // accumulated member table survives) and push the rename down
+            // into the ENGINE's own channel table
+            // (`cc_session_update_room_channel`, keyed by the REAL token found
+            // via the scan) so `ccSessionRoomTokenForChannel`'s byte-exact
+            // scan recognizes the server's casing on every SUBSEQUENT wire
+            // line naming this room (a PRIVMSG/PART/... using the server's
+            // casing would otherwise never resolve a room_token at all,
+            // since the engine's own table still held our original,
+            // differently-cased registration) — this ALSO fixes up
+            // `roomToken`/`resolvedToken` itself (below) so the rest of this
+            // case uses the REAL token, not the unresolvable one this event
+            // arrived with.
+            var resolvedToken = roomToken
+            if resolvedToken == CC_ROOM_TOKEN_NONE {
+                if let (existingToken, oldChannel) = roomTokenToChannel.first(where: {
+                    $0.value.caseInsensitiveCompare(channel) == .orderedSame
+                }) {
+                    resolvedToken = existingToken
+                    if oldChannel != channel {
+                        if let migrated = rooms.removeValue(forKey: oldChannel) {
+                            rooms[channel] = migrated
+                        }
+                        if let s = cSession {
+                            _ = channel.withCString { cc_session_update_room_channel(s, existingToken, $0) }
+                        }
+                        roomTokenToChannel[existingToken] = channel
+                    }
+                }
             }
+            if roomTokenToChannel[resolvedToken] == nil {
+                roomTokenToChannel[resolvedToken] = channel
+            }
+            var state = rooms[channel] ?? RoomState(channel: channel, roomToken: resolvedToken)
+            state.roomToken = resolvedToken
             var me = state.members[_ownNick] ?? RoomMember(nick: _ownNick)
             me.departed = false
             state.members[_ownNick] = me
