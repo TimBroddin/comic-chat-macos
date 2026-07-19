@@ -567,8 +567,10 @@ int32_t cc_session_announce_avatar(cc_session* h, uint32_t room_token, const cha
 
 // --- cc_session_send_sound (Plan 4b outbound-sound task) --------------------
 // See comicchat.h's doc comment for the full finding/grammar citation. Builds
-// "\x01SOUND \"<file>\" <text>\x01" byte-for-byte per bChatSendSound's sprintf
-// (protsupp.cpp:3349) and sends it as the MESSAGE argument (not annotations)
+// "\x01SOUND \"<file>\" <text>\x01" -- the wire-COMPATIBLE quoted-filename
+// form of bChatSendSound's sprintf (protsupp.cpp:3349; the original leaves
+// plain filenames BARE via CTCPQuoteString, both forms parse -- see the
+// header's I-1 note) -- and sends it as the MESSAGE argument (not annotations)
 // via bChatSendToChannel with uModes=BM_SOUND, mirroring the original's
 // non-whisper branch (saywnd.cpp:889's `else bChatSendSound(..., BM_SAY,
 // NULL)` -- BM_SAY there names the ANNOTATION mode for the visual "action"

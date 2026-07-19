@@ -908,9 +908,14 @@ int32_t cc_session_announce_avatar(cc_session* s, uint32_t room_token,
  * "\x01SOUND ...\x01" bytes from a bare filename. So a dedicated builder is
  * required; this function is that builder.
  *
- * WIRE GRAMMAR (byte-for-byte from bChatSendSound's sprintf,
- * protsupp.cpp:3349: `sprintf(GetOutBuff(), "%.*s %s %s%c", g_nSoundLen,
- * soundID, szQuotedSnd, szControlFull ? szControlFull : szMesg, 0x1)`):
+ * WIRE GRAMMAR (wire-COMPATIBLE quoted-filename form of bChatSendSound's
+ * sprintf, protsupp.cpp:3349: `sprintf(GetOutBuff(), "%.*s %s %s%c",
+ * g_nSoundLen, soundID, szQuotedSnd, szControlFull ? szControlFull :
+ * szMesg, 0x1)` -- NOT byte-identical for plain names: the original's
+ * CTCPQuoteString (histent.cpp:772) leaves an unproblematic filename BARE
+ * (`\x01SOUND boing.wav \x01`) where this builder always quotes; the
+ * original receiver ccPrepareSound accepts BOTH branches, so the forms
+ * interoperate -- review sweep I-1 recorded this wording correction):
  *   \x01SOUND "<file>" <text>\x01
  * `file` is wrapped in literal double-quotes here (matching the selftest's
  * VECTOR 17 ground truth, cc_selftest_pv_sound_ctcp: `:Bob!bob@h PRIVMSG
