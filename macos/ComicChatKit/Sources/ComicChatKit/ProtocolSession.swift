@@ -164,11 +164,14 @@ public final class ProtocolSession: @unchecked Sendable {
 
     // MARK: AsyncStream plumbing
 
-    private var eventContinuation: AsyncStream<ProtocolEvent>.Continuation?
-    /// The event stream. Multiple concurrent consumers are not supported —
-    /// like the underlying `cc_session`, this models ONE session's event feed
-    /// (create the stream once via the lazy `events` accessor pattern below).
-    public let events: AsyncStream<ProtocolEvent>
+    private var eventContinuation: AsyncStream<ScopedEvent>.Continuation?
+    /// The event stream (Plan 4b Task 7: now `ScopedEvent`, each event paired
+    /// with the channel it's scoped to — `nil` for session-scoped events, see
+    /// `ScopedEvent`'s doc comment). Multiple concurrent consumers are not
+    /// supported — like the underlying `cc_session`, this models ONE session's
+    /// event feed (create the stream once via the lazy `events` accessor
+    /// pattern below).
+    public let events: AsyncStream<ScopedEvent>
 
     // MARK: Init / lifecycle
 
@@ -200,7 +203,7 @@ public final class ProtocolSession: @unchecked Sendable {
         self.userName = userName
         self.realName = realName
         self.sessionQueue = engineQueue ?? DispatchQueue(label: "com.comicchat.ProtocolSession")
-        var continuation: AsyncStream<ProtocolEvent>.Continuation!
+        var continuation: AsyncStream<ScopedEvent>.Continuation!
         self.events = AsyncStream { cont in continuation = cont }
         self.eventContinuation = continuation
         self._ownNick = nick
@@ -257,7 +260,7 @@ public final class ProtocolSession: @unchecked Sendable {
                         if resumeGuard.markResumed() {
                             continuation.resume(throwing: error)
                         } else {
-                            self.emit(.disconnectedHint(text: "\(error)"))
+                            self.emit(.disconnectedHint(text: "\(error)"), roomToken: CC_ROOM_TOKEN_NONE)
                         }
                     case .cancelled:
                         self.connectionStatus = .disconnected
@@ -360,7 +363,7 @@ public final class ProtocolSession: @unchecked Sendable {
                 }
                 if let error {
                     self.connectionStatus = .disconnected
-                    self.emit(.disconnectedHint(text: "\(error)"))
+                    self.emit(.disconnectedHint(text: "\(error)"), roomToken: CC_ROOM_TOKEN_NONE)
                     return
                 }
                 if isComplete {
@@ -790,32 +793,32 @@ public final class ProtocolSession: @unchecked Sendable {
             // so consumers that want the raw feed can see the pairing landed
             // (documented choice: cheap to emit, easy to filter, and useful
             // for debugging the re-pairing itself).
-            emit(event)
+            emit(event, roomToken: roomToken)
 
         case .text(let nick, let ident, let target, let text, let kind, let annotations):
             if annotations == nil, let pending = pendingUDI.removeValue(forKey: nick) {
                 emit(.text(nick: nick, ident: ident, target: target, text: text,
-                          kind: kind, annotations: pending))
+                          kind: kind, annotations: pending), roomToken: roomToken)
             } else {
-                emit(event)
+                emit(event, roomToken: roomToken)
             }
 
         case .whisper(let nick, let ident, let text, let annotations):
             if annotations == nil, let pending = pendingUDI.removeValue(forKey: nick) {
-                emit(.whisper(nick: nick, ident: ident, text: text, annotations: pending))
+                emit(.whisper(nick: nick, ident: ident, text: text, annotations: pending), roomToken: roomToken)
             } else {
-                emit(event)
+                emit(event, roomToken: roomToken)
             }
 
         case .action(let nick, let text, let annotations):
             if annotations == nil, let pending = pendingUDI.removeValue(forKey: nick) {
-                emit(.action(nick: nick, text: text, annotations: pending))
+                emit(.action(nick: nick, text: text, annotations: pending), roomToken: roomToken)
             } else {
-                emit(event)
+                emit(event, roomToken: roomToken)
             }
 
         default:
-            emit(event)
+            emit(event, roomToken: roomToken)
         }
     }
 
@@ -981,9 +984,26 @@ public final class ProtocolSession: @unchecked Sendable {
         }
     }
 
-    /// Yield an event into the `AsyncStream`. Must run on `sessionQueue`.
-    private func emit(_ event: ProtocolEvent) {
-        eventContinuation?.yield(event)
+    /// Yield an event into the `AsyncStream`, resolving its channel scope from
+    /// `roomToken` (Plan 4b Task 7). Must run on `sessionQueue` — it calls
+    /// `cc_session_room_channel` on the engine handle, which requires the
+    /// single-threaded engine contract (and this is only ever reached from
+    /// `handleEvent`, itself on `sessionQueue`).
+    ///
+    /// `roomToken == CC_ROOM_TOKEN_NONE` (0) yields `channel: nil` (a
+    /// session-scoped event — see `ScopedEvent`'s doc comment). Otherwise the
+    /// token is resolved against the session's token→channel table via
+    /// `cc_session_room_channel` and decoded per `encoding` (the same wire
+    /// encoding every other string field on the event went through). A token
+    /// that fails to resolve (empty C string — shouldn't happen for a token
+    /// the engine itself just emitted) also yields `nil`, defensively.
+    private func emit(_ event: ProtocolEvent, roomToken: UInt32) {
+        var channel: String? = nil
+        if roomToken != CC_ROOM_TOKEN_NONE, let s = cSession {
+            let resolved = WireCodec.decode(cc_session_room_channel(s, roomToken), encoding: encoding)
+            if !resolved.isEmpty { channel = resolved }
+        }
+        eventContinuation?.yield(ScopedEvent(event: event, channel: channel))
     }
 
     // MARK: C trampolines (must be plain @convention(c): no captured context)

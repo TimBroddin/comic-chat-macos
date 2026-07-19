@@ -160,8 +160,8 @@ extension EngineGlobalStateSelfTests {
             // give the event loop a moment to process the 001 line and flip
             // connectionStatus to .connected before asserting success.
             var loggedIn = false
-            for await ev in session.events {
-                if case .loggedIn = ev { loggedIn = true; break }
+            for await scoped in session.events {
+                if case .loggedIn = scoped.event { loggedIn = true; break }
             }
             #expect(loggedIn)
 
@@ -190,14 +190,15 @@ extension EngineGlobalStateSelfTests {
         /// not `Sendable` and can't cross into a task-group child task,
         /// which a manual timeout race requires.
         private func collectUntil(
-            _ iterator: inout AsyncStream<ProtocolEvent>.AsyncIterator,
+            _ iterator: inout AsyncStream<ScopedEvent>.AsyncIterator,
             matching predicate: @escaping (ProtocolEvent) -> Bool
         ) async throws -> [ProtocolEvent] {
             var collected: [ProtocolEvent] = []
             while true {
-                guard let ev = await iterator.next() else {
+                guard let scoped = await iterator.next() else {
                     throw StreamEndedError(collectedSoFar: collected)
                 }
+                let ev = scoped.event   // Plan 4b Task 7: unwrap the scoped event
                 collected.append(ev)
                 if predicate(ev) { return collected }
             }

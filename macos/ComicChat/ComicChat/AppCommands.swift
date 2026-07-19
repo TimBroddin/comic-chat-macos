@@ -20,6 +20,18 @@ struct AppCommands: Commands {
         }
 
         CommandMenu("Room") {
+            // Plan 4b Task 7: joins an ADDITIONAL room on the current
+            // connection (opens the Enter Room sheet — the tab bar's "+"
+            // twin). Requires a live session.
+            Button("Enter Room…") {
+                appState.enterRoomText = ""
+                appState.showEnterRoomSheet = true
+            }
+            .keyboardShortcut("j", modifiers: .command)
+            .disabled(appState.model == nil)
+
+            Divider()
+
             Button("Leave/Disconnect") {
                 appState.disconnect()
                 appState.showConnectSheet = true

@@ -60,7 +60,13 @@ extension EngineGlobalStateSelfTests {
 
             try await model.send("posed line", mode: .say)
 
-            let text = try await waitForReceivedBytes(server, containing: "PRIVMSG #p4 :")
+            // Wait for the "posed line" say specifically, NOT a bare
+            // "PRIVMSG #p4 :" prefix — the self-join announce
+            // ("PRIVMSG #p4 :# Appears as ...") ALSO matches that prefix, so a
+            // wait keyed on it can return before this say has reached the wire
+            // (a latent race, same lesson as
+            // ChatSessionModelTests.liveLoopRendersAndSends' "hi win" wait).
+            let text = try await waitForReceivedBytes(server, containing: "posed line")
             let lines = text.components(separatedBy: "\r\n").filter { $0.contains("posed line") }
             #expect(!lines.isEmpty, "expected a PRIVMSG line carrying \"posed line\", got: \(text)")
             #expect(lines.contains { $0.contains("(#G") },
@@ -96,7 +102,10 @@ extension EngineGlobalStateSelfTests {
             let before = model.transcript.count
             try await model.send("thought", mode: .think)
 
-            let text = try await waitForReceivedBytes(server, containing: "PRIVMSG #p4 :")
+            // Wait for "thought" specifically, not a bare "PRIVMSG #p4 :"
+            // prefix (which the self-join announce also matches — see the
+            // say-mode test above for the same latent-race note).
+            let text = try await waitForReceivedBytes(server, containing: "thought")
             let lines = text.components(separatedBy: "\r\n").filter { $0.contains("thought") }
             #expect(!lines.isEmpty, "expected a PRIVMSG line carrying \"thought\", got: \(text)")
             // SM_THINK == 3 (Task 2's confirmed SM_* mapping) -- the annotation

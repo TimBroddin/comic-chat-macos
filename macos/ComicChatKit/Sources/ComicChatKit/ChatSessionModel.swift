@@ -75,6 +75,34 @@ public struct WhisperLine: Sendable, Equatable {
     }
 }
 
+/// One joined room's state (Plan 4b Task 7: true multi-room). Each room keeps
+/// its OWN canonical event-log transcript (the transcript doctrine, unchanged
+/// — just per-room now); the ONE live strip is rebuilt from whichever room is
+/// active. Background rooms cache their last composed image (`lastImage`) so a
+/// tab switch away and back is instant, and count `unread` MESSAGES (only
+/// `.text`/`.action`/whisper-carried content — NOT joins/parts/names).
+struct RoomBox {
+    var transcript: [ProtocolEvent] = []
+    var lastImage: CGImage?
+    var lastSizePoints: CGSize = .zero
+    var unread: Int = 0
+}
+
+/// A room's tab-bar summary (Plan 4b Task 7). `Identifiable` by `name` so
+/// SwiftUI's `RoomTabBar` `ForEach` can key on it directly.
+public struct RoomInfo: Sendable, Equatable, Identifiable {
+    public var id: String { name }
+    public let name: String
+    public let unread: Int
+    public let isActive: Bool
+
+    public init(name: String, unread: Int, isActive: Bool) {
+        self.name = name
+        self.unread = unread
+        self.isActive = isActive
+    }
+}
+
 /// The app's headless, testable core (D1 §3.2's binding recommendation: all
 /// logic lives in ComicChatKit, only chrome lives in the app). Composes every
 /// prior Plan 4a task into one live loop:
@@ -117,6 +145,12 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// = the addressee) -- see `WhisperBox`'s doc comment for how the app
     /// layer uses this to drive unread badges/live transcript updates.
     public var onWhisper: (@Sendable (String, WhisperLine) -> Void)?
+    /// Fired on the MAIN thread whenever the set of joined rooms, the active
+    /// room, or any room's unread count changes (Plan 4b Task 7). Drives the
+    /// app's `RoomTabBar`. The `[RoomInfo]` is in join order (initial room
+    /// first), each carrying its current unread count and whether it's the
+    /// active room.
+    public var onRoomsChanged: (@Sendable ([RoomInfo]) -> Void)?
 
     /// `var` (Plan 4b Task 5): `changeCharacter` updates the model's OWN
     /// notion of `config.characterName` so a subsequent `reflowLocked()` (or
@@ -147,14 +181,34 @@ public final class ChatSessionModel: @unchecked Sendable {
 
     // MARK: Engine-queue-owned state (touched ONLY on `engineQueue`)
 
-    /// The canonical event log — every `ProtocolEvent` this session has seen,
-    /// in arrival order, INCLUDING the synthetic self-say events `send(_:)`
-    /// injects (see that method's doc comment). This is the transcript
-    /// `setViewport`'s reflow replays against (D2 §2.3: "the transcript = the
-    /// event log; reflow = destroy strip -> recreate -> re-apply transcript").
-    /// Backed by `_transcript` (engine-queue-only storage) + `transcript`
-    /// (the public, thread-safe snapshot reader) below.
-    private var _transcript: [ProtocolEvent] = []
+    /// Per-room state (Plan 4b Task 7: true multi-room), keyed by channel,
+    /// engine-queue-owned. Each room's `transcript` is the canonical event log
+    /// for THAT room — every `ProtocolEvent` scoped to it, in arrival order,
+    /// INCLUDING the synthetic self-say events `send(_:)` injects and the
+    /// synthetic self-character-switch `.appearsAs` (which is appended to
+    /// EVERY room's transcript — clarification 1). The ACTIVE room's
+    /// transcript is what `setViewport`'s reflow replays against (D2 §2.3:
+    /// "the transcript = the event log; reflow = destroy strip -> recreate ->
+    /// re-apply transcript"). `roomOrder` preserves join order for the tab bar.
+    private var rooms: [String: RoomBox] = [:]
+    /// Join order (initial room first) — the order `RoomTabBar` shows tabs.
+    private var roomOrder: [String] = []
+    /// The channel whose transcript currently owns the ONE live strip. Seeded
+    /// from `config.room` in `start()`. `setActiveRoom` swaps it (destroy strip
+    /// -> rebuild from the new room's transcript -> recompose).
+    private var activeRoom: String = ""
+    /// Session-scoped event log (Plan 4b Task 7, clarification 2): whisper/
+    /// sound/status/login/error events (token 0 — `channel == nil`) that
+    /// belong to no single room. Kept for Task 10 (save) / Task 11 (text
+    /// view), which consume per-room transcript + relevant session events.
+    private var sessionTranscript: [ProtocolEvent] = []
+    /// Convenience read of the ACTIVE room's transcript (the `transcript`
+    /// public accessor's backing). Per-room appends go directly to
+    /// `rooms[room].transcript` in `handleLocked`; `rebuildStripLocked` replays
+    /// a specific room's transcript by name — so this is a read-only view.
+    private var _transcript: [ProtocolEvent] {
+        rooms[activeRoom]?.transcript ?? []
+    }
     private var metricsCanvas: CTMetricsCanvas?
     /// The `CanvasBox` wrapping `metricsCanvas`, registered with the engine
     /// via `cc_set_metrics_canvas` — MUST be kept alive as a property (not
@@ -314,10 +368,35 @@ public final class ChatSessionModel: @unchecked Sendable {
         return dir.path
     }
 
-    /// Thread-safe snapshot of the event log so far (see `_transcript`'s doc
-    /// comment for why the engine-queue-owned storage is private).
+    /// Thread-safe snapshot of the ACTIVE room's event log so far (Plan 4b
+    /// Task 7: per-room transcripts — this returns the active room's, matching
+    /// the single-room callers' pre-Task-7 expectations; use
+    /// `transcript(for:)` for a specific room).
     public var transcript: [ProtocolEvent] {
         engineQueue.sync { _transcript }
+    }
+
+    /// Thread-safe snapshot of `room`'s event log (Plan 4b Task 7), or `[]` if
+    /// that room isn't joined. Task 10/11 read this per-room.
+    public func transcript(for room: String) -> [ProtocolEvent] {
+        engineQueue.sync { rooms[room]?.transcript ?? [] }
+    }
+
+    /// Thread-safe snapshot of the session-scoped event log (Plan 4b Task 7,
+    /// clarification 2) — whisper/sound/status/login events that belong to no
+    /// single room. Task 10/11 consume this alongside a room's transcript.
+    public var sessionEvents: [ProtocolEvent] {
+        engineQueue.sync { sessionTranscript }
+    }
+
+    /// Thread-safe snapshot of the joined rooms in tab order (Plan 4b Task 7).
+    public var roomInfos: [RoomInfo] {
+        engineQueue.sync { roomInfosLocked() }
+    }
+
+    /// Thread-safe snapshot of the active room's name (Plan 4b Task 7).
+    public var currentRoom: String {
+        engineQueue.sync { activeRoom }
     }
 
     /// Thread-safe snapshot of the strip's current panel count (`Strip.panelCount`,
@@ -352,9 +431,18 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// fire-and-forget rather than blocking its caller.
     public func start() async throws {
         try engineQueue.sync {
+            // Seed the initial room (Plan 4b Task 7) BEFORE building the strip:
+            // `activeRoom`/`rooms[activeRoom]` must exist so `_transcript`
+            // (now the active room's transcript) and the strip title resolve.
+            self.activeRoom = self.config.room
+            if self.rooms[self.config.room] == nil {
+                self.rooms[self.config.room] = RoomBox()
+                self.roomOrder = [self.config.room]
+            }
             try self.setUpStripLocked(isReflow: false)
         }
         startEventConsumer()
+        emitRooms()
         try await session.connect()
     }
 
@@ -409,7 +497,11 @@ public final class ChatSessionModel: @unchecked Sendable {
         // (`recomposeLocked` skips while `panelCount == 0`), exactly the gap
         // `FixtureReplayServerTests` exercises (a fixture with a login/join
         // sequence but no chat message at all).
-        try newStrip.setTitle(config.room)
+        // Title = the ACTIVE room (Plan 4b Task 7). On a fresh `start()`,
+        // `activeRoom` was just seeded to `config.room`; on a reflow or a
+        // `setActiveRoom` rebuild, it is the room whose transcript is about to
+        // be replayed — so the strip's starring panel names the right room.
+        try newStrip.setTitle(activeRoom)
         // extraDirs (Plan 4b Task 6): the user characters dir is searched
         // BEFORE comicartDir (D1 §4.3) — a downloaded avatar shadows a
         // same-named bundled one, and (the reflow-coherence payoff) a
@@ -442,8 +534,8 @@ public final class ChatSessionModel: @unchecked Sendable {
     private func startEventConsumer() {
         consumerTask = Task { [weak self] in
             guard let self else { return }
-            for await ev in self.session.events {
-                self.enqueueHandle(ev)
+            for await scoped in self.session.events {
+                self.enqueueHandle(scoped.event, channel: scoped.channel)
             }
         }
     }
@@ -454,9 +546,9 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// false`) — both funnel through this single entry point so
     /// `_transcript`/`announcedBackTo`/`loggedInContinuation` have exactly
     /// one serialized owner.
-    private func enqueueHandle(_ ev: ProtocolEvent, fromServer: Bool = true) {
+    private func enqueueHandle(_ ev: ProtocolEvent, channel: String? = nil, fromServer: Bool = true) {
         engineQueue.async { [weak self] in
-            self?.handleLocked(ev, fromServer: fromServer)
+            self?.handleLocked(ev, channel: channel, fromServer: fromServer)
         }
     }
 
@@ -495,26 +587,69 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///                           -> recompute sorted member list -> onMembers
     ///   .statusLine/.error/.disconnectedHint -> onStatus
     ///
+    /// - Parameter channel: the room this event is scoped to (Plan 4b Task 7),
+    ///   `nil` for session-scoped events (whisper/sound/status/login — see
+    ///   `ScopedEvent`'s doc comment). A channel-scoped event appends to THAT
+    ///   room's transcript and drives the live strip ONLY when it is the
+    ///   active room; otherwise it bumps that room's unread (messages only)
+    ///   and refreshes the tab bar. A `nil` channel routes to the SESSION
+    ///   transcript and behaves exactly as pre-Task-7 (no strip effect unless
+    ///   it's one of the room-agnostic strip events — none are).
     /// - Parameter fromServer: `true` for every event arriving off the wire
     ///   (the event-consumer `Task`'s default); `false` only for `send(_:)`'s
-    ///   synthetic self-say. Used by the `.text` case's own-say echo dedup
-    ///   below — a synthetic event (`fromServer == false`) never matches the
-    ///   `pendingLocalEchoes` check, since it IS the render being kept.
-    private func handleLocked(_ ev: ProtocolEvent, fromServer: Bool = true) {
+    ///   synthetic self-say / `changeCharacter`'s synthetic self-`.appearsAs`.
+    ///   Used by the `.text` case's own-say echo dedup below — a synthetic
+    ///   event (`fromServer == false`) never matches the `pendingLocalEchoes`
+    ///   check, since it IS the render being kept.
+    private func handleLocked(_ ev: ProtocolEvent, channel: String? = nil, fromServer: Bool = true) {
         guard !isShutDown else { return }
 
         // Own-say echo dedup (4a carryover): some servers echo PRIVMSG back to
         // the sender; our synthetic local echo (send(_:)) already rendered it.
         // Drop exactly one server copy per pending send, BEFORE the transcript
-        // append -- reflow (`reflowLocked`, which replays `_transcript`
-        // verbatim) must not double-render it either.
+        // append -- reflow (`rebuildStripLocked`, which replays a room's
+        // transcript verbatim) must not double-render it either.
         if case .text(let nick, _, _, let text, _, _) = ev,
            fromServer, nick == currentOwnNick,
            let i = pendingLocalEchoes.firstIndex(of: text) {
             pendingLocalEchoes.remove(at: i)
             return
         }
-        _transcript.append(ev)
+
+        // --- transcript routing (Plan 4b Task 7) ---------------------------
+        // Channel-scoped -> that room's transcript (create the box if the
+        // event beat the `.selfJoined` that would have — defensive; normal
+        // flow registers the room in `joinRoom`/`.selfJoined`). Session-scoped
+        // (`channel == nil`) -> the session transcript. The strip-driving
+        // switch below reads `isActiveRoom` to decide live-render vs unread.
+        //
+        // `scopedRoom` prefers the token-resolved `channel` but falls back to
+        // an event's OWN payload channel for the events that carry one
+        // (`.selfJoined`/`.selfParted`). This closes a token-registration race:
+        // `.selfJoined` is what CONFIRMS a join, but the wire JOIN echo can
+        // arrive before the async `session.join(...)` (fired from `.loggedIn`)
+        // has registered the room's token — so the token-resolved channel is
+        // nil, yet the event payload names the channel unambiguously. Using the
+        // payload channel keeps `.selfJoined` in its room's transcript
+        // regardless of that timing (verified: FixtureReplayServerTests, whose
+        // fixture sends the JOIN echo immediately after 001).
+        let scopedRoom = channel ?? intrinsicChannel(of: ev)
+        let isActiveRoom = (scopedRoom != nil && scopedRoom == activeRoom)
+        // `.selfParted` for a room we already dropped (via `leaveRoom`, which
+        // removes the box BEFORE the server's part-confirm echo lands) must
+        // NOT re-create the box (which would re-add a phantom tab). It routes
+        // to the session transcript instead and the `.selfParted` case below
+        // is a no-op for an already-gone room.
+        let isPartOfDepartedRoom: Bool = {
+            if case .selfParted(let ch) = ev { return rooms[ch] == nil }
+            return false
+        }()
+        if let room = scopedRoom, !isPartOfDepartedRoom {
+            ensureRoomBoxLocked(room)
+            rooms[room]!.transcript.append(ev)
+        } else {
+            sessionTranscript.append(ev)
+        }
 
         switch ev {
         case .loggedIn(let nick):
@@ -523,42 +658,70 @@ public final class ChatSessionModel: @unchecked Sendable {
                 try? await session.join(config.room)
             }
 
-        case .selfJoined:
+        case .selfJoined(let joinedChannel):
+            // The server confirmed a join. Register/activate is already done
+            // for the INITIAL room (`start()`) and for a `joinRoom` (below);
+            // this just ensures the box exists and announces our avatar IN
+            // THAT CHANNEL (clarification 1: the per-CRoomInfo announce goes
+            // to the joined channel, not a hard-coded `config.room`).
+            ensureRoomBoxLocked(joinedChannel)
             let name = config.characterName.capitalized
-            Task { [session, config] in
-                try? await session.announceAvatar(channel: config.room, name: name)
+            Task { [session] in
+                try? await session.announceAvatar(channel: joinedChannel, name: name)
             }
-            recomposeLocked()
+            if joinedChannel == activeRoom { recomposeLocked() }
+            emitRooms()
+
+        case .selfParted(let partedChannel):
+            // A server-confirmed self-part. If `leaveRoom` already dropped the
+            // box (the common case — a user-initiated leave), this is a no-op
+            // (guarded by `isPartOfDepartedRoom` above, which routed the event
+            // to the session transcript and never re-created the box). If the
+            // room is STILL joined, the part was server-initiated (a forced
+            // part / self-kick the app didn't drive) — drop it the same way
+            // `leaveRoom` does: remove the box/tab, and if it was active,
+            // fall back to another room or clear the strip.
+            if rooms[partedChannel] != nil {
+                let wasActive = (partedChannel == activeRoom)
+                rooms.removeValue(forKey: partedChannel)
+                roomOrder.removeAll { $0 == partedChannel }
+                if wasActive {
+                    if let fallback = roomOrder.first {
+                        rebuildStripLocked(for: fallback, resetAnnounce: false)
+                        rooms[fallback]?.unread = 0
+                        emitMembers(for: fallback)
+                    } else {
+                        strip?.close(); strip = nil; bridge = nil
+                        selfParticipantID = nil; activeRoom = ""
+                    }
+                }
+                emitRooms()
+            }
 
         case .appearsAs(let nick, let avatarName, let url):
-            // Plan 4b Task 5 fix round 1 (transcript-doctrine finding): a
-            // character switch is now synthesized as a `.appearsAs` for OUR
-            // OWN nick (see `changeCharacter`'s doc comment) and routed
-            // through this SAME handler so `bridge.apply` re-avatars the self
-            // participant and the switch lands in `_transcript` at its
-            // correct reflow position. The reply-announce below exists to
-            // greet a PEER whose avatar we're seeing for the first time — it
-            // must NEVER fire for our own synthetic (`!fromServer`) or for a
-            // server-echoed announce of our OWN nick (some servers echo a
-            // client's own PRIVMSG-shaped announce back, same class of hazard
-            // as `send`'s own-say echo dedup), or we'd send ourselves a
-            // private "# Appears as" reply. The bridge.apply/recompose below
-            // are unconditional either way — those are what actually make the
-            // avatar switch visible, self or peer.
+            // A character-appearance announce. It rides a room PRIVMSG/DATA so
+            // it is channel-scoped on the wire (clarification 4) — it lives in
+            // THAT room's transcript (appended above) and drives the live
+            // strip only when that room is active. The reply-announce greets a
+            // PEER whose avatar we're seeing for the first time; it must NEVER
+            // fire for our own synthetic (`!fromServer`) or a server-echoed
+            // announce of our OWN nick. `announcedBackTo` stays session-level
+            // (a nick is greeted once across the whole session).
             let isOwnAnnounce = !fromServer || nick.caseInsensitiveCompare(currentOwnNick) == .orderedSame
             if !isOwnAnnounce, !announcedBackTo.contains(nick) {
                 announcedBackTo.insert(nick)
                 let name = config.characterName.capitalized
-                Task { [session, config] in
-                    try? await session.announceAvatar(channel: config.room, toNick: nick, name: name)
+                let announceChannel = scopedRoom ?? activeRoom
+                Task { [session] in
+                    try? await session.announceAvatar(channel: announceChannel, toNick: nick, name: name)
                 }
             }
-            try? bridge?.apply(ev)
-            recomposeLocked()
-            // Plan 4b Task 6 (D4 §4): a PEER's announce (never our own
-            // synthetic — `isOwnAnnounce` guards that below, same reasoning
-            // as the reply-announce above) naming art we don't have locally
-            // AND carrying a fetchable URL enters the auto-download path.
+            if isActiveRoom { try? bridge?.apply(ev); recomposeLocked() }
+            // Plan 4b Task 6 (D4 §4): a PEER's announce naming art we don't
+            // have locally AND carrying a fetchable URL enters the
+            // auto-download path. Fires once regardless of room — the in-flight
+            // guard dedupes (clarification 4); the resolved avatar is picked up
+            // by whichever room's transcript replay next resolves the name.
             if !isOwnAnnounce {
                 downloadAvatarIfNeededLocked(nick: nick, avatarName: avatarName, url: url)
             }
@@ -569,55 +732,64 @@ public final class ChatSessionModel: @unchecked Sendable {
             // <ourNick> :text` -- the engine classifies this `CC_EV_TEXT`
             // (never `CC_EV_WHISPER`; see `whisperBoxRoutingLocked`'s doc
             // comment for the verified ircsock.cpp citations), so it must
-            // ALSO be routed to the whisper box here, alongside the existing
-            // main-strip rendering below. Detected either by the PRIVMSG's
-            // target being our own nick (not a channel) or by cooked
-            // SM_WHISPER-mode (mode == 2) annotations riding along on a
-            // `.text` event. This check runs AFTER the own-echo dedup guard
-            // above (which already `return`ed for a matching echo) -- so an
-            // own-whisper echo (target == the PEER, not our nick) never
-            // reaches here a second time via this path; see
-            // `WhisperRoutingTests.ownWhisperEchoIsDedupedNotDoubleCounted`.
-            if target.caseInsensitiveCompare(currentOwnNick) == .orderedSame || annotations?.mode == 2 {
+            // ALSO be routed to the whisper box, alongside strip rendering.
+            // Whispers stay SESSION-level (clarification 2) — the whisper-box
+            // routing runs regardless of which room is active. Detected by the
+            // PRIVMSG target being our own nick or cooked SM_WHISPER-mode
+            // (mode == 2) annotations. Runs AFTER the own-echo dedup guard
+            // above (which already `return`ed for a matching echo).
+            let isWhisper = target.caseInsensitiveCompare(currentOwnNick) == .orderedSame || annotations?.mode == 2
+            if isWhisper {
                 whisperBoxRoutingLocked(nick: nick, text: text)
             }
-            try? bridge?.apply(ev)
-            recomposeLocked()
+            // Strip/unread routing: a plain-IRC whisper is session-scoped
+            // (`channel == nil`), so it never bumps a room's unread or strip;
+            // a genuine channel message drives the active strip or bumps the
+            // background room's unread. An OWN message (`!fromServer` — the
+            // synthetic self-say into a background room) renders but never
+            // bumps unread (you don't have unread from yourself).
+            handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedRoom,
+                                         isMessage: !isWhisper && fromServer)
 
         case .action:
-            try? bridge?.apply(ev)
-            recomposeLocked()
+            handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedRoom,
+                                         isMessage: fromServer)
 
         case .whisper(let nick, _, let text, _):
             // Plan 4b Task 4: the IRCX WHISPER verb path -- see
             // `whisperBoxRoutingLocked`'s doc comment for both wire forms.
-            // The main-strip whisper-balloon rendering (`bridge.apply` +
-            // `recomposeLocked`) is EXISTING 4a behavior for room-scoped
-            // whispers and is unconditionally kept either way -- this task
-            // only adds the tabbed-box routing alongside it.
+            // Whisper-box routing is session-level (clarification 2). The 4a
+            // main-strip whisper-balloon rendering is kept, gated on the
+            // whisper's room being active (a channel-scoped WHISPER) or
+            // session-scoped (`channel == nil` -> render on the active strip,
+            // matching pre-Task-7 behavior). A whisper does NOT bump unread.
             whisperBoxRoutingLocked(nick: nick, text: text)
-            try? bridge?.apply(ev)
-            recomposeLocked()
+            if isActiveRoom || channel == nil { try? bridge?.apply(ev); recomposeLocked() }
 
         case .userJoined:
-            try? bridge?.apply(ev)
-            recomposeLocked()
-            // Final review (Plan 4a): a peer joining mid-session must also
-            // refresh the member sidebar -- match every other membership case
-            // below (parts/quits/kicks/names/nick-changes) which already call
-            // `emitMembers()`. Without this, a joining peer appears in the
-            // comic strip but never in the sidebar until some unrelated
-            // membership event happens to fire.
-            emitMembers()
+            // A peer joining is strip-relevant (renders a JOIN panel) AND
+            // membership-relevant, both scoped to the event's room. Live only
+            // when that room is active; a background room defers rendering to
+            // its next activation (transcript already appended). A join does
+            // NOT bump unread (clarification 3).
+            if isActiveRoom { try? bridge?.apply(ev); recomposeLocked() }
+            if let room = scopedRoom { emitMembers(for: room) }
 
         case .nickChanged(_, let newNick, let isSelf):
             if isSelf {
                 currentOwnNick = newNick   // echo-only rule confirmation, mirrors ProtocolSession's own _ownNick update
             }
-            emitMembers()
+            // A nick change is server-wide (session-scoped) — refresh the
+            // active room's member list (the sidebar shows the active room).
+            emitMembers(for: activeRoom)
 
-        case .userParted, .userQuit, .kicked, .names, .endOfNames:
-            emitMembers()
+        case .userParted, .kicked, .names, .endOfNames:
+            emitMembers(for: scopedRoom ?? activeRoom)
+
+        case .userQuit:
+            // Server-wide: the peer left every room at once — refresh the
+            // active room's sidebar.
+            emitMembers(for: activeRoom)
 
         case .statusLine(let text):
             emitStatus(text)
@@ -628,6 +800,50 @@ public final class ChatSessionModel: @unchecked Sendable {
 
         default:
             break
+        }
+    }
+
+    /// ENGINE QUEUE ONLY. A channel-scoped strip message (`.text`/`.action`):
+    /// if it's the active room, apply it to the live strip and recompose; if a
+    /// background room, bump that room's unread (only when `isMessage`) and
+    /// refresh the tab bar. The transcript append already happened in
+    /// `handleLocked`. `room == nil` (session-scoped, e.g. a plain-IRC
+    /// whisper) does nothing here — it never touches the strip or unread.
+    private func handleRoomMessageStripEffect(_ ev: ProtocolEvent, isActiveRoom: Bool, room: String?, isMessage: Bool) {
+        if isActiveRoom {
+            try? bridge?.apply(ev)
+            recomposeLocked()
+        } else if let room, rooms[room] != nil {
+            if isMessage {
+                rooms[room]!.unread += 1
+                emitRooms()
+            }
+        }
+    }
+
+    /// ENGINE QUEUE ONLY. Ensures a `RoomBox` and its tab-order slot exist for
+    /// `room` (idempotent). Used defensively wherever an event might reference
+    /// a room the normal join flow hasn't registered yet.
+    private func ensureRoomBoxLocked(_ room: String) {
+        if rooms[room] == nil {
+            rooms[room] = RoomBox()
+            roomOrder.append(room)
+        }
+    }
+
+    /// The channel an event carries in its OWN payload, for the join-lifecycle
+    /// events where that channel IS definitionally the room and is needed as a
+    /// fallback when the token-resolved channel is momentarily nil (the
+    /// token-registration race — see `handleLocked`'s `scopedRoom`). Only
+    /// `.selfJoined`/`.selfParted` qualify: their payload channel is
+    /// unambiguously a room. Message events (`.text` target may be a nick;
+    /// `.userJoined` carries no channel) are NOT included — those rely on the
+    /// authoritative token-resolved channel.
+    private func intrinsicChannel(of ev: ProtocolEvent) -> String? {
+        switch ev {
+        case .selfJoined(let channel): return channel
+        case .selfParted(let channel): return channel
+        default: return nil
         }
     }
 
@@ -743,33 +959,74 @@ public final class ChatSessionModel: @unchecked Sendable {
         guard (try? bridge.compose(onto: canvas)) != nil else { return }
         guard let image = canvas.makeCGImage() else { return }
         let sizePoints = CGSize(width: CGFloat(w) / 20, height: CGFloat(h) / 20)
+        // Plan 4b Task 7: cache the last composed image so `setActiveRoom` can
+        // stash it into the outgoing room's box (an instant switch-back).
+        lastComposedImage = image
+        lastComposedSizePoints = sizePoints
         DispatchQueue.main.async { [onStripImage] in
             onStripImage?(image, sizePoints)
         }
     }
 
-    /// Reads the current member list and forwards it to `onMembers`. Called
-    /// from `handleLocked` (running ON the engine queue), but dispatched via
-    /// a detached `Task` rather than reading `session.room(_:)` directly:
-    /// that accessor does its own `sessionQueue.sync` internally
-    /// (`ProtocolSession`'s public read API), and `sessionQueue` IS this
-    /// model's `engineQueue` (shared by injection, `ProtocolSession`'s own
-    /// doc comment) — calling it synchronously from a closure ALREADY
-    /// executing on that same serial queue is a same-queue reentrant `sync`,
-    /// which traps (SIGTRAP, observed) rather than merely deadlocking. The
-    /// `Task` runs on its own (cooperative-pool) context, genuinely off the
-    /// engine queue, so `session.room(_:)`'s internal `sync` is safe there.
-    private func emitMembers() {
+    /// The image/size the LAST `recomposeLocked` produced for the CURRENT
+    /// active strip (Plan 4b Task 7). Stashed into the outgoing room's box on a
+    /// `setActiveRoom` swap. Engine-queue-owned.
+    private var lastComposedImage: CGImage?
+    private var lastComposedSizePoints: CGSize = .zero
+
+    /// Reads `room`'s member list and forwards it to `onMembers`. Called from
+    /// `handleLocked` (running ON the engine queue), but dispatched via a
+    /// detached `Task` rather than reading `session.room(_:)` directly: that
+    /// accessor does its own `sessionQueue.sync` internally (`ProtocolSession`'s
+    /// public read API), and `sessionQueue` IS this model's `engineQueue`
+    /// (shared by injection, `ProtocolSession`'s own doc comment) — calling it
+    /// synchronously from a closure ALREADY executing on that same serial queue
+    /// is a same-queue reentrant `sync`, which traps (SIGTRAP, observed) rather
+    /// than merely deadlocking. The `Task` runs on its own (cooperative-pool)
+    /// context, genuinely off the engine queue, so `session.room(_:)`'s
+    /// internal `sync` is safe there.
+    ///
+    /// Plan 4b Task 7: `room` is the event's own channel — the sidebar shows
+    /// whichever room is active, so a membership event for a BACKGROUND room
+    /// still refreshes ITS `session.room(room)` snapshot but only the active
+    /// room's snapshot actually shows (the app re-reads on `setActiveRoom`).
+    /// Emitting for the event's room keeps `ProtocolSession`'s own per-room
+    /// member table the single source of truth and lets a caller filter.
+    private func emitMembers(for room: String) {
         membersSeq += 1                              // engine queue — serialized
         let seq = membersSeq
-        Task { [session, config, onMembers] in
-            let members = session.room(config.room)?.members ?? [:]
+        let activeAtEmit = activeRoom
+        Task { [session, onMembers] in
+            // Only the ACTIVE room's membership drives the one sidebar — a
+            // background room's churn updates `session.room(room)` (read on
+            // its next activation) but must not overwrite the visible list.
+            guard room == activeAtEmit else { return }
+            let members = session.room(room)?.members ?? [:]
             let sorted = members.values.filter { !$0.departed }.map(\.nick).sorted()
             DispatchQueue.main.async {
                 guard seq > self.appliedMembersSeq else { return }   // stale snapshot — drop
                 self.appliedMembersSeq = seq
                 onMembers?(sorted)
             }
+        }
+    }
+
+    /// ENGINE QUEUE ONLY. Builds the current `[RoomInfo]` (tab order, unread,
+    /// active flag). Reads `roomOrder`/`rooms`/`activeRoom` — all engine-queue
+    /// state.
+    private func roomInfosLocked() -> [RoomInfo] {
+        roomOrder.compactMap { name in
+            guard let box = rooms[name] else { return nil }
+            return RoomInfo(name: name, unread: box.unread, isActive: name == activeRoom)
+        }
+    }
+
+    /// ENGINE QUEUE ONLY. Fires `onRoomsChanged` with the current tab-bar
+    /// snapshot on the main thread (Plan 4b Task 7).
+    private func emitRooms() {
+        let infos = roomInfosLocked()
+        DispatchQueue.main.async { [onRoomsChanged] in
+            onRoomsChanged?(infos)
         }
     }
 
@@ -887,6 +1144,16 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///
     /// Fire-and-forget: hops onto the engine queue and returns immediately,
     /// same posture as `setEmotion`/`previewTyping`/`setViewport`.
+    /// Plan 4b Task 7 (multi-room, clarification 1): the self character-switch
+    /// is appended to EVERY joined room's transcript (each room's replay needs
+    /// the `.appearsAs` positionally so a later `setActiveRoom` rebuild
+    /// re-avatars the self participant correctly), applied ONCE to the current
+    /// live strip (the active room), and the wire announce goes to EVERY joined
+    /// room (the original's per-CRoomInfo announce). The synthetic is appended
+    /// DIRECTLY to each room's transcript rather than routed through
+    /// `handleLocked` per-room (which would recompose N times and re-run the
+    /// reply-announce guard N times) — its only strip effect is the single
+    /// `bridge.apply` on the active strip, done here.
     public func changeCharacter(_ name: String) {
         engineQueue.async { [weak self] in
             guard let self, !self.isShutDown, self.strip != nil,
@@ -895,13 +1162,23 @@ public final class ChatSessionModel: @unchecked Sendable {
             self.selfAvatarFile = nil
             let synthetic = ProtocolEvent.appearsAs(nick: self.currentOwnNick,
                                                     avatarName: name.capitalized, url: "")
-            self.handleLocked(synthetic, fromServer: false)
+            // Record the switch in every room's transcript at its correct
+            // reflow position (clarification 1).
+            for room in self.roomOrder {
+                self.rooms[room]?.transcript.append(synthetic)
+            }
+            // Apply to the live strip (the active room) once.
+            try? self.bridge?.apply(synthetic)
+            self.recomposeLocked()
             self.emitSelfPoseLocked()
+            // The REAL wire announce to every joined room.
             let session = self.session
-            let channel = self.config.room
             let announceName = name.capitalized
+            let joinedRooms = self.roomOrder
             Task {
-                try? await session.announceAvatar(channel: channel, name: announceName)
+                for room in joinedRooms {
+                    try? await session.announceAvatar(channel: room, name: announceName)
+                }
             }
         }
     }
@@ -1014,26 +1291,25 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// through the SAME transcript-append + enqueue path a server-originated
     /// `.text` would take, so the own line appears (posed) without depending
     /// on any echo.
-    public func send(_ text: String, mode: Strip.Mode = .say) async throws {
+    /// - Parameter room: the room to send into (Plan 4b Task 7). `nil`
+    ///   (default) targets the ACTIVE room — the compose bar always sends into
+    ///   the tab it's showing, and the app leaves this `nil` since the active
+    ///   room IS the shown tab. A caller MAY pass an explicit room to send into
+    ///   a background room without switching to it.
+    public func send(_ text: String, mode: Strip.Mode = .say, room: String? = nil) async throws {
         // `performOnEngineQueue` traps if called while already ON the engine
         // queue (its own doc comment) — `send` is invoked from the UI/main
         // context (ChatWindow's Task { try? await model.send(...) }), never
         // from inside `handleLocked`/the event consumer, so this is legal,
         // same posture as the pre-existing `session.say` call below.
         //
-        // `config` READ HAZARD (Plan 4b Task 5): `config` became a `var`
-        // this task (`changeCharacter`/`changeBackdrop` mutate
-        // `config.characterName`/`.backdropName` ON the engine queue) — so a
-        // bare off-queue `config.room`/`config.sendComicsData` read here
-        // would race those writes (Swift's exclusivity model has no
-        // per-field granularity for a struct touched from two threads; ANY
-        // field write on one thread races ANY field read on another, even a
-        // DIFFERENT field). Both needed values are read inside this SAME
-        // `performOnEngineQueue` call (which was already here for
-        // `strip?.selfAnnotations()`) rather than via bare `config.x`
-        // accesses below.
-        let (sendComicsData, room): (Bool, String) = session.performOnEngineQueue { [self] in
-            (config.sendComicsData, config.room)
+        // `config`/`activeRoom` READ HAZARD (Plan 4b Task 5/7): both are
+        // engine-queue-owned (`changeCharacter`/`changeBackdrop`/
+        // `setActiveRoom` mutate them ON the engine queue) — so a bare
+        // off-queue read here would race those writes. All needed values are
+        // read inside this SAME `performOnEngineQueue` call.
+        let (sendComicsData, targetRoom): (Bool, String) = session.performOnEngineQueue { [self] in
+            (config.sendComicsData, room ?? activeRoom)
         }
         let ann: Annotations? = session.performOnEngineQueue { [self] in
             guard sendComicsData else { return nil }
@@ -1041,7 +1317,7 @@ public final class ChatSessionModel: @unchecked Sendable {
             a.mode = Self.smMode(for: mode)
             return a
         }
-        try await session.say(room, text: text, annotations: ann,
+        try await session.say(targetRoom, text: text, annotations: ann,
                               modes: UInt16(mode.rawValue))
         // Registered BEFORE the synthetic event is enqueued (4a carryover:
         // own-say echo dedup, `handleLocked`'s doc comment) so a server echo
@@ -1050,9 +1326,13 @@ public final class ChatSessionModel: @unchecked Sendable {
         // pending entry to consume, however the two async paths interleave.
         engineQueue.async { [weak self] in self?.pendingLocalEchoes.append(text) }
         let ownNick = session.ownNick
-        let synthetic = ProtocolEvent.text(nick: ownNick, ident: "", target: room,
+        let synthetic = ProtocolEvent.text(nick: ownNick, ident: "", target: targetRoom,
                                           text: text, kind: 0, annotations: ann)
-        enqueueHandle(synthetic, fromServer: false)
+        // Route the synthetic through the target room's channel (Plan 4b Task
+        // 7) so it lands in that room's transcript and renders on the live
+        // strip when that room is active (own-say is never counted unread —
+        // `handleLocked`'s message-vs-active gate handles a background target).
+        enqueueHandle(synthetic, channel: targetRoom, fromServer: false)
     }
 
     // MARK: - whisper (Plan 4b Task 4)
@@ -1090,15 +1370,17 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// exactly what this method's closure is.
     public func sendWhisper(to peer: String, text: String) async throws {
         // Same `config` read-hazard fix as `send(_:mode:)`'s own doc comment
-        // (Plan 4b Task 5: `config` is now a `var`, mutated on the engine
-        // queue by `changeCharacter`/`changeBackdrop`) — `config.room` is
-        // read inside this SAME `performOnEngineQueue` call rather than as a
-        // bare off-queue access.
+        // (Plan 4b Task 5/7: `config`/`activeRoom` are engine-queue-owned) —
+        // read inside this SAME `performOnEngineQueue` call. Plan 4b Task 7:
+        // the whisper's room context is the ACTIVE room (the tab the user is
+        // whispering FROM) — the wire form is still a plain PRIVMSG to `peer`
+        // (`cc_session_send_whisper`), the room only scopes the token/
+        // annotations context.
         let (ann, room): (Annotations?, String) = session.performOnEngineQueue { [self] in
-            guard var a = try? strip?.selfAnnotations() else { return (nil, config.room) }
+            guard var a = try? strip?.selfAnnotations() else { return (nil, activeRoom) }
             a.mode = Self.smMode(for: .whisper)
             a.addressees = [peer]
-            return (a, config.room)
+            return (a, activeRoom)
         }
         try await session.whisper(to: [peer], text: text, channel: room, annotations: ann)
         engineQueue.async { [weak self] in
@@ -1152,27 +1434,129 @@ public final class ChatSessionModel: @unchecked Sendable {
             self.didSetViewport = true
             self.currentColumns = columns
             self.currentUnitTwips = unit
-            self.reflowLocked()
+            // Reflow the ACTIVE room (Plan 4b Task 7): a viewport change only
+            // affects the one live strip, which the active room owns.
+            self.rebuildStripLocked(for: self.activeRoom, resetAnnounce: true)
         }
     }
 
-    /// ENGINE QUEUE ONLY. See `setViewport`'s doc comment for the full
-    /// rationale: destroy + recreate the strip at the (already updated)
-    /// `currentColumns`/`currentUnitTwips`, re-add backdrop/self, fresh
-    /// bridge, re-apply the whole transcript, recompose.
-    private func reflowLocked() {
+    /// ENGINE QUEUE ONLY. Destroy + recreate the ONE live strip and replay
+    /// `room`'s transcript into it (Plan 4b Task 7: the generalized reflow —
+    /// `setViewport` calls it for the active room on a geometry change,
+    /// `setActiveRoom` calls it for the room being switched to). See
+    /// `setViewport`'s doc comment for the full rationale: "replay is the
+    /// reflow" — the room's transcript IS its event log, so tearing down and
+    /// re-applying it reproduces that room's exact strip content at the current
+    /// panel geometry. The metrics canvas installed in `setUpStripLocked` stays
+    /// live (a process-global registration, not per-strip).
+    ///
+    /// ONE STRIP AT A TIME (engine UB territory): the teardown-then-create
+    /// order here mirrors the proven single-room reflow exactly — `strip?.close()`
+    /// FIRST, null out `strip`/`bridge`, THEN `setUpStripLocked` creates the
+    /// new one. At no point do two strips coexist.
+    ///
+    /// - Parameter resetAnnounce: clears `announcedBackTo` (the pre-Task-7
+    ///   viewport-reflow behavior — a resize re-greets peers on their next live
+    ///   announce). `setActiveRoom` passes `false`: a tab switch must NOT
+    ///   re-greet already-greeted peers (`announcedBackTo` is session-scoped).
+    private func rebuildStripLocked(for room: String, resetAnnounce: Bool) {
         strip?.close()
         strip = nil
         bridge = nil
         selfParticipantID = nil
-        announcedBackTo.removeAll()
+        if resetAnnounce { announcedBackTo.removeAll() }
 
+        // `setUpStripLocked` seeds the title from `activeRoom`, so ensure it
+        // points at the room being rebuilt (the caller sets this too, but keep
+        // it robust — `activeRoom` is the single source of truth for the title
+        // and the `_transcript` computed property this replays).
+        activeRoom = room
         guard (try? setUpStripLocked(isReflow: true)) != nil else { return }
         guard let bridge else { return }
-        for ev in _transcript {
+        for ev in rooms[room]?.transcript ?? [] {
             try? bridge.apply(ev)
         }
         recomposeLocked()
+    }
+
+    // MARK: - room management (Plan 4b Task 7)
+
+    /// Joins an ADDITIONAL room on the same connection (Plan 4b Task 7). The
+    /// server's `.selfJoined` confirm creates the room box + announces our
+    /// avatar in that channel (`handleLocked`'s `.selfJoined` case). Registers
+    /// the tab-order slot immediately so the tab appears before the confirm
+    /// lands (the room shows with 0 unread until its first message). Does NOT
+    /// switch to the new room — the caller decides when to `setActiveRoom`.
+    public func joinRoom(_ room: String) async throws {
+        engineQueue.sync {
+            self.ensureRoomBoxLocked(room)
+        }
+        emitRooms()
+        try await session.join(room)
+    }
+
+    /// Leaves `room` (Plan 4b Task 7). Sends the wire PART, drops the room's
+    /// box/tab, and — if it was the active room — activates another surviving
+    /// room (falling back to the first in tab order) or clears the strip if it
+    /// was the last one.
+    public func leaveRoom(_ room: String) async throws {
+        try await session.part(room)
+        var newActive: String? = nil
+        var wasActive = false
+        engineQueue.sync {
+            guard self.rooms[room] != nil else { return }
+            wasActive = (room == self.activeRoom)
+            self.rooms.removeValue(forKey: room)
+            self.roomOrder.removeAll { $0 == room }
+            if wasActive {
+                newActive = self.roomOrder.first
+            }
+        }
+        if wasActive, let newActive {
+            setActiveRoom(newActive)
+        } else if wasActive {
+            // Last room left — tear down the live strip (no room to rebuild
+            // from). The app clears its own strip image when `rooms` empties.
+            engineQueue.sync {
+                self.strip?.close()
+                self.strip = nil
+                self.bridge = nil
+                self.selfParticipantID = nil
+                self.activeRoom = ""
+                self.lastComposedImage = nil
+            }
+        }
+        emitRooms()
+    }
+
+    /// Switches the ONE live strip to `room` (Plan 4b Task 7). Engine-queue:
+    /// stash the current strip's last image into the OLD room's box, tear down
+    /// the strip and rebuild it from the NEW room's transcript (same proven
+    /// reflow machinery, `rebuildStripLocked`), zero the new room's unread,
+    /// recompose, and refresh the tab bar + member sidebar. A no-op if `room`
+    /// is already active or not joined.
+    public func setActiveRoom(_ room: String) {
+        engineQueue.async { [weak self] in
+            guard let self, !self.isShutDown else { return }
+            guard self.rooms[room] != nil, room != self.activeRoom else { return }
+            // Stash the outgoing room's last composed image (cached for an
+            // instant switch-back — the app can show it while the new room
+            // rebuilds, though `rebuildStripLocked` is fast enough that the
+            // fresh recompose usually lands first).
+            let previous = self.activeRoom
+            if var box = self.rooms[previous] {
+                box.lastImage = self.lastComposedImage
+                box.lastSizePoints = self.lastComposedSizePoints
+                self.rooms[previous] = box
+            }
+            // Rebuild the strip from the new room's transcript (title = new
+            // room name, via `activeRoom` set inside `rebuildStripLocked`).
+            self.rebuildStripLocked(for: room, resetAnnounce: false)
+            // Zero the newly-active room's unread.
+            self.rooms[room]?.unread = 0
+            self.emitRooms()
+            self.emitMembers(for: room)
+        }
     }
 
     // MARK: - shutdown

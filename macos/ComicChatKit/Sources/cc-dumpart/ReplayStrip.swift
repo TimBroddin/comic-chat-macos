@@ -169,8 +169,8 @@ private final class EventDrainBox: @unchecked Sendable {
     private let lock = NSLock()
     private var events: [ProtocolEvent] = []
 
-    init(iterator: AsyncStream<ProtocolEvent>.AsyncIterator) {
-        // `AsyncStream<ProtocolEvent>.AsyncIterator` is not `Sendable`, which
+    init(iterator: AsyncStream<ScopedEvent>.AsyncIterator) {
+        // `AsyncStream<ScopedEvent>.AsyncIterator` is not `Sendable`, which
         // makes the compiler's data-race checker reject capturing it in the
         // `Task` closure below even though, by construction, exactly one
         // place ever touches it (this Task body -- the outer `init` never
@@ -178,9 +178,13 @@ private final class EventDrainBox: @unchecked Sendable {
         // `iterator.next()` from nowhere else). `nonisolated(unsafe)` records
         // that as a deliberate, verified exception rather than silencing the
         // check with a broader escape hatch.
+        //
+        // Plan 4b Task 7: the stream now yields `ScopedEvent` (event + channel);
+        // this driver only cares about the bare event, so it unwraps `.event`.
         nonisolated(unsafe) var iterator = iterator
         Task {
-            while let ev = await iterator.next() {
+            while let scoped = await iterator.next() {
+                let ev = scoped.event
                 if ProcessInfo.processInfo.environment["CC_REPLAY_DEBUG"] != nil {
                     FileHandle.standardError.write(Data("DEBUG DRAINED: \(ev)\n".utf8))
                 }
@@ -201,11 +205,12 @@ private final class EventDrainBox: @unchecked Sendable {
 /// driver should still render whatever it collected rather than fail outright
 /// if a capture ends without ever producing the awaited event).
 private func collectUntil(
-    _ iterator: inout AsyncStream<ProtocolEvent>.AsyncIterator,
+    _ iterator: inout AsyncStream<ScopedEvent>.AsyncIterator,
     matching predicate: (ProtocolEvent) -> Bool
 ) async throws -> [ProtocolEvent] {
     var collected: [ProtocolEvent] = []
-    while let ev = await iterator.next() {
+    while let scoped = await iterator.next() {
+        let ev = scoped.event   // Plan 4b Task 7: unwrap the scoped event
         if ProcessInfo.processInfo.environment["CC_REPLAY_DEBUG"] != nil {
             FileHandle.standardError.write(Data("DEBUG DRAINED: \(ev)\n".utf8))
         }

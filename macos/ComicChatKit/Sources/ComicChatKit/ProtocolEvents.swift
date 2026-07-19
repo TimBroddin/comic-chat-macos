@@ -160,6 +160,38 @@ public enum ProtocolEvent: Sendable {
     case statusLine(text: String)
 }
 
+/// A `ProtocolEvent` paired with the CHANNEL it is scoped to (Plan 4b Task 7:
+/// true multi-room). `ProtocolSession.events` yields these so a consumer that
+/// has joined N rooms on one connection can route each event to the right
+/// per-room transcript.
+///
+/// `channel` is `nil` for SESSION-scoped events — anything the engine emitted
+/// with `room_token == CC_ROOM_TOKEN_NONE` (0): connection lifecycle
+/// (`.loggedIn`/`.serverCaps`), server-wide notices (`.statusLine`/`.error`/
+/// `.motd`/room-list items), a plain-IRC private whisper (`PRIVMSG <ourNick>`,
+/// which has no channel target), quits (`.userQuit` is server-wide — the peer
+/// left every room at once), and IRCX out-of-band `DATA` lines. The channel is
+/// resolved ON the engine queue at emit time via `cc_session_room_channel`
+/// (the token→channel table the session already maintains) — see
+/// `ProtocolSession.emit`.
+///
+/// Note the token→channel resolution is authoritative for ROUTING; several
+/// event payloads ALSO carry a `channel` field of their own (`.selfJoined`,
+/// `.names`, `.topicChanged`, …) for display — those two always agree for a
+/// registered room, and `channel` here is derived from the same parsed channel
+/// the token was resolved from (`ccSessionRoomTokenForChannel`, ircsock.cpp).
+public struct ScopedEvent: Sendable {
+    public let event: ProtocolEvent
+    /// The channel this event is scoped to, or `nil` for session-scoped events
+    /// (token 0). See the type doc comment for the full session-scoped list.
+    public let channel: String?
+
+    public init(event: ProtocolEvent, channel: String?) {
+        self.event = event
+        self.channel = channel
+    }
+}
+
 extension ProtocolEvent {
     /// Build a `ProtocolEvent` from the raw C event, decoding every string
     /// field per `encoding`. Returns `nil` for `CC_EV_NONE` (not a real

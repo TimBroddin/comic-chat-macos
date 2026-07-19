@@ -22,6 +22,13 @@ struct ChatWindow: View {
         @Bindable var state = appState
         HSplitView {
             VStack(spacing: 0) {
+                // Plan 4b Task 7: the room tab bar sits above the one live
+                // strip — tabs with unread badges + close, a "+" to enter a
+                // room. Only shown once connected (there's at least one room).
+                if !appState.rooms.isEmpty {
+                    RoomTabBar()
+                    Divider()
+                }
                 ComicStripView(image: appState.stripImage,
                                 sizePoints: appState.stripSizePoints,
                                 model: appState.model)

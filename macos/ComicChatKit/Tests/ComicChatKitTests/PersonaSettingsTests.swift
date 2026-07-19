@@ -138,8 +138,8 @@ extension EngineGlobalStateSelfTests {
 
             try await server.send(":srv 001 timb :Welcome")
             while true {
-                guard let ev = await iterator.next() else { break }
-                if case .loggedIn = ev { break }
+                guard let scoped = await iterator.next() else { break }
+                if case .loggedIn = scoped.event { break }   // Plan 4b Task 7: unwrap
             }
 
             session.disconnect()

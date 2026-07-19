@@ -143,7 +143,10 @@ private extension Data {
 /// mid-replay side effect off `collectUntil` observing a specific event
 /// (e.g. `.loggedIn`), never off a `send` call completing.
 struct CaptureReplayCursor {
-    private var iterator: AsyncStream<ProtocolEvent>.AsyncIterator
+    // Plan 4b Task 7: `session.events` now yields `ScopedEvent`; this cursor
+    // exposes the bare `ProtocolEvent` API its callers already use by
+    // unwrapping `.event` at the one `iterator.next()` boundary below.
+    private var iterator: AsyncStream<ScopedEvent>.AsyncIterator
     let server: LoopbackIRCServer
     /// Every event observed so far across the whole replay (all phases).
     private(set) var allEvents: [ProtocolEvent] = []
@@ -171,7 +174,8 @@ struct CaptureReplayCursor {
     /// non-`Sendable` iterator rules out a bespoke timeout race here.
     mutating func collectUntil(_ predicate: (ProtocolEvent) -> Bool) async throws -> [ProtocolEvent] {
         var collectedThisCall: [ProtocolEvent] = []
-        while let ev = await iterator.next() {
+        while let scoped = await iterator.next() {
+            let ev = scoped.event   // Plan 4b Task 7: unwrap the scoped event
             allEvents.append(ev)
             collectedThisCall.append(ev)
             if predicate(ev) { return collectedThisCall }

@@ -29,14 +29,15 @@ extension EngineGlobalStateSelfTests {
         }
 
         private func collectUntil(
-            _ iterator: inout AsyncStream<ProtocolEvent>.AsyncIterator,
+            _ iterator: inout AsyncStream<ScopedEvent>.AsyncIterator,
             matching predicate: @escaping (ProtocolEvent) -> Bool
         ) async throws -> [ProtocolEvent] {
             var collected: [ProtocolEvent] = []
             while true {
-                guard let ev = await iterator.next() else {
+                guard let scoped = await iterator.next() else {
                     throw StreamEndedError(collectedSoFar: collected)
                 }
+                let ev = scoped.event   // Plan 4b Task 7: unwrap the scoped event
                 collected.append(ev)
                 if predicate(ev) { return collected }
             }
@@ -59,7 +60,7 @@ extension EngineGlobalStateSelfTests {
         private func loginAndJoin(
             _ session: ProtocolSession,
             _ server: LoopbackIRCServer,
-            _ iterator: inout AsyncStream<ProtocolEvent>.AsyncIterator,
+            _ iterator: inout AsyncStream<ScopedEvent>.AsyncIterator,
             channel: String,
             nick: String,
             otherMembers: String = ""

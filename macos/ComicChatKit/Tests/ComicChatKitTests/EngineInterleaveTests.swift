@@ -44,9 +44,10 @@ extension EngineGlobalStateSelfTests {
         var description: String { "event stream ended before expected event arrived" }
     }
 
-    private func nextEvent(_ iterator: inout AsyncStream<ProtocolEvent>.AsyncIterator) async throws -> ProtocolEvent {
-        guard let ev = await iterator.next() else { throw StreamEndedError() }
-        return ev
+    private func nextEvent(_ iterator: inout AsyncStream<ScopedEvent>.AsyncIterator) async throws -> ProtocolEvent {
+        // Plan 4b Task 7: unwrap the scoped event — this driver is single-room.
+        guard let scoped = await iterator.next() else { throw StreamEndedError() }
+        return scoped.event
     }
 
     /// Drives one scripted conversation over a real loopback socket and

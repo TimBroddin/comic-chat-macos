@@ -12,6 +12,20 @@ public final class AppState {
     public var members: [String] = []
     public var stripImage: CGImage?
     public var stripSizePoints: CGSize = .zero
+
+    // MARK: Rooms (Plan 4b Task 7: true multi-room)
+
+    /// The joined rooms in tab order, mirrored from
+    /// `ChatSessionModel.onRoomsChanged` on the main thread — `RoomTabBar`'s
+    /// data source (tab name + unread badge + active flag).
+    public var rooms: [RoomInfo] = []
+    /// The active room's name (the tab currently owning the one live strip),
+    /// or `nil` before connect. Derived from `rooms` (the active one), kept as
+    /// a convenience for the tab bar's selection binding.
+    public var activeRoom: String? { rooms.first { $0.isActive }?.name }
+    /// Bound to the Enter Room sheet's text field (⌘J / RoomTabBar "+").
+    public var showEnterRoomSheet = false
+    public var enterRoomText = ""
     /// The self avatar's live pose preview (Plan 4b Task 3) — updated after
     /// every emotion-wheel drag or typing-preview via `ChatSessionModel.onSelfPose`.
     public var selfPoseImage: CGImage?
@@ -70,6 +84,29 @@ public final class AppState {
         if !line.isOwn {
             whisperUnread[peer, default: 0] += 1
         }
+    }
+
+    /// Switches the one live strip to `room` (Plan 4b Task 7) — the tab bar's
+    /// tap handler. Fire-and-forget on the model (engine-queue-hopped there).
+    public func setActiveRoom(_ room: String) {
+        model?.setActiveRoom(room)
+    }
+
+    /// Joins an ADDITIONAL room on the same connection (Plan 4b Task 7) — the
+    /// Enter Room sheet / ⌘J / RoomTabBar "+". Normalizes a bare name to a
+    /// channel (`#`-prefixed) the way the connect sheet's room field does.
+    public func joinRoom(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, let model else { return }
+        let channel = trimmed.hasPrefix("#") || trimmed.hasPrefix("&") ? trimmed : "#" + trimmed
+        Task { try? await model.joinRoom(channel) }
+    }
+
+    /// Leaves `room` (Plan 4b Task 7) — the tab's close button. If it was
+    /// active, the model activates a surviving room (or clears the strip).
+    public func leaveRoom(_ room: String) {
+        guard let model else { return }
+        Task { try? await model.leaveRoom(room) }
     }
 
     /// Kept alive for the process's whole replay session — `FixtureReplayServer`
@@ -153,6 +190,8 @@ public final class AppState {
         m.onSelfPose = { [weak self] img in Task { @MainActor in self?.selfPoseImage = img } }
         m.onWhisper = { [weak self] peer, line in
             Task { @MainActor in self?.recordWhisper(peer: peer, line: line) } }
+        m.onRoomsChanged = { [weak self] infos in
+            Task { @MainActor in self?.rooms = infos } }
         model = m
         do { try await m.start(); showConnectSheet = false }
         catch { statusLine = "Connect failed: \(error)" }
@@ -181,6 +220,9 @@ public final class AppState {
         stripImage = nil
         stripSizePoints = .zero
         selfPoseImage = nil
+        rooms = []
+        showEnterRoomSheet = false
+        enterRoomText = ""
         replayServer?.stop()
         replayServer = nil
         whisperPeers = []
