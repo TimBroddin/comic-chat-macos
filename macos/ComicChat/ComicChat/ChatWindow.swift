@@ -29,9 +29,17 @@ struct ChatWindow: View {
                     RoomTabBar()
                     Divider()
                 }
-                ComicStripView(image: appState.stripImage,
-                                sizePoints: appState.stripSizePoints,
-                                model: appState.model)
+                // Plan 4b Task 11: the View menu ("Comic Strip view ⌘1" /
+                // "Plain Text view ⌘2", `AppCommands`) swaps this for
+                // `TranscriptTextView` — same event log, two renderings, one
+                // shown at a time (never both).
+                if appState.comicMode {
+                    ComicStripView(image: appState.stripImage,
+                                    sizePoints: appState.stripSizePoints,
+                                    model: appState.model)
+                } else {
+                    TranscriptTextView(attributedText: appState.transcriptText)
+                }
                 Divider()
                 ComposeBar(composeText: $composeText, model: appState.model,
                           selectedMembers: appState.selectedMembers)

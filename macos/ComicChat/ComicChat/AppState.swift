@@ -3,6 +3,7 @@ import Observation
 import CoreGraphics
 import AVFoundation
 import AppKit
+import SwiftUI
 import ComicChatKit
 
 @Observable @MainActor
@@ -11,12 +12,45 @@ public final class AppState {
     public var settings = SettingsStore()
     public var showConnectSheet = true
     public var statusLine = ""
+    /// Plan 4b Task 11: an `@Observable`-TRACKED mirror of
+    /// `settings.comicMode`. `SettingsStore` is a thin `UserDefaults`
+    /// wrapper with no change notification of its own (unlike this class,
+    /// which is `@Observable`) — a raw `settings.comicMode = ...` write from
+    /// the View menu's `CommandGroup` would silently fail to re-render
+    /// `ChatWindow`'s body, since nothing `@Observable`-tracked actually
+    /// changed. This property is the fix: it's what the View menu toggles
+    /// and what `ChatWindow` reads, `didSet` writes through to
+    /// `settings.comicMode` so the choice still persists across launches
+    /// (same UserDefaults-backed persistence, just with a live-UI-reactive
+    /// front door). Seeded from `settings.comicMode` at init so a relaunch
+    /// picks up the last persisted choice.
+    public var comicMode = true {
+        didSet { settings.comicMode = comicMode }
+    }
     /// Plan 4b Task 8: widened from `[String]` to `[MemberRow]` (nick/isOp/
     /// avatarName), mirrored from `ChatSessionModel.onMembers` on the main
     /// thread — `ChatWindow`'s member `List` reads this directly.
     public var members: [MemberRow] = []
     public var stripImage: CGImage?
     public var stripSizePoints: CGSize = .zero
+    /// Plan 4b Task 11: the plain-text transcript view's content — the ACTIVE
+    /// room's transcript, run through `TranscriptTextBuilder`. Recomputed
+    /// from `model.transcript`/`model.sessionEvents` on every strip update
+    /// (`onStripImage`, which fires on every recompose — the same signal
+    /// `stripImage` itself updates on) and on every status/error line
+    /// (`onStatus`, which the comic view doesn't otherwise need to observe,
+    /// but the text view's status/error lines DO come from there), on
+    /// tab switch (`handleRoomsChanged`, since the active room — and so which
+    /// transcript this shows — changes there), AND on every sound event
+    /// (`playSound` — `.sound` renders no strip panel so `onStripImage` never
+    /// fires for one, and it sets `statusLine` directly rather than through
+    /// `onStatus`, so without its own explicit recompute a `.sound` line
+    /// would silently never reach the text view; see that method's own doc
+    /// comment). Cheap at chat scale (a full rebuild of a plain-text
+    /// `AttributedString` from the whole event log each time); a
+    /// `.text`-count-gated cache is the brief's fallback if
+    /// that ever stops being true.
+    public var transcriptText = AttributedString()
 
     // MARK: Rooms (Plan 4b Task 7: true multi-room)
 
@@ -92,6 +126,14 @@ public final class AppState {
     public init() {
         try? FileManager.default.createDirectory(
             atPath: settings.soundsFolder, withIntermediateDirectories: true)
+        // Seed the observable mirror from the persisted setting (Plan 4b
+        // Task 11) — done here, AFTER `settings` exists, rather than as
+        // `comicMode`'s own default literal, so a relaunch picks up whatever
+        // was last persisted instead of always starting `true`. Assigning
+        // here does fire `comicMode`'s `didSet`, which just writes the same
+        // value straight back to `settings.comicMode` — a harmless no-op
+        // re-write, not a reset.
+        comicMode = settings.comicMode
     }
 
     /// Handles one inbound `.sound` event (`ChatSessionModel.onSound`, wired
@@ -103,6 +145,19 @@ public final class AppState {
     /// either way" wording).
     private func playSound(nick: String, file: String) {
         statusLine = "\(nick) played \(file)"
+        // Plan 4b Task 11: `.sound` events render NO strip panel
+        // (`ChatSessionModel.handleLocked`'s `.sound` case is audio-only —
+        // no `bridge.apply`/`recomposeLocked()`), so `onStripImage` never
+        // fires for one, and this method sets `statusLine` directly rather
+        // than through `onStatus` — neither of `transcriptText`'s other two
+        // recompute triggers would ever see a `.sound` event otherwise, even
+        // though it already landed in the transcript
+        // (`ChatSessionModel.handleLocked`'s transcript-routing block runs
+        // for every event, `.sound` included, before this callback even
+        // fires) and IS one of `TranscriptTextBuilder`'s styled kinds
+        // (`♪ nick played file`). This is the third, sound-specific
+        // recompute trigger.
+        recomputeTranscriptText()
         guard settings.soundsEnabled else { return }
         let folder = URL(fileURLWithPath: settings.soundsFolder)
         guard let resolved = SoundLibrary(folder: folder).resolve(file) else { return }
@@ -455,6 +510,40 @@ public final class AppState {
             selectedMembers = []
         }
         lastKnownActiveRoom = newActive
+        // Plan 4b Task 11 (post-Task-7 note): the active room can change here
+        // without any strip recompose in between (e.g. switching to a room
+        // whose strip is already up to date) — the text view must still
+        // re-point at the new active room's transcript.
+        recomputeTranscriptText()
+    }
+
+    /// Plan 4b Task 11: rebuilds `transcriptText` from the active room's
+    /// transcript (`model.transcript`) plus the session-scoped events
+    /// (`model.sessionEvents` — login/status/error/whisper-to-self lines that
+    /// belong to no single room). `nil` model (not connected, or between
+    /// `disconnect()` and a fresh `connect()`) clears it. Room-scoped
+    /// whispers are already mixed into `model.transcript` (they're room
+    /// events when room-scoped — `ChatSessionModel.handleLocked`'s `.whisper`
+    /// case appends to the active room's transcript unconditionally), so no
+    /// separate whisper feed is merged in here beyond that.
+    ///
+    /// ORDERING CAVEAT (documented, not silently swept under the rug):
+    /// `model.transcript`/`model.sessionEvents` are two SEPARATE arrays with
+    /// no shared sequence number or timestamp (`RoomBox`/`ChatSessionModel`'s
+    /// own storage — see those types' doc comments), so this is a
+    /// concatenation, NOT a true chronological merge: every session-scoped
+    /// line (status/error/login) renders AFTER the entire room transcript,
+    /// regardless of when it actually arrived relative to the room's chat.
+    /// Session-scoped events are rare relative to room chat (one login, the
+    /// occasional error/status note) and still fully visible in-order
+    /// RELATIVE TO EACH OTHER, so this is judged an acceptable simplification
+    /// for this task rather than plumbing a global sequence counter through
+    /// `ChatSessionModel` — flagged here for a future task if strict
+    /// interleaving is ever required.
+    private func recomputeTranscriptText() {
+        guard let model else { transcriptText = AttributedString(); return }
+        let events = model.transcript + model.sessionEvents
+        transcriptText = TranscriptTextBuilder.attributedString(for: events)
     }
 
     /// Joins an ADDITIONAL room on the same connection (Plan 4b Task 7) — the
@@ -559,9 +648,23 @@ public final class AppState {
 
         let m = ChatSessionModel(config: cfg)
         m.onStripImage = { [weak self] img, size in
-            Task { @MainActor in self?.stripImage = img; self?.stripSizePoints = size } }
+            Task { @MainActor in
+                self?.stripImage = img; self?.stripSizePoints = size
+                // Plan 4b Task 11: every strip recompose means the active
+                // room's transcript grew (or the room itself changed) — the
+                // text view mirrors the same signal the comic view uses.
+                self?.recomputeTranscriptText()
+            } }
         m.onMembers = { [weak self] rows in Task { @MainActor in self?.members = rows } }
-        m.onStatus = { [weak self] s in Task { @MainActor in self?.statusLine = s } }
+        m.onStatus = { [weak self] s in
+            Task { @MainActor in
+                self?.statusLine = s
+                // Plan 4b Task 11: status/error lines are session-scoped
+                // (`.statusLine`/`.error`/`.disconnectedHint`) and don't
+                // necessarily trigger a strip recompose — the text view needs
+                // its own recompute here to pick them up.
+                self?.recomputeTranscriptText()
+            } }
         m.onSelfPose = { [weak self] img in Task { @MainActor in self?.selfPoseImage = img } }
         m.onWhisper = { [weak self] peer, line in
             Task { @MainActor in self?.recordWhisper(peer: peer, line: line) } }
@@ -600,6 +703,7 @@ public final class AppState {
         members = []
         stripImage = nil
         stripSizePoints = .zero
+        transcriptText = AttributedString()
         selfPoseImage = nil
         rooms = []
         showEnterRoomSheet = false

@@ -60,6 +60,24 @@ struct AppCommands: Commands {
             .disabled(appState.model == nil || appState.stripImage == nil)
         }
 
+        // Plan 4b Task 11 (D1 §1.2/spec §5): toggles `ChatWindow` between the
+        // comic strip and the plain-text transcript view. Two checkable-by-
+        // convention buttons rather than a single `Toggle` menu item (SwiftUI
+        // `Commands` has no native checkmark-Toggle-in-menu API) — matches
+        // how the rest of this app's `CommandMenu`s are built (plain
+        // `Button`s with keyboard shortcuts).
+        CommandMenu("View") {
+            Button("Comic Strip view") {
+                appState.comicMode = true
+            }
+            .keyboardShortcut("1", modifiers: .command)
+
+            Button("Plain Text view") {
+                appState.comicMode = false
+            }
+            .keyboardShortcut("2", modifiers: .command)
+        }
+
         CommandMenu("Room") {
             // Plan 4b Task 7: joins an ADDITIONAL room on the current
             // connection (opens the Enter Room sheet — the tab bar's "+"
