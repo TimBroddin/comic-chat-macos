@@ -14,8 +14,39 @@ struct AppCommands: Commands {
     @Environment(\.openSettings) private var openSettings
 
     var body: some Commands {
+        // Hands this scene's `openWindow(id:)` action to `AppDelegate` for its
+        // own Dock-reopen (`applicationShouldHandleReopen`) and launch-time
+        // zero-window safety net (`applicationDidFinishLaunching`) — see that
+        // type's own doc comment for both hazards. `body` runs once at launch
+        // (and again on later environment/state changes SwiftUI decides
+        // warrant a rebuild) as part of building the menu bar, regardless of
+        // whether any window is open yet (menu commands must work even with
+        // zero windows) — a reliable, always-set-early capture point, unlike
+        // hooking a window's own `.onAppear`, which by definition never fires
+        // if that window never appears (exactly the launch-time failure mode
+        // this fix exists for). Re-assigning the same closure on every `body`
+        // evaluation is harmless (idempotent, cheap). Plain `let _ =` is legal
+        // inside a result-builder body (a local declaration, not part of the
+        // built `Commands` result) — verified by a successful build below.
+        let _ = { AppDelegate.shared?.reopenMainWindow = { openWindow(id: "main") } }()
+
         CommandGroup(replacing: .newItem) {
+            // Bug fix (Tim's report: "New connection doesn't work when the
+            // main window is closed"): the connect sheet is presented BY
+            // `ChatWindow` (`.sheet(isPresented: $state.showConnectSheet)`,
+            // that file) — with the main window closed there is no
+            // `ChatWindow` instance around to host the sheet, so setting
+            // `showConnectSheet = true` alone was a silent no-op. `openWindow`
+            // is available here (`@Environment(\.openWindow)` is reachable
+            // from `Commands` content on macOS 14+, confirmed working —
+            // WWDC22 "Bring Multiple Windows to Your SwiftUI App"): reopen the
+            // main WindowGroup by its fixed id FIRST, then flip the flag —
+            // by the time the (possibly-fresh) `ChatWindow` instance's body
+            // runs, `showConnectSheet` is already `true`, so its `.sheet`
+            // presents immediately. If a "main" window is already open, this
+            // is a harmless no-op that just brings it forward.
             Button("New Connection…") {
+                openWindow(id: "main")
                 appState.showConnectSheet = true
             }
             .keyboardShortcut("n", modifiers: .command)

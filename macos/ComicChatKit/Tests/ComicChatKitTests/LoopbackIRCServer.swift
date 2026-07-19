@@ -27,30 +27,20 @@ final class LoopbackIRCServer: @unchecked Sendable {
     /// `self.peerState`.
     private let peerState: PeerState
 
-    /// Starts listening immediately; throws if the listener can't be created
-    /// or fails to come up within a short timeout.
+    /// Starts listening immediately on an OS-assigned ephemeral port; throws
+    /// if the listener can't be created or fails to come up within a short
+    /// timeout. `allowLocalEndpointReuse` (set below) lets a fresh listener
+    /// rebind promptly even if a just-closed prior one lingers in TIME_WAIT.
     ///
-    /// - Parameter port: bind to a SPECIFIC port instead of an OS-assigned
-    ///   ephemeral one (`nil`, the default). The auto-reconnect test
-    ///   (`ReconnectTests`) needs this: a drop-then-reconnect targets
-    ///   `config.host`/`config.port`, so after the first server closes the
-    ///   socket the test must resurrect a SECOND server on the SAME port the
-    ///   `ProtocolSession` will dial back into. `allowLocalEndpointReuse`
-    ///   (already set below) lets the fresh listener rebind that port even
-    ///   though the just-closed one may linger in TIME_WAIT briefly.
-    convenience init() throws {
-        try self.init(port: nil)
-    }
-
-    init(port: UInt16?) throws {
+    /// (Review cleanup: an earlier `init(port:)` overload existed for the
+    /// auto-reconnect test to rebind a specific port after a drop — never
+    /// actually used; every call site across the test suite, including
+    /// `ReconnectTests`, uses this parameterless initializer. Removed rather
+    /// than left as unreachable dead code.)
+    init() throws {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        let l: NWListener
-        if let port, let nwPort = NWEndpoint.Port(rawValue: port) {
-            l = try NWListener(using: params, on: nwPort)
-        } else {
-            l = try NWListener(using: params, on: .any)
-        }
+        let l = try NWListener(using: params, on: .any)
         self.listener = l
 
         let portBox = PortBox()

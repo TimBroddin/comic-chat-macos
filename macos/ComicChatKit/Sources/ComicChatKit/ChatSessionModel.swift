@@ -615,9 +615,12 @@ public final class ChatSessionModel: @unchecked Sendable {
 
     /// The in-flight backoff-reconnect `Task`, or `nil` when no reconnect loop
     /// is running. Spawned by `handleLocked`'s `.disconnectedHint` case on an
-    /// UNEXPECTED drop; cancelled by `shutdown()` and by `beginManualSupersede()`
-    /// (a manual reconnect/disconnect always wins). Engine-queue-owned like
-    /// every other piece of this section's state.
+    /// UNEXPECTED drop; cancelled by `shutdown()` (which calls `cancelReconnect()`
+    /// as its first step) and directly by `cancelReconnect()` itself — the
+    /// app layer's disconnect-before-connect path (`AppState.disconnect()` ->
+    /// `ChatSessionModel.shutdown()`) is what actually runs before a manual
+    /// reconnect (a manual reconnect/disconnect always wins). Engine-queue-owned
+    /// like every other piece of this section's state.
     private var reconnectTask: Task<Void, Never>?
     /// `true` while a reconnect loop is active — guards `.disconnectedHint`
     /// against spawning a SECOND overlapping loop (a fresh session that fails
