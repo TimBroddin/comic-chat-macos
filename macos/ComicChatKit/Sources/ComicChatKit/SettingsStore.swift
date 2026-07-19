@@ -71,10 +71,13 @@ public struct SettingsStore {
 
     /// Plan 4b Batch C: the free-text "profile" a peer's `# GetInfo` probe
     /// receives back (`cc_session_send_info_reply`'s `profile_text`,
-    /// `ChatConfig.profileText`). Empty by default — an empty profile still
-    /// gets an honest reply (see `ChatSessionModel`'s `.infoRequest` handler
-    /// doc comment for the `ID_DEFAULT_PROFILE` archaeology gap this default
-    /// stands in for), it is simply an empty "# HeresInfo: " body.
+    /// `ChatConfig.profileText`). Empty by default — this is a UI default,
+    /// distinct from the original's own default-profile string
+    /// (`ID_DEFAULT_PROFILE`, chat.rc:2272: "This person is too lazy to
+    /// create a profile entry.") which the reply site substitutes at send
+    /// time when `profileText` is empty (see `ChatSessionModel`'s
+    /// `.infoRequest` handler doc comment) — so an unconfigured profile still
+    /// reproduces the original's exact wire reply, not a bare empty body.
     public var profileText: String {
         get { defaults.string(forKey: Keys.profileText) ?? "" }
         nonmutating set { defaults.set(newValue, forKey: Keys.profileText) }

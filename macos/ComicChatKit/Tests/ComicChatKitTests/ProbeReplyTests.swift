@@ -86,12 +86,14 @@ extension EngineGlobalStateSelfTests {
             server.stop()
         }
 
-        // Empty profile text (the default, and the ID_DEFAULT_PROFILE
-        // archaeology gap's honest-placeholder posture, see
-        // SettingsStore.profileText's doc comment) still gets a reply --
-        // just with an empty body after the prefix.
+        // Empty profile text (the Settings UI default) falls back to the
+        // original's own default-profile string, ID_DEFAULT_PROFILE
+        // (v2.5-beta-1-modern/chat.rc:2272, resource.h:987: "This person is
+        // too lazy to create a profile entry.") -- byte-parity with the
+        // original's wire reply, not a bare "# HeresInfo: " body. See
+        // ChatSessionModel.defaultProfileText's doc comment.
         @Test(.timeLimit(.minutes(1)))
-        func inboundGetInfoProbeWithEmptyProfileStillReplies() async throws {
+        func inboundGetInfoProbeWithEmptyProfileUsesOriginalDefaultString() async throws {
             let server = try LoopbackIRCServer()
             let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
                                                        nick: "Mac", room: "#p4", artDir: art()))
@@ -101,8 +103,8 @@ extension EngineGlobalStateSelfTests {
             try await server.send(":Bob!bob@h PRIVMSG #p4 :# GetInfo")
 
             let sent = try await waitForReceivedLine(server, containing: "HeresInfo")
-            #expect(sent.contains("PRIVMSG Bob :# HeresInfo: "),
-                    "expected an empty-profile GetInfo reply; c2s so far: \(sent)")
+            #expect(sent.contains("PRIVMSG Bob :# HeresInfo: This person is too lazy to create a profile entry."),
+                    "expected the original's exact default-profile string on the wire; c2s so far: \(sent)")
 
             model.shutdown()
             server.stop()

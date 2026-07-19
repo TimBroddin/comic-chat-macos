@@ -305,6 +305,17 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// original's exact string.
     public static let versionReplyText = "Microsoft Comic Chat for macOS (open-source port) - comicchat 2.5 engine"
 
+    /// Byte-parity fallback for `.infoRequest`: the original's own
+    /// default-profile string, `ID_DEFAULT_PROFILE`
+    /// (v2.5-beta-1-modern/chat.rc:2272, resource.h:987) — used verbatim,
+    /// unlike `versionReplyText` above, because this one IS recoverable from
+    /// the original's resources (an earlier draft of this doc comment
+    /// wrongly called it an unrecoverable gap; it was sitting in chat.rc the
+    /// whole time). Substituted at reply time when `config.profileText` is
+    /// empty, so an unconfigured Mac client's "# GetInfo" reply matches the
+    /// original's wire bytes exactly instead of sending an empty body.
+    public static let defaultProfileText = "This person is too lazy to create a profile entry."
+
     public var onStripImage: (@Sendable (CGImage, CGSize) -> Void)?
     /// Plan 4b Task 8: widened from `[String]` to `[MemberRow]` — same
     /// snapshot+seq-guard delivery as before (`emitMembers`'s doc comment),
@@ -1700,7 +1711,13 @@ public final class ChatSessionModel: @unchecked Sendable {
 
         case .infoRequest(let fromNick):
             replyToProbeIfDueLocked(fromNick, scopedRoom: scopedRoom) { channel in
-                let profile = self.config.profileText
+                // Empty `profileText` (the Settings UI default) falls back to
+                // the original's own default-profile string here rather than
+                // sending an empty "# HeresInfo: " body — see
+                // `defaultProfileText`'s doc comment for the chat.rc citation.
+                let profile = self.config.profileText.isEmpty
+                    ? Self.defaultProfileText
+                    : self.config.profileText
                 Task { [session] in
                     try? await session.sendInfoReply(channel: channel, toNick: fromNick, profileText: profile)
                 }

@@ -1228,6 +1228,11 @@ static ccPayloadResult ccProcessSay(const char* szNickname, CUserInfo* pui, char
         // gets an event while the other eight verbs stay exactly as
         // suppressed as before -- see this file's own R20 table comment
         // above ProcessSay, and the still-suppressed `if` immediately below).
+        // Provenance note (Batch C review M-2): that combined 9-verb `||`
+        // grouping was itself a Plan-3 flattening of the original's
+        // else-if chain (protsupp.cpp:1659-1811, one branch per verb,
+        // READ-ONLY reference) -- this split reverts toward that original
+        // per-verb structure rather than introducing a new departure from it.
         // Grammar (original protsupp.cpp:1659-1667): only the BARE
         // `\x01VERSION\x01` query form (no argument text, i.e. the byte
         // right after "VERSION" is the closing 0x01) triggers a reply --

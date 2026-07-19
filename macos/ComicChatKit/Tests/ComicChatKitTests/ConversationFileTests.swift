@@ -12,10 +12,11 @@ import Foundation
 @Suite
 struct ConversationFileTests {
     /// A representative event array: text with cooked annotations, a
-    /// whisper, an appearsAs, a sound, and joins — one of each shape the
-    /// brief calls out, so the round-trip exercises every associated-value
-    /// case that resists trivial synthesis (nested `Annotations`, optional
-    /// `Annotations?`, arrays, bools).
+    /// whisper, an appearsAs, a sound, joins, and (Batch C review M-1) the
+    /// two probe-reply events — one of each shape the brief calls out, so
+    /// the round-trip exercises every associated-value case that resists
+    /// trivial synthesis (nested `Annotations`, optional `Annotations?`,
+    /// arrays, bools).
     private func representativeEvents() -> [ProtocolEvent] {
         let cookedAnn = Annotations(gesturePose: 3, gestureEmotion: 2, gestureIntensity: 80,
                                     facePose: 1, faceEmotion: 4, faceIntensity: 60,
@@ -31,6 +32,8 @@ struct ConversationFileTests {
                      annotations: nil),
             .appearsAs(nick: "Boris", avatarName: "Armando", url: "https://example.com/armando.avb"),
             .sound(nick: "Anon", file: "tada.wav", text: "*tada*"),
+            .versionRequest(fromNick: "Boris"),
+            .infoRequest(fromNick: "Boris"),
         ]
     }
 

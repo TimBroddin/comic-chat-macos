@@ -696,9 +696,11 @@ public final class ProtocolSession: @unchecked Sendable {
     /// Outbound `# GetInfo` reply (Plan 4b Batch C, `cc_session_send_info_reply`
     /// — see that C function's comicchat.h doc comment for the exact
     /// "# HeresInfo: <profile>" wire grammar citation). `profileText` may be
-    /// empty (an honest empty-profile reply — see `ChatSessionModel`'s
-    /// `.infoRequest` case doc comment for the `ID_DEFAULT_PROFILE`
-    /// archaeology-gap note).
+    /// empty — the caller (`ChatSessionModel`'s `.infoRequest` case) already
+    /// substitutes the original's own default-profile string
+    /// (`ID_DEFAULT_PROFILE`, chat.rc:2272) before calling this, so an empty
+    /// `profileText` here should only occur if a caller deliberately wants a
+    /// bare "# HeresInfo: " body.
     public func sendInfoReply(channel: String, toNick: String, profileText: String) async throws {
         try await onQueueGated { s in
             guard let token = self.roomTokenFor(channel) else {
