@@ -298,38 +298,40 @@ extension EngineGlobalStateSelfTests {
         // MARK: - Live-fix 4: wheel self-pose preview must track the switch
 
         /// Plan 4b live-fix 4 (Tim's live report: the emotion-wheel center pose
-        /// preview showed a wrong/garbage pose — a head icon, not a full-body
-        /// pose — after live-fix 2/3 landed). Bisected at the KIT boundary
-        /// (a connected model → `setEmotion` → `onSelfPose`): the Kit fires a
-        /// non-nil image in BOTH cases, so a bare non-nil check is too weak. The
-        /// real defect is that after `changeCharacter`, the Task-2 self APIs
-        /// (`cc_strip_self_pose`/`set_self_emotion`/`preview_self_text`/
-        /// `self_annotations`) resolved the SELF avatar via
-        /// `GetAvatar(selfParticipant)` — the raw PARTICIPANT id — but
-        /// `cc_strip_set_participant_avatar` re-pointed the self CUserInfo at a
-        /// freshly-loaded avatar under a NEW avatar id (the same
-        /// participant-id-vs-avatar-id conflation live-fix 3 fixed for line
-        /// ingestion). So `selfPoseIndex()` read the OLD avatar's poseID, which,
-        /// fed into the NEW character's `.avb` (`selfAvatarFile`, reopened on the
-        /// switch), landed on a mismatched pose (a head icon) instead of the
-        /// intended full-body pose. Fix: every Task-2 self API resolves the
-        /// CURRENT avatar id (`pui->GetAvatarID()`) via `selfAvatarID()`.
+        /// preview showed a wrong/garbage pose after live-fix 2/3 landed) — the
+        /// self APIs now resolve the CURRENT avatar id (`pui->GetAvatarID()`) via
+        /// `selfAvatarID()`, not the raw PARTICIPANT id, so a `changeCharacter`
+        /// switch is reflected in the preview. Live-fix 7 re-homed the preview
+        /// itself onto `cc_strip_self_preview` (the engine's own `DrawBody`
+        /// head+torso composite) — the old single-pose-record path drew only the
+        /// torso for a complex avatar, a HEADLESS body — but the differential
+        /// below is unchanged and still exercises live-fix 4's guarantee: the
+        /// preview reads the strip's live self avatar, so it must follow a switch.
         ///
         /// OBSERVABLE (differential): a session that switches anna→susan then
         /// drives the wheel must produce the SAME self-pose image as a control
-        /// that STARTED as susan and drove the wheel identically. Pre-fix the
-        /// switched session produced the stale-avatar pose (different bytes,
-        /// even a different SIZE — a head icon vs a full body); post-fix they
-        /// match byte-for-byte. A guard scenario (fresh anna, no switch) pins
-        /// that the common case still fires a non-nil pose.
+        /// that STARTED as susan and drove the wheel identically. If the preview
+        /// read the STALE avatar, the switched session would render anna's body,
+        /// not susan's — different bytes. Post-fix they match byte-for-byte. A
+        /// guard scenario (fresh anna, no switch) pins that the common case still
+        /// fires a non-nil pose.
+        ///
+        /// HEAD PRESENCE (live-fix 7): the preview must be the full DrawBody
+        /// canvas render (a fixed-aspect portrait image whose pixel dimensions
+        /// are the `CGCanvas`-scaled 2400x3600-twips box), NOT a raw single pose
+        /// record — a bare `AvatarFile.poseImage(0)` on the same complex avatar
+        /// has the record bitmap's OWN dimensions, which do not match. Asserting
+        /// the preview carries the composite-canvas dimensions (and differs in
+        /// size from the bare torso record) is the regression pin for the
+        /// headless-body bug at the Kit boundary.
         @Test(.timeLimit(.minutes(1)))
         func wheelSelfPoseFollowsCharacterSwitch() async throws {
             let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
 
             // Drives one model to a connected+joined state, optionally switches
             // character, then fires setEmotion and returns the last self-pose
-            // image's pixel bytes (nil if none fired).
-            func selfPose(start: String, switchTo: String?) async throws -> Data? {
+            // CGImage (nil if none fired).
+            func selfPoseImage(start: String, switchTo: String?) async throws -> CGImage? {
                 let box = SelfPoseBox()
                 let server = try LoopbackIRCServer()
                 let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
@@ -349,14 +351,40 @@ extension EngineGlobalStateSelfTests {
                 model.setEmotion(angle: 0.0, intensity: 1.0)
                 try await settle()
                 defer { model.shutdown(); server.stop() }
-                guard let img = box.lastImage() else { return nil }
+                return box.lastImage()
+            }
+            func selfPose(start: String, switchTo: String?) async throws -> Data? {
+                guard let img = try await selfPoseImage(start: start, switchTo: switchTo) else { return nil }
                 return try pixelBytesLocal(img)
             }
 
             // Guard: the common (fresh, never-switched) case still fires a pose.
-            let fresh = try await selfPose(start: "anna", switchTo: nil)
-            #expect(fresh != nil,
+            let freshImg = try await selfPoseImage(start: "anna", switchTo: nil)
+            #expect(freshImg != nil,
                     "a fresh connected model's setEmotion must fire onSelfPose with a non-nil pose image")
+
+            // HEAD PRESENCE (live-fix 7): the preview is the DrawBody composite
+            // canvas render, whose pixel size is the CGCanvas-scaled portrait box
+            // (2400x3600 twips @ scale 2 -> 240x360 pt -> 480x720 px), NOT a raw
+            // pose record. A bare single-record poseImage(0) on the same complex
+            // avatar (anna) has the record bitmap's own dimensions, which differ
+            // — the pin against the old headless single-record preview path.
+            if let freshImg {
+                // Expected composite-canvas size: same arithmetic as CGCanvas.init
+                // (widthTwips/20 * scale, rounded), for the 2400x3600 box @ 2.0.
+                let expectedW = Int((2400.0 / 20.0 * 2.0).rounded())   // 240
+                let expectedH = Int((3600.0 / 20.0 * 2.0).rounded())   // 360
+                #expect(freshImg.width == expectedW && freshImg.height == expectedH,
+                        "self preview must be the DrawBody composite canvas (\(expectedW)x\(expectedH)px), not a raw pose record; got \(freshImg.width)x\(freshImg.height)")
+                // And it must NOT be the bare torso record: an independent
+                // single-record poseImage(0) on anna has different dimensions.
+                let anna = try AvatarFile(path: art + "/anna.avb")
+                if let bareTorso = try? anna.poseImage(0) {
+                    let cg = bareTorso.cgImage()
+                    #expect(cg == nil || cg!.width != freshImg.width || cg!.height != freshImg.height,
+                            "self preview must differ from a bare single pose record (the headless-body path); both were \(freshImg.width)x\(freshImg.height)")
+                }
+            }
 
             // The fix: a switched anna->susan self-pose must equal a control
             // that started as susan (both drove the wheel identically) — proves
@@ -367,7 +395,7 @@ extension EngineGlobalStateSelfTests {
                     "both switched and control self-pose images must be non-nil")
             let poseMatches = switchedToSusan == plainSusan
             #expect(poseMatches,
-                    "after a switch to susan, the wheel self-pose must match a susan-from-start control; a mismatch means the Task-2 self APIs read the STALE participant avatar (the reported wrong-pose bug). switched.count=\(switchedToSusan?.count ?? -1) control.count=\(plainSusan?.count ?? -1)")
+                    "after a switch to susan, the wheel self-pose must match a susan-from-start control; a mismatch means the self preview read the STALE participant avatar (the reported wrong-pose bug). switched.count=\(switchedToSusan?.count ?? -1) control.count=\(plainSusan?.count ?? -1)")
         }
     }
 }

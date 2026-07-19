@@ -108,4 +108,17 @@ struct EngineGlobalStateSelfTests {
         let other = fixture("anna.avb")
         #expect(cc_run_self_emotion_selftest(avatar, other) == 0)
     }
+
+    // Plan 4b live-fix 7: cc_strip_self_preview -- the head+torso DrawBody
+    // preview that replaces the old single-pose-record path (which drew a
+    // headless body for a complex avatar). anna.avb is a CAvatarComplex
+    // (CBodyDouble), so its self preview drives CBodyDouble::DrawBody -> torso
+    // plane + head plane => >= 2 image blits in the recording-canvas log. The
+    // retired single-record path could emit at most one blit, so the >= 2
+    // assertion is RED against it and GREEN only for the composite path. Also
+    // checks the "no self set" and degenerate-bounds rejections.
+    @Test func selfPosePreviewSelfTestPasses() {
+        let avatar = fixture("anna.avb")   // COMPLEX (two-part) avatar
+        #expect(cc_run_selfpose_preview_selftest(avatar) == 0)
+    }
 }

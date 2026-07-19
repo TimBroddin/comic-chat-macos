@@ -14,12 +14,47 @@ import ComicChatKit
 /// `settingsBinding` pattern as before, unchanged. The picker is a
 /// fill-in convenience layered on top: selecting a row copies that
 /// server's host/port/room into the settings fields; typing a custom
-/// host that doesn't match any known entry's host+port simply falls back
-/// to the "Custom Server" selection state (computed, never fought).
+/// host that doesn't match any known entry's host+port falls back to the
+/// "Custom Server" selection state.
+///
+/// Live-fix 7 (server picker was INERT in 34c54a8 — tapping a row never
+/// changed the highlight or the fields): the server list is now EXPLICIT
+/// `Button` rows, each of which, on tap, writes its server's host/port/room
+/// straight through the settings write-through path AND sets a plain `@State`
+/// visual-selection id (`selectedServerID`). Obvious-by-construction: the tap's
+/// effect is the button's own action, not a `Picker` selection binding SwiftUI
+/// has to infer and re-read.
+///
+/// Why the shipped `Picker(.inline)` failed: its `selection` was a `Binding`
+/// DERIVED from `settings.server`/`settings.port` (a getter that re-read the
+/// fields). But `SettingsStore` is a plain struct with `nonmutating set`
+/// accessors that write straight to `UserDefaults` and fire NO change
+/// notification, and it is a stored property of the `@Observable AppState` — so
+/// writing `appState.settings.server = …` never invalidates any `@Observable`
+/// dependency (the struct itself is not reassigned). SwiftUI therefore had no
+/// reason to re-evaluate `body`, the derived getter was never re-invoked, and
+/// the inline Picker's highlight — which only moves when `body` re-reads its
+/// `selection` — stayed put. (The free-text `TextField`s "worked" only because
+/// a `TextField` echoes local keystrokes itself, independent of `@Observable`
+/// invalidation.)
+///
+/// The `@State selectedServerID` is the ONLY thing driving the visual selection
+/// now, and SwiftUI tracks it natively: a Button tap sets it (instant
+/// re-render); a custom host/port edit re-derives it FROM the fields via
+/// `serverFieldBinding`/`portFieldBinding` (so typing a host matching no known
+/// entry visibly flips the highlight to "Custom Server", and typing one that
+/// matches re-highlights that row). The text fields stay authoritative for
+/// custom input; the buttons are a fill-in convenience over them.
 struct ConnectSheet: View {
     @Environment(AppState.self) private var appState
     @Environment(\.dismiss) private var dismiss
     @State private var isConnecting = false
+
+    /// The visual selection — real SwiftUI `@State` (see the type doc comment
+    /// for why a `Picker` selection binding over `settings` could not work).
+    /// Seeded from the current settings on appear; set directly by a row
+    /// Button tap; re-derived from the fields on a custom edit.
+    @State private var selectedServerID = ConnectSheet.customSelectionID
 
     /// A sentinel selection id for "Custom Server" in the picker list,
     /// distinct from any `KnownServer.id` (which is always `host:port`).
@@ -32,15 +67,13 @@ struct ConnectSheet: View {
             header
 
             Section("Server") {
-                // `serverPicker`'s selection is DERIVED from `settings.server`/
-                // `settings.port` (see `selectionBinding`'s getter) — typing a
-                // custom host here that no longer matches the previously
-                // selected known entry's host+port automatically re-derives
-                // to "Custom Server" on the next body evaluation, with no
-                // separate `.onChange` needed. The fields stay authoritative;
-                // the picker just follows along (brief: "don't fight the user").
+                // Explicit Button rows: each writes its server's host/port/room
+                // through to `settings` AND sets `selectedServerID` (the
+                // highlight) in its own action — no Picker selection inference.
+                // Typing a custom host in the field re-derives the selection to
+                // "Custom Server" via `serverFieldBinding`.
                 serverPicker
-                TextField("Server", text: settingsBinding(\.server))
+                TextField("Server", text: serverFieldBinding)
             }
 
             Section("Identity") {
@@ -50,7 +83,7 @@ struct ConnectSheet: View {
             }
 
             DisclosureGroup("Details") {
-                TextField("Port", value: settingsBinding(\.port), format: .number.grouping(.never))
+                TextField("Port", value: portFieldBinding, format: .number.grouping(.never))
                 Picker("Encoding", selection: settingsBinding(\.encoding)) {
                     Text("Windows-1252").tag(WireEncoding.cp1252)
                     Text("UTF-8").tag(WireEncoding.utf8)
@@ -72,6 +105,12 @@ struct ConnectSheet: View {
         .formStyle(.grouped)
         .disabled(isConnecting)
         .frame(minWidth: 420, minHeight: 460)
+        // Seed the visual selection from whatever the persisted settings
+        // already hold (a relaunch restores the last host/port), so the
+        // matching known row — or "Custom Server" — is highlighted from the
+        // first render. (The row Buttons write settings on tap; the write-
+        // through no longer lives in an `.onChange`.)
+        .onAppear { selectedServerID = derivedSelectionID() }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Cancel") { dismiss() }
@@ -114,51 +153,91 @@ struct ConnectSheet: View {
         .listRowBackground(Color.clear)
     }
 
-    /// The known-servers list, plus a trailing "Custom Server" row. Selecting
-    /// a known row copies host/port/room straight into `settings` (the same
-    /// write-through path the text fields use); selecting "Custom Server"
-    /// changes nothing (the fields already hold whatever was last typed).
+    /// The known-servers list (explicit Button rows), plus a trailing "Custom
+    /// Server" row. Tapping a known row writes its host/port/room straight into
+    /// `settings` (the same write-through path the text fields use) and marks
+    /// it selected; tapping "Custom Server" changes no settings (the fields
+    /// already hold whatever was last typed), it just moves the highlight.
     private var serverPicker: some View {
-        Picker("Known Servers", selection: selectionBinding) {
+        VStack(spacing: 0) {
             ForEach(KnownServers.all) { server in
-                serverRow(server).tag(server.id)
+                serverRow(server)
+                if server.id != KnownServers.all.last?.id {
+                    Divider()
+                }
             }
-            customRow.tag(Self.customSelectionID)
+            Divider()
+            customRow
         }
-        .pickerStyle(.inline)
-        .labelsHidden()
     }
 
+    /// A known-server row as a Button: on tap it writes host/port/room through
+    /// to `settings` and sets `selectedServerID` (both effects in this one
+    /// action — obvious-by-construction).
     private func serverRow(_ server: KnownServer) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack {
-                Text(server.name)
-                    .font(.headline)
-                Spacer()
-                protocolBadge(server.protocolNote)
+        Button {
+            appState.settings.server = server.host
+            appState.settings.port = server.port
+            appState.settings.room = server.room
+            selectedServerID = server.id
+        } label: {
+            HStack(spacing: 8) {
+                selectionMark(isSelected: selectedServerID == server.id)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(server.name)
+                            .font(.headline)
+                        Spacer()
+                        protocolBadge(server.protocolNote)
+                    }
+                    Text("\(server.host):\(server.port)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(server.blurb)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            Text("\(server.host):\(server.port)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(server.blurb)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            .contentShape(Rectangle())
+            .padding(.vertical, 4)
         }
-        .padding(.vertical, 2)
+        .buttonStyle(.plain)
     }
 
+    /// The "Custom Server" row as a Button: selecting it changes no settings
+    /// (the fields already hold custom input), it only moves the highlight —
+    /// so a user who typed a custom host, then wants the picker to reflect
+    /// "Custom", can tap it explicitly (it is also selected automatically
+    /// whenever the fields match no known entry, via `serverFieldBinding`).
     private var customRow: some View {
-        HStack {
-            Image(systemName: "network")
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Custom Server")
-                    .font(.headline)
-                Text("Enter your own host and room below.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        Button {
+            selectedServerID = Self.customSelectionID
+        } label: {
+            HStack(spacing: 8) {
+                selectionMark(isSelected: selectedServerID == Self.customSelectionID)
+                Image(systemName: "network")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Custom Server")
+                        .font(.headline)
+                    Text("Enter your own host and room below.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .contentShape(Rectangle())
+            .padding(.vertical, 4)
         }
-        .padding(.vertical, 2)
+        .buttonStyle(.plain)
+    }
+
+    /// The leading selection checkmark for a picker row — filled when selected,
+    /// a reserved blank slot otherwise so every row's text stays left-aligned.
+    private func selectionMark(isSelected: Bool) -> some View {
+        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary.opacity(0.4))
+            .imageScale(.large)
     }
 
     private func protocolBadge(_ note: String) -> some View {
@@ -170,24 +249,47 @@ struct ConnectSheet: View {
             .foregroundStyle(.secondary)
     }
 
-    /// Derives the picker's current selection from the settings fields
-    /// (never the other way around, except when the user actively picks a
-    /// row): a known entry if server+port exactly match one, else "Custom
-    /// Server". Selecting a row writes server/port/room through to
-    /// `settings`; selecting "Custom Server" is a no-op on the fields — it
-    /// only exists to be reachable/highlightable when nothing else matches.
-    private var selectionBinding: Binding<String> {
+    /// The current known-entry id matching the persisted `settings.server`/
+    /// `settings.port` exactly, else the "Custom Server" sentinel. Used to
+    /// SEED `selectedServerID` on appear and to RE-DERIVE it whenever the
+    /// server/port fields are edited (so custom input flips the highlight to
+    /// "Custom Server", and typing a host that happens to match a known
+    /// entry re-selects that entry). This is a plain read of `settings`, not
+    /// a `Binding` — the picker's live selection lives in `@State`
+    /// (`selectedServerID`), which SwiftUI actually tracks; `settings` (a
+    /// notification-free `UserDefaults` wrapper) cannot drive the highlight
+    /// on its own (see the type doc comment).
+    private func derivedSelectionID() -> String {
+        KnownServers.match(host: appState.settings.server, port: appState.settings.port)?.id
+            ?? Self.customSelectionID
+    }
+
+    /// Write-through binding for the free-text Server field that ALSO
+    /// re-derives `selectedServerID` on every edit — so typing a custom host
+    /// visibly flips the picker to "Custom Server" (and typing one that
+    /// matches a known entry re-highlights that row). Setting `selectedServerID`
+    /// here only moves the HIGHLIGHT — it no longer triggers any settings
+    /// write-back (the row Buttons own that), so a field edit can never
+    /// clobber what the user just typed.
+    private var serverFieldBinding: Binding<String> {
         Binding(
-            get: {
-                KnownServers.match(host: appState.settings.server, port: appState.settings.port)?.id
-                    ?? Self.customSelectionID
-            },
-            set: { newID in
-                guard newID != Self.customSelectionID,
-                      let server = KnownServers.all.first(where: { $0.id == newID }) else { return }
-                appState.settings.server = server.host
-                appState.settings.port = server.port
-                appState.settings.room = server.room
+            get: { appState.settings.server },
+            set: { newValue in
+                appState.settings.server = newValue
+                selectedServerID = derivedSelectionID()
+            }
+        )
+    }
+
+    /// Write-through binding for the Port field that likewise re-derives the
+    /// picker selection (a custom port on an otherwise-known host flips the
+    /// row to "Custom Server", since a known entry matches host AND port).
+    private var portFieldBinding: Binding<Int> {
+        Binding(
+            get: { appState.settings.port },
+            set: { newValue in
+                appState.settings.port = newValue
+                selectedServerID = derivedSelectionID()
             }
         )
     }

@@ -1,12 +1,20 @@
 import SwiftUI
 import ComicChatKit
 
-/// The emotion wheel (original CBodyCam, bodycam.cpp): bulls-eye + 8 face
-/// icons at 2π·i/8 (y-up, happy=east; order = lg_icons, bodycam.cpp:49-59)
-/// + the self avatar's live pose preview behind it. Drag inside the bull
-/// radius sets emotion (direction) × intensity (distance, 0.2 detente).
+/// The emotion wheel (original CBodyCam, bodycam.cpp): a COMPACT bulls-eye +
+/// detente ring + 8 face icons ringed TIGHTLY just outside the bull, at
+/// 2π·i/8 (y-up, happy=east; order = lg_icons, bodycam.cpp:49-59). Drag inside
+/// the bull radius sets emotion (direction) × intensity (distance, 0.2
+/// detente).
+///
+/// Live-fix 7 (original-style right column): this view is now WHEEL-ONLY — the
+/// posed self-avatar preview moved OUT to `PosePreviewPane`, the large
+/// full-body pane above the wheel, matching the original `CBodyCam` layout
+/// (the posed avatar occupies the tall upper pane; the bulls-eye sits in a
+/// short pane beneath it, chatview.cpp:333-378). The wheel therefore renders
+/// no pose image and packs the icons tightly around a small bulls-eye so it
+/// fits the ~1/4-column-height pane the restructured column gives it.
 struct BodyCamView: View {
-    var poseImage: CGImage?
     var onEmotion: (Double, Double) -> Void       // (angleRadians, intensity01)
 
     private static let iconFiles = ["fc_hap_l", "fc_coy_l", "fc_bor_l", "fc_sca_l",
@@ -20,28 +28,18 @@ struct BodyCamView: View {
         GeometryReader { geo in
             let side = min(geo.size.width, geo.size.height)
             let center = CGPoint(x: geo.size.width/2, y: geo.size.height/2)
-            let bullRadius = side * 0.28
-            let iconOffset = bullRadius + side * 0.14
+            // Compact bulls-eye: a small central target with the 8 icons ringed
+            // just outside it (tight spacing, matching the original's compact
+            // pane). The icons sit at `bullRadius + a small gap`, close to the
+            // bull rather than flung to the pane edges.
+            let bullRadius = side * 0.30
+            let iconOffset = bullRadius + side * 0.13
             ZStack {
-                if let poseImage {
-                    // Live-fix (Tim's screenshot report): a width-only `.frame`
-                    // let a tall pose image (full-body poses run ~1:2.5 w:h)
-                    // fit WIDTH and blow out vertically well past the wheel
-                    // pane. Constraining BOTH dimensions makes `.fit` letterbox
-                    // the pose inside a square that matches the wheel's own
-                    // sizing (`side*0.55`, comparable to the bull's `side*0.28`
-                    // radius = `side*0.56` diameter) so the pose sits INSIDE
-                    // the bulls-eye like the original CBodyCam pane
-                    // (bodycam.cpp draws the posed avatar within the pane
-                    // bounds). `.clipped()` on the ZStack below is belt-and-
-                    // braces in case some future pose art still overflows.
-                    Image(decorative: poseImage, scale: 2).resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: side*0.55, height: side*0.55)
-                        .opacity(0.9)
-                }
+                // Outer bull ring + inner detente ring (the 0.2 center detente
+                // target, bodycam.cpp:404).
                 Circle().stroke(.secondary).frame(width: bullRadius*2, height: bullRadius*2)
-                Circle().stroke(.secondary.opacity(0.5)).frame(width: bullRadius*0.4, height: bullRadius*0.4)
+                Circle().stroke(.secondary.opacity(0.5))
+                    .frame(width: bullRadius*0.4, height: bullRadius*0.4)
                 ForEach(0..<8, id: \.self) { i in
                     let angle = 2 * .pi * Double(i) / 8
                     let pos = CGPoint(x: center.x + iconOffset * cos(angle),
@@ -62,6 +60,36 @@ struct BodyCamView: View {
                 onEmotion(angle, intensity)
             })
         }
-        .frame(minWidth: 120, minHeight: 120)
+        .frame(minHeight: 120)
+    }
+}
+
+/// The large self-pose pane (original `CBodyCam`'s upper region, bodycam.cpp:
+/// draws the posed avatar full-body above the bulls-eye): the user's own
+/// avatar standing FULL-BODY (head + torso composited by the engine's
+/// `DrawBody`, via `Strip.selfPreviewImage` — live-fix 7), aspect-fit in a tall
+/// bordered pane. A plain-value `Image` from `AppState.selfPoseImage` (the
+/// parameter-passing contract: the parent reads `appState`, this child takes
+/// the plain `CGImage?`). Shows nothing until a self pose has been emitted.
+struct PosePreviewPane: View {
+    var poseImage: CGImage?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(nsColor: .textBackgroundColor))
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(.secondary.opacity(0.3), lineWidth: 1)
+            if let poseImage {
+                // Full-body, aspect-fit, pinned to the bottom of the pane like
+                // the original (the standing figure rests on the pane floor).
+                Image(decorative: poseImage, scale: 2)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding(6)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

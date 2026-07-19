@@ -48,35 +48,36 @@ struct ChatWindow: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 8).padding(.bottom, 4)
             }
-            // Original layout (chatview.cpp:333-378): members over bodycam.
+            // Original layout (chatview.cpp:333-378, the user's screenshot):
+            // the member ICON GRID at the top, the large full-body self-pose
+            // pane in the middle, the COMPACT emotion wheel in a short pane at
+            // the bottom. Parameter-passing contract: this parent body reads
+            // `appState.*`; each child takes plain values.
             VStack(spacing: 0) {
-                // Plan 4b Task 8 (D1 §1.5): the List's SELECTION is the
-                // original's canonical talk-to state — `AppState.selectedMembers`
-                // feeds `ComposeBar`'s send as `addressees`.
-                List(appState.members, selection: $state.selectedMembers) { row in
-                    MemberRowView(row: row)
-                        .tag(row.nick)
-                        .contextMenu {
-                            Button("Whisper…") {
-                                appState.showWhisperBox(peer: row.nick)
-                                openWindow(id: "whispers")
-                            }
-                            Button("Get Info…") { appState.getInfo(row.nick) }
-                            Divider()
-                            Button("Kick…") { appState.kick(row.nick) }
-                                .disabled(!appState.selfIsOp)
-                            Button("Ban…") { appState.ban("\(row.nick)!*@*") }
-                                .disabled(!appState.selfIsOp)
-                        }
-                        .onAppear { appState.resolveMemberIcon(row.avatarName) }
-                }
+                // (1) Member grid — a 2-column icon grid, scrollable. The grid
+                // SELECTION is still the original's canonical talk-to state
+                // (`AppState.selectedMembers` feeds `ComposeBar`'s send as
+                // `addressees`, Plan 4b Task 8 / D1 §1.5): a cell tap toggles
+                // that nick in the set (visible highlight), preserved from the
+                // List's `selection:` semantics.
+                MemberGrid(members: appState.members)
                 Divider()
-                BodyCamView(poseImage: appState.selfPoseImage,
-                            onEmotion: { angle, intensity in
+                // (2) The large full-body self-pose pane (head + torso
+                // composited by DrawBody, live-fix 7). Plain `CGImage?` value.
+                PosePreviewPane(poseImage: appState.selfPoseImage)
+                    .frame(maxHeight: .infinity)
+                    .padding(8)
+                Divider()
+                // (3) The compact emotion wheel, in a short fixed-height pane
+                // (~1/4 the column, matching the original's compact bulls-eye
+                // pane). Wheel-only now — the pose moved up to (2).
+                BodyCamView(onEmotion: { angle, intensity in
                     appState.model?.setEmotion(angle: angle, intensity: intensity)
                 })
+                .frame(height: 140)
+                .padding(8)
             }
-            .frame(minWidth: 140, maxWidth: 220)
+            .frame(minWidth: 180, maxWidth: 240)
         }
         .frame(minWidth: 640, minHeight: 480)
         .sheet(isPresented: $state.showConnectSheet) { ConnectSheet() }
@@ -97,6 +98,29 @@ struct ChatWindow: View {
             if ProcessInfo.processInfo.arguments.contains("--replay-fixture") {
                 appState.showConnectSheet = false
                 await appState.connect()
+            }
+            // Live-fix-7 probe hook: `--debug-pose-probe` drives the wheel's
+            // self-pose path end-to-end without UI automation (the screen may
+            // be locked). After the replay-fixture connect has JOINED, it
+            // drives one full-intensity emotion via the SAME
+            // `ChatSessionModel.setEmotion` call the wheel drag makes, then
+            // logs `appState.selfPoseImage`'s size via `PoseProbe` (a non-nil
+            // size proves the whole model->AppState->view pose chain is live).
+            // The size is now the DrawBody composite-canvas size (the head+torso
+            // preview, not a raw pose record), so a full-body pose is present.
+            // Same "demo-only launch flag, no AX available in this sandbox"
+            // posture as `--switch-character`/`--replay-fixture`; inert without
+            // the flag.
+            if ProcessInfo.processInfo.arguments.contains("--debug-pose-probe") {
+                for _ in 0..<200 {
+                    if appState.model != nil && !appState.members.isEmpty { break }
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                try? await Task.sleep(for: .seconds(2))
+                appState.model?.setEmotion(angle: 0, intensity: 1.0)
+                try? await Task.sleep(for: .seconds(1))
+                let sz = appState.selfPoseImage.map { "\($0.width)x\($0.height)" } ?? "nil"
+                PoseProbe.log("selfPoseImage=\(sz) membersCount=\(appState.members.count)")
             }
             // Task 4's visual-artifact demo hook: `--open-whisper <peer>`
             // auto-opens the whisper box for `peer` once a whisper from them
@@ -170,41 +194,119 @@ private struct UserInfoItem: Identifiable {
     let text: String
 }
 
-/// One member-list row (Plan 4b Task 8): an icon thumbnail (resolved via
-/// `AppState.resolveMemberIcon`/`memberIconCache`; unresolved names show no
-/// icon), the nick, and an op badge for room owners/ops.
+/// The member ICON GRID (live-fix 7, the original's right-column top region,
+/// chatview.cpp:333-378 / the user's screenshot): a 2-column `LazyVGrid` where
+/// each cell is an avatar head thumbnail with an "@nick" caption beneath —
+/// replacing the old single-column `List`. Native macOS chrome (no Windows-98
+/// styling). Scrollable so a large channel doesn't push the pose pane / wheel
+/// off-screen.
 ///
-/// Live-fix (Tim's screenshot report): a name that still doesn't resolve to
-/// real art (empty `avatarName`, or a name `resolveMemberIcon` tried and
-/// failed to decode into anything) used to render a gray rounded-rect
-/// placeholder here — ugly, and with `emitMembers`'s fallback fill (self/
-/// peer-announce snapshot) now covering the two known "empty avatarName"
-/// causes, that placeholder would otherwise ALSO show for any genuinely
-/// unresolvable name (art missing on disk, decode failure). Per the brief,
-/// unresolvable now renders NOTHING — just the nick, indented to the same
-/// leading edge the icon would have occupied so rows stay aligned.
-private struct MemberRowView: View {
+/// Parameter-passing contract: the parent passes `members` as a plain value;
+/// this view reads `AppState` for the cross-cutting state each cell needs
+/// (selection, resolved icons, op status, actions) — the same reads the old
+/// `List`/`MemberRowView` pair made.
+///
+/// SELECTION = the original's canonical talk-to state (`AppState.selectedMembers`
+/// feeds `ComposeBar`'s send as `addressees`): a tap TOGGLES the cell's nick in
+/// the set, exactly the multi-select semantics the `List`'s `selection:`
+/// binding had, with a visible highlight. Context menus (Whisper/Get Info/Kick/
+/// Ban) are preserved from Task 8.
+private struct MemberGrid: View {
     @Environment(AppState.self) private var appState
-    let row: MemberRow
+    @Environment(\.openWindow) private var openWindow
+    let members: [MemberRow]
+
+    private let columns = [GridItem(.flexible(), spacing: 8),
+                           GridItem(.flexible(), spacing: 8)]
 
     var body: some View {
-        HStack(spacing: 6) {
-            if let icon = appState.memberIconCache[row.avatarName] {
-                Image(decorative: icon, scale: 1)
-                    .resizable()
-                    .frame(width: 20, height: 20)
-                    .clipShape(RoundedRectangle(cornerRadius: 3))
-            } else {
-                Color.clear.frame(width: 20, height: 20)
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 8) {
+                ForEach(members) { row in
+                    MemberGridCell(row: row,
+                                   icon: appState.memberIconCache[row.avatarName],
+                                   isSelected: appState.selectedMembers.contains(row.nick))
+                        .onTapGesture { toggleSelection(row.nick) }
+                        .contextMenu {
+                            Button("Whisper…") {
+                                appState.showWhisperBox(peer: row.nick)
+                                openWindow(id: "whispers")
+                            }
+                            Button("Get Info…") { appState.getInfo(row.nick) }
+                            Divider()
+                            Button("Kick…") { appState.kick(row.nick) }
+                                .disabled(!appState.selfIsOp)
+                            Button("Ban…") { appState.ban("\(row.nick)!*@*") }
+                                .disabled(!appState.selfIsOp)
+                        }
+                        .onAppear { appState.resolveMemberIcon(row.avatarName) }
+                }
             }
-            Text(row.nick)
-            if row.isOp {
-                Image(systemName: "star.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.yellow)
-                    .help("Operator")
-            }
+            .padding(8)
         }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// Toggle `nick` in the multi-select set (the `List` selection semantics
+    /// this grid replaces): tapping a selected member deselects it.
+    private func toggleSelection(_ nick: String) {
+        if appState.selectedMembers.contains(nick) {
+            appState.selectedMembers.remove(nick)
+        } else {
+            appState.selectedMembers.insert(nick)
+        }
+    }
+}
+
+/// One member grid cell (live-fix 7): an avatar head thumbnail above an
+/// "@nick" caption, with the op star preserved and a selection highlight.
+/// Pure plain-value inputs (`row`, resolved `icon`, `isSelected`) — no
+/// `@Environment` read, so it re-renders purely on those values changing
+/// (parameter-passing contract).
+///
+/// A name that still doesn't resolve to real art (empty `avatarName`, or one
+/// `resolveMemberIcon` failed to decode — Tim's earlier gray-placeholder
+/// report) renders NO icon, just a blank thumbnail slot above the caption, so
+/// cells stay aligned.
+private struct MemberGridCell: View {
+    let row: MemberRow
+    let icon: CGImage?
+    let isSelected: Bool
+
+    var body: some View {
+        VStack(spacing: 3) {
+            ZStack {
+                if let icon {
+                    Image(decorative: icon, scale: 1)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 40, height: 40)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                } else {
+                    Color.clear.frame(width: 40, height: 40)
+                }
+                if row.isOp {
+                    Image(systemName: "star.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.yellow)
+                        .help("Operator")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                        .frame(width: 40, height: 40)
+                }
+            }
+            Text("@\(row.nick)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isSelected ? Color.accentColor.opacity(0.25) : Color.clear)
+        )
+        .contentShape(Rectangle())
     }
 }
 

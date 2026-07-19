@@ -2978,6 +2978,86 @@ extern "C" int32_t cc_run_self_emotion_selftest(const char* avatarPath,
     return g_failures;
 }
 
+// --- Plan 4b live-fix 7: cc_strip_self_preview (head+torso DrawBody preview) --
+// The REGRESSION PIN for the "headless body" bug. avatarPath must be a COMPLEX
+// (two-part) avatar -- anna.avb is a CAvatarComplex whose body is a CBodyDouble
+// composited from a SEPARATE head and torso pose (see cc_selftest_bodydraw's
+// own comment). The old preview path (cc_strip_self_pose -> cc_avatar_pose_image)
+// drew ONE pose record, so for such an avatar it rendered only the torso plane
+// -- a headless body. cc_strip_self_preview drives CBody::DrawBody instead,
+// which for a CBodyDouble emits BOTH planes.
+//
+// The distinguishing observable is the image-blit count in the recording-canvas
+// log: DrawBody on a complex avatar emits >= 2 image blits (torso drawing + head
+// drawing; drawNimbus=FALSE, so no aura planes -- exactly the 2 the bodydraw
+// selftest asserts for anna at (a)), whereas the single-record path can emit at
+// most 1. Asserting >= 2 is therefore RED against the old single-pose preview
+// and GREEN only once the composite head+torso path is wired.
+static int cc_selftest_selfpose_preview(const char* avatarPath) {
+    int startFailures = g_failures;
+
+    static CCRecordingCanvas selfPreviewMetrics;
+    cc_set_metrics_canvas(selfPreviewMetrics.handle());
+
+    cc_strip* s = cc_strip_create();
+    CC_CHECK(s != NULL);
+    if (!s) return g_failures - startFailures;
+
+    // A canvas of these twips dimensions -- the pane's own aspect-fit maps the
+    // body into them (GetBodyBox); the exact size is not asserted, only the
+    // blit count is (fixture-agnostic to the body's intrinsic proportions).
+    const int32_t kW = 2400, kH = 3600;
+
+    // --- (a) no self set yet: cc_strip_self_preview must reject (nonzero) and
+    //     emit NOTHING to the canvas (the caller then renders no preview).
+    {
+        CCRecordingCanvas rec;
+        CC_CHECK(cc_strip_self_preview(s, rec.handle(), kW, kH) != 0);
+        CC_CHECK(rec.log().empty());
+    }
+
+    int32_t p = cc_strip_add_participant(s, "Anna", avatarPath);
+    CC_CHECK(p == 1);
+    if (p < 0) { cc_strip_destroy(s); return g_failures - startFailures; }
+    CC_CHECK(cc_strip_set_self(s, p) == 0);
+
+    // --- (b) the regression pin: a COMPLEX avatar's self preview drives
+    //     CBodyDouble::DrawBody -> torso plane + head plane => >= 2 image blits.
+    //     The retired single-record path (cc_avatar_pose_image on one poseID)
+    //     could only ever emit 1, so this assertion fails against it.
+    {
+        cc_strip_set_self_emotion(s, 0.0, 1.0);   // a definite posed body (happy, full)
+        CCRecordingCanvas rec;
+        CC_CHECK(cc_strip_self_preview(s, rec.handle(), kW, kH) == 0);
+        int imageLines = 0;
+        for (const std::string& l : rec.log())
+            if (l.rfind("image ", 0) == 0) imageLines++;
+        CC_CHECK(imageLines >= 2);   // head + torso -- NOT the headless single-record path
+    }
+
+    // --- (c) degenerate bounds are rejected (nonzero), no draw. Guards the
+    //     width/height<=0 early-out that the CGCanvas clamp would otherwise
+    //     paper over on the Swift side.
+    {
+        CCRecordingCanvas rec;
+        CC_CHECK(cc_strip_self_preview(s, rec.handle(), 0, kH) != 0);
+        CC_CHECK(cc_strip_self_preview(s, rec.handle(), kW, 0) != 0);
+        CC_CHECK(rec.log().empty());
+    }
+
+    cc_strip_destroy(s);
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift wrapper (BodyDrawTests.swift), which passes a
+// COMPLEX-avatar fixture (anna.avb). Runs standalone (resets g_failures).
+extern "C" int32_t cc_run_selfpose_preview_selftest(const char* avatarPath) {
+    g_failures = 0;
+    if (avatarPath == NULL) return 1;
+    cc_selftest_selfpose_preview(avatarPath);
+    return g_failures;
+}
+
 // --- Plan 4a Task 7: CDC::DrawTextEllipsis selftest --------------------------
 // Drives the new shim member directly over a recording canvas: a short string
 // (fits the box) must draw UNTRUNCATED; a long string (doesn't fit) must draw

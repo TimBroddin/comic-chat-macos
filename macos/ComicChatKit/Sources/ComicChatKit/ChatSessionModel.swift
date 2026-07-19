@@ -392,14 +392,6 @@ public final class ChatSessionModel: @unchecked Sendable {
     private var strip: Strip?
     private var bridge: ProtocolStripBridge?
     private var selfParticipantID: Int32?
-    /// Standalone handle (independent of `strip`'s own participant registry)
-    /// on the SELF character's `.avb`, used only to render `emitSelfPoseLocked`'s
-    /// preview image via `poseImage(_:)`. Lazily created on first use;
-    /// survives a `reflowLocked()` reflow (it has nothing to do with the
-    /// strip's own participant table) but is NOT reset by reflow -- Task 5's
-    /// character-change flow is what would need to reset this when the
-    /// self-character actually changes (out of this task's scope).
-    private var selfAvatarFile: AvatarFile?
     /// nicks this model has already sent a private reply-announce to (Task
     /// 8's `toNick:` announce) — guards the "first `.appearsAs` from an
     /// unseen nick" rule so a nick's later avatar changes don't re-announce.
@@ -789,6 +781,14 @@ public final class ChatSessionModel: @unchecked Sendable {
         // other member, so a later `.userJoined`/`.text` event carrying OUR
         // OWN nick must resolve to this SAME participant id, not a fresh one.
         newBridge.preRegisterSelfParticipant(nick: config.nick, id: selfID)
+
+        // Live-fix 7: emit the neutral self pose immediately so the pose pane
+        // shows the standing avatar from launch (and re-shows it after a
+        // reflow), rather than staying blank until the first wheel drag /
+        // typing preview. `setSelf(selfID)` above means `cc_strip_self_preview`
+        // can already resolve the self avatar; the avatar's freshly-loaded
+        // `m_body` is its neutral pose.
+        emitSelfPoseLocked()
     }
 
     // MARK: - Event consumer
@@ -1698,17 +1698,13 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///   1. update `config.characterName` FIRST (before constructing/handling
     ///      the synthetic event) — `handleLocked`'s `.appearsAs` case reads
     ///      `config.characterName` for the reply-announce name (irrelevant
-    ///      here, guarded off below) but ALSO, critically, this ordering is
-    ///      what makes `emitSelfPoseLocked` (called after) rebuild
-    ///      `selfAvatarFile` against the NEW character rather than the old
-    ///      one — see that property's reset below;
-    ///   2. reset `selfAvatarFile` to `nil` so `emitSelfPoseLocked` lazily
-    ///      reopens it against the NEW character (Task 3's named obligation —
-    ///      that property's own doc comment explicitly deferred this reset
-    ///      to "Task 5's problem"; skipping it ships a stale wheel-preview
-    ///      bug: the preview would keep rendering poses from the OLD avatar
-    ///      file);
-    ///   3. synthesize `.appearsAs(nick: currentOwnNick, avatarName:
+    ///      here, guarded off below). Live-fix 7 note: `emitSelfPoseLocked`
+    ///      no longer keeps a separate self-avatar file to rebuild — it reads
+    ///      the strip's own live self avatar (`cc_strip_self_preview`), which
+    ///      the `.appearsAs`-driven `setParticipantAvatar` re-points below — so
+    ///      the wheel preview follows the switch automatically with no per-
+    ///      character-switch reset;
+    ///   2. synthesize `.appearsAs(nick: currentOwnNick, avatarName:
     ///      name.capitalized, url: "")` and hand it to `handleLocked` DIRECTLY
     ///      (not `enqueueHandle`, which would re-hop `engineQueue.async` —
     ///      unnecessary and slower, since `changeCharacter` is ALREADY running
@@ -1723,9 +1719,9 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///      FUTURE-PANELS-ONLY semantics, original-faithful (existing panels
     ///      keep the OLD avatar exactly like a peer's `.appearsAs` switch —
     ///      histent.cpp:368-413's documented behavior);
-    ///   4. calls `emitSelfPoseLocked()` so the wheel's live preview updates
+    ///   3. calls `emitSelfPoseLocked()` so the wheel's live preview updates
     ///      immediately to the new character's current pose;
-    ///   5. fires `session.announceAvatar` fire-and-forget (a detached
+    ///   4. fires `session.announceAvatar` fire-and-forget (a detached
     ///      `Task`, same shape as `.selfJoined`'s own announce in
     ///      `handleLocked` — SetMyAvatar's announce-on-change, avatar.cpp:
     ///      585-599) — the REAL wire announce, unchanged from before this fix.
@@ -1739,12 +1735,11 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// case's own doc comment).
     ///
     /// KNOWN DEVIATION from the pre-fix shape: the OLD code guarded
-    /// `config.characterName`/`selfAvatarFile`'s mutation behind
-    /// `strip.setParticipantAvatar`'s own throw (a bad/missing `.avb` path
-    /// left every bit of state untouched). Routing through `handleLocked` ->
-    /// `bridge?.apply(ev)` (which swallows the throw via `try?`, matching
-    /// every other case in that switch) drops that guard: `config`/
-    /// `selfAvatarFile` are now mutated, and the wire announce still fires,
+    /// `config.characterName`'s mutation behind `strip.setParticipantAvatar`'s
+    /// own throw (a bad/missing `.avb` path left every bit of state untouched).
+    /// Routing through `handleLocked` -> `bridge?.apply(ev)` (which swallows the
+    /// throw via `try?`, matching every other case in that switch) drops that
+    /// guard: `config` is now mutated, and the wire announce still fires,
     /// even if the underlying avatar file fails to resolve/load. Accepted:
     /// every real caller (`CharacterPickerView.select`, the one production
     /// call site) only ever passes a name from `buildCatalog(artDir:)`'s
@@ -1771,7 +1766,6 @@ public final class ChatSessionModel: @unchecked Sendable {
             guard let self, !self.isShutDown, self.strip != nil,
                   self.selfParticipantID != nil else { return }
             self.config.characterName = name
-            self.selfAvatarFile = nil
             let synthetic = ProtocolEvent.appearsAs(nick: self.currentOwnNick,
                                                     avatarName: name.capitalized, url: "")
             // Record the switch in every room's transcript at its correct
@@ -1835,29 +1829,33 @@ public final class ChatSessionModel: @unchecked Sendable {
         }
     }
 
-    /// ENGINE QUEUE ONLY. Renders the SELF participant's CURRENT pose
-    /// (`strip.selfPoseIndex()`) via a standalone `AvatarFile` handle on the
-    /// self character (`selfAvatarFile`, lazily created here) and hands the
-    /// image to `onSelfPose` on the main thread.
+    /// ENGINE QUEUE ONLY. Renders the SELF participant's CURRENT posed body
+    /// (head + torso + masks) via `Strip.selfPreviewImage(...)` — the engine's
+    /// own `CBody::DrawBody` path, the original bodycam pane's draw — and hands
+    /// the image to `onSelfPose` on the main thread.
     ///
-    /// INDEX SPACE (critical, comicchat.h): `selfPoseIndex()` returns the
-    /// engine's poseID, which is ONE-BASED — `AvatarFile.poseImage(_:)`'s
-    /// index space is zero-based over the SAME pose array, so the poseID is
-    /// converted via `Int(idx) - 1` before the lookup. This is a DIFFERENT
-    /// index space again from `selfAnnotations()`'s pose fields (GetIndices
-    /// record indices) — never mix the three. For complex (two-part)
-    /// avatars, `selfPoseIndex()` reports the TORSO poseID only, which is an
-    /// accepted approximation for this preview.
+    /// Live-fix 7: this REPLACES the old `selfPoseIndex()` ->
+    /// `AvatarFile.poseImage(_:)` single-record preview, which drew ONE pose
+    /// record and therefore rendered only the TORSO for a complex (two-part)
+    /// avatar — a headless body (Tim's live report). `selfPreviewImage`
+    /// composites the head and torso planes exactly as the engine does when it
+    /// draws the avatar in a panel, so both parts appear. It also removes the
+    /// standalone `selfAvatarFile` handle and its per-character-switch reset
+    /// choreography: the preview now reads the strip's OWN live self avatar
+    /// (`cc_strip_self_preview` resolves it via the current avatar id), so a
+    /// `changeCharacter` switch is reflected automatically with no separate
+    /// file to reopen or index-space to reconcile.
+    ///
+    /// The twips bounds define the aspect box the engine fits the body into
+    /// (portrait, matching a standing figure); the pose pane in the UI
+    /// aspect-fits the resulting image again, so the exact numbers only set the
+    /// intrinsic aspect ratio, not the on-screen size. A nil result (no self
+    /// set yet) clears the preview, exactly as the old guard did.
     private func emitSelfPoseLocked() {
         guard let strip else { return }
-        if selfAvatarFile == nil {
-            selfAvatarFile = try? AvatarFile(path: config.artDir + "/" + config.characterName + ".avb")
-        }
-        var image: CGImage? = nil
-        if let idx = try? strip.selfPoseIndex(), idx >= 1, let av = selfAvatarFile,
-           let art = try? av.poseImage(Int(idx) - 1) {
-            image = art.cgImage()
-        }
+        // Portrait aspect box for a full standing body; the engine's GetBodyBox
+        // aspect-fits + centers + bottom-pins the body within it.
+        let image = strip.selfPreviewImage(widthTwips: 2400, heightTwips: 3600)
         DispatchQueue.main.async { [onSelfPose] in onSelfPose?(image) }
     }
 

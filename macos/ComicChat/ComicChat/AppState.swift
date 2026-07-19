@@ -6,6 +6,31 @@ import AppKit
 import SwiftUI
 import ComicChatKit
 
+/// Diagnostic sink for the `--debug-pose-probe` launch hook (live-fix 7 —
+/// kept as a small future probe, same posture as the `--switch-character` /
+/// `--replay-fixture` demo flags). Swift `print` to a redirected stdout is
+/// block-buffered when the destination is not a TTY, so probe lines wouldn't
+/// reach a tee'd log until the buffer filled or the process exited. This
+/// appends each line to a fixed file (`/tmp/pose-probe-swift.log`) AND writes
+/// to stderr, so the evidence is readable even while the app is still running
+/// and the screen is locked. Every call is a no-op unless `--debug-pose-probe`
+/// is present, so it is inert in normal runs.
+enum PoseProbe {
+    static func log(_ msg: String) {
+        guard ProcessInfo.processInfo.arguments.contains("--debug-pose-probe") else { return }
+        let line = "POSE-PROBE \(msg)\n"
+        let path = "/tmp/pose-probe-swift.log"
+        if let data = line.data(using: .utf8) {
+            if let fh = FileHandle(forWritingAtPath: path) {
+                fh.seekToEndOfFile(); fh.write(data); try? fh.close()
+            } else {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+        }
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+}
+
 @Observable @MainActor
 public final class AppState {
     public var model: ChatSessionModel?

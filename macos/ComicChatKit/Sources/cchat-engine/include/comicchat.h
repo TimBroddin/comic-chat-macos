@@ -78,6 +78,17 @@ int32_t cc_run_strip_title_starring_selftest(const char* avatar_path, const char
  * otherwise). Kept out of cc_run_selftests because it needs the fixture paths. */
 int32_t cc_run_self_emotion_selftest(const char* avatar_path, const char* other_avatar_path);
 
+/* Plan 4b live-fix 7: cc_strip_self_preview selftest -- the head+torso DrawBody
+ * preview regression pin. avatar_path MUST be a COMPLEX (two-part) avatar
+ * (anna.avb): its body is a CBodyDouble, and cc_strip_self_preview drives
+ * CBody::DrawBody, which emits BOTH the torso and head planes (>= 2 image
+ * blits in the recording-canvas log) -- where the retired single-pose-record
+ * preview path could emit at most one, rendering a headless body. Also checks
+ * the "no self set" and degenerate-bounds rejections. Returns 0 on success
+ * (failure count otherwise). Kept out of cc_run_selftests because it needs the
+ * fixture path. */
+int32_t cc_run_selfpose_preview_selftest(const char* avatar_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env
@@ -468,6 +479,27 @@ int32_t cc_strip_set_self_emotion(cc_strip* s, double angle_radians, double inte
 int32_t cc_strip_preview_self_text(cc_strip* s, const char* text_bytes); /* 0 ok */
 int32_t cc_strip_self_pose(cc_strip* s, int32_t* out_pose_index); /* 0 ok */
 int32_t cc_strip_self_annotations(cc_strip* s, cc_annotations* out); /* 0 ok */
+
+/* cc_strip_self_preview: render the SELF participant's CURRENT posed body
+ * (head + torso + masks, whatever the last wheel drag / typing preview set)
+ * scaled-to-fit and centered into a `width_twips` x `height_twips` canvas --
+ * the bodycam pane's own draw path (bodycam.cpp:499's
+ * body->DrawBody(&memDC, rect2, FALSE)), the original's live self-pose
+ * preview. This REPLACES the old cc_strip_self_pose -> cc_avatar_pose_image
+ * single-record preview, which for a COMPLEX (two-part) avatar drew only the
+ * torso record -- a headless body -- because such a body is a CBodyDouble
+ * composited from a SEPARATE head and torso pose (CBodyDouble::DrawBody).
+ * Driving CBody::DrawBody directly emits BOTH planes for a complex avatar
+ * (>= 2 image blits) and the single plane for a simple one. Scale/center/
+ * aspect are NOT computed by the caller: DrawBody's GetBodyBox aspect-fits and
+ * centers the body into the clientRect for both shapes. The canvas is
+ * MM_TWIPS y-up (a page of height_twips spans y in [-height_twips, 0]); pass
+ * the SAME width/height twips the canvas was created with. Returns 0 on
+ * success, -1 when no self is set / the participant no longer resolves / the
+ * avatar has no body -- the caller then renders no preview. See cc_compose.cpp
+ * for the full derivation. */
+int32_t cc_strip_self_preview(cc_strip* s, cc_canvas* canvas,
+                              int32_t width_twips, int32_t height_twips); /* 0 ok */
 
 /* ---- Protocol session (Plan 3): bytes in, events out ---------------------
  * The engine never opens a socket. Swift owns NWConnection and the event loop.

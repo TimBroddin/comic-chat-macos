@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 import cchat_engine
 
 /// A scripted-strip session (Plan 2 Task 10 C API `cc_strip`), wrapped in Swift
@@ -199,6 +200,40 @@ public final class Strip {
             throw StripError(message: "selfAnnotations() failed")
         }
         return Annotations(cAnnotations: cAnn, encoding: encoding)
+    }
+
+    /// Render the SELF participant's CURRENT posed body (head + torso + masks --
+    /// whatever the last `setSelfEmotion`/`previewSelfText` set) scaled-to-fit
+    /// and centered into a `widthTwips` x `heightTwips` image, as a `CGImage`.
+    /// This is the bodycam pane's own draw path (the original `CBodyCam`'s
+    /// `body->DrawBody`), and it REPLACES the old `selfPoseIndex()` ->
+    /// `AvatarFile.poseImage(_:)` single-record preview, which for a COMPLEX
+    /// (two-part) avatar drew only the torso record -- a HEADLESS body -- because
+    /// such a body is a `CBodyDouble` composited from a separate head and torso
+    /// pose. Driving the engine's own `DrawBody` emits BOTH planes for a complex
+    /// avatar and the single plane for a simple one.
+    ///
+    /// Pure image drawing: builds a fresh `CGCanvas` sized to the twips bounds
+    /// (no shared metrics-canvas dependency -- `DrawBody` only blits pose planes,
+    /// it measures no text), composites onto it via `cc_strip_self_preview`, and
+    /// returns `makeCGImage()`. Returns `nil` when no self is set / the
+    /// participant no longer resolves / the avatar has no body (the C entry
+    /// rejects), so the caller simply shows no preview -- exactly as the old
+    /// guard did. `setSelf` must have been called first.
+    ///
+    /// `scale` is the CGCanvas supersampling factor (points -> pixels); the twips
+    /// bounds define the aspect box the body is fit into (the engine's own
+    /// `GetBodyBox` does the aspect-fit + horizontal-center + bottom-pin).
+    public func selfPreviewImage(widthTwips: Int32, heightTwips: Int32,
+                                 scale: CGFloat = 2.0) -> CGImage? {
+        guard let h = handle, widthTwips > 0, heightTwips > 0 else { return nil }
+        let canvas = CGCanvas(widthTwips: widthTwips, heightTwips: heightTwips, scale: scale)
+        let box = CanvasBox(canvas)
+        let rc = withExtendedLifetime(box) { () -> Int32 in
+            cc_strip_self_preview(h, box.handle, widthTwips, heightTwips)
+        }
+        guard rc == 0 else { return nil }
+        return canvas.makeCGImage()
     }
 
     /// Ingest one scripted line spoken by `speaker` (a participant id from

@@ -705,11 +705,11 @@ extern "C" int32_t cc_strip_set_self(cc_strip* s, int32_t participant) {
 // self-avatar change, cc_strip_set_participant_avatar re-points the self
 // CUserInfo at a freshly-loaded avatar under a NEW avatar id while
 // selfParticipant is unchanged, so GetAvatar(selfParticipant) returned the OLD
-// avatar. The wheel's pose preview then read the OLD avatar's poseID and fed it
-// into the NEW character's `.avb` (ChatSessionModel.selfAvatarFile, reopened on
-// the switch) -- a mismatched index space rendering the wrong pose (Tim's live
-// report: the center pose preview showed a garbage/wrong pose after a character
-// change). Every self API now resolves the current avatar id first.
+// avatar. The wheel's pose preview then read the OLD avatar's pose state,
+// rendering the wrong pose (Tim's live report: the center pose preview showed a
+// garbage/wrong pose after a character change). Every self API now resolves the
+// current avatar id first -- including cc_strip_self_preview (live-fix 7), which
+// draws the CURRENT self avatar's body directly through DrawBody.
 
 // Resolves the CURRENT self avatar id (the participant's live GetAvatarID()),
 // or 0 if no self is set / the participant no longer resolves. Centralizes the
@@ -862,5 +862,66 @@ extern "C" int32_t cc_strip_self_annotations(cc_strip* s, cc_annotations* out) {
     out->mode = 0;              // caller's job (Task 3)
     out->addressee_count = 0;   // caller's job (Task 3)
     out->cooked = 1;            // both intensities always populated by this path
+    return 0;
+}
+
+// cc_strip_self_preview: render the SELF participant's CURRENT posed body
+// (head + torso + masks/auras, whatever the last wheel drag / typing preview
+// set) scaled-to-fit and centered into a `width_twips` x `height_twips` canvas
+// -- the bodycam pane's own draw path (bodycam.cpp:499's
+// `body->DrawBody(&memDC, rect2, FALSE)`), the original's live self-pose
+// preview.
+//
+// WHY THE OLD PATH WAS HEADLESS: the previous preview
+// (ChatSessionModel.emitSelfPoseLocked) took `cc_strip_self_pose`'s poseID,
+// looked it up in `cc_avatar_pose_image`, and drew that ONE pose record. For a
+// COMPLEX (two-part) avatar the body is a CBodyDouble composited from TWO pose
+// records -- a head and a torso (CBodyDouble::DrawBody, bodycam.cpp:573) -- so
+// drawing a single record renders only the torso (Tim's live report: a
+// headless body). This function instead drives the avatar's OWN CBody::DrawBody
+// through a CDC over the caller's canvas, exactly as CBodyCam::DrawBody does
+// (bodycam.cpp:480-513) minus the offscreen-mem-DC / palette-realize / BitBlt
+// scroll machinery R16 does not port -- so a CBodyDouble emits BOTH the torso
+// and the head plane (>= 2 image blits), and a CBodySingle its one plane.
+//
+// SCALE / CENTER / ASPECT: NOT computed here -- DrawBody's own GetBodyBox
+// (bodycam.cpp:700/742) already aspect-fits the body into the clientRect
+// (`scale = min(widthScale, heightScale)`), centers it horizontally
+// (`(clientWidth - fullWidth) / 2`), and pins it to the bottom, for BOTH body
+// shapes. Passing the full canvas rect as the clientRect therefore reproduces
+// the pane's exact fit behavior with no extra math. `av->m_body` is the LIVE
+// posed body: cc_strip_set_self_emotion / cc_strip_preview_self_text update it
+// via CAvatarX::UpdateBody (avatar.cpp:495), and it is non-null from avatar
+// load (the neutral pose), so a fresh strip previews the neutral pose.
+//
+// COORDINATES: the canvas (CGCanvas) works in MM_TWIPS, y-UP -- a page of
+// `height_twips` spans y in [-height_twips, 0]. The clientRect is built y-up
+// (top = 0, bottom = -height_twips) so GetBodyBox's `heightSign` detects the
+// MM_TWIPS (bottom < top) convention, matching cc_selftest_bodydraw's own
+// `clientRect.bottom = -2400` setup (cc_selftest.cpp:1428-1429). Rejects with
+// -1 when no self is set / the participant no longer resolves / the avatar has
+// no body -- same error-code convention as the other self APIs, and the caller
+// then renders no preview (exactly as the old guard did).
+extern "C" int32_t cc_strip_self_preview(cc_strip* s, cc_canvas* canvas,
+                                         int32_t width_twips, int32_t height_twips) {
+    if (!s || !canvas || width_twips <= 0 || height_twips <= 0) return -1;
+    UINT self = selfAvatarID();   // live-fix 4: current avatar id, not participant id
+    if (self == 0) return -1;
+    CAvatarX* av = GetAvatar((USHORT)self);
+    if (!av || !av->m_body) return -1;
+
+    // Full-canvas clientRect in the canvas's MM_TWIPS y-up space (see doc).
+    RECT clientRect;
+    clientRect.left = 0;
+    clientRect.top = 0;
+    clientRect.right = width_twips;
+    clientRect.bottom = -height_twips;   // y-up: bottom is the smaller (negative) y
+
+    CDC dc(canvas);
+    // drawNimbus = FALSE: the pane's own aura state is a whisper effect the
+    // preview does not render (bodycam.cpp:499 passes FALSE too). DrawBody
+    // dispatches on the body's real shape (CBodyDouble -> head+torso planes,
+    // CBodySingle -> one plane), so this is correct for both avatar kinds.
+    av->m_body->DrawBody(&dc, clientRect, FALSE);
     return 0;
 }
