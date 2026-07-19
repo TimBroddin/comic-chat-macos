@@ -63,6 +63,29 @@ save/print, text view).
   it echoes our own `PRIVMSG` back, and whether the dedup worked cleanly
   (no visible duplicate line) or not.** This is the first real-server trial
   of that code path.
+- **Whisper presentation ruling (final-review Important #4b, binding) — a
+  live-session UX change, not new work, but the human at the keyboard should
+  not be surprised by it:** a PRIVATE whisper (either wire form — an IRCX
+  `WHISPER` naming no real channel, or a plain-IRC `PRIVMSG <ourNick>`)
+  renders ONLY in the whisper box now; it no longer balloons on the main
+  comic strip even transiently. A ROOM-scoped `WHISPER <chan> ...` (naming a
+  real joined channel) is unchanged — it still balloons on that room's strip
+  when active, same as before. If step 7's whisper checklist item shows no
+  strip balloon for a direct Windows→Mac whisper, that is the intended
+  behavior (matches the original's box-only private-whisper posture,
+  `whisprbx.cpp`), not a regression — confirm the line DID land in the
+  whisper box/window instead before treating it as a bug.
+- **Room-list LIST-error behavior — only if the room list is exercised.**
+  If a server responds to `LIST` with an error reply instead of the usual
+  321/322×N/323 sequence, `roomListRequestInFlight` now clears on ANY
+  `.error` event (not just a LIST-caused one — the event carries no
+  correlation back to which request triggered it, so the clear is
+  intentionally coarse; see `ChatSessionModel.handleLocked`'s `.error` case
+  comment). Practically: a spurious unrelated error while a LIST is
+  genuinely still in flight could let a second `requestRoomList()` reach the
+  wire early — a redundant request, not a correctness break. Not on the
+  ordered checklist itself; note it here only if Room List is opened during
+  the session and a server-side LIST error is actually observed.
 
 ## 3. Rig scripts
 

@@ -205,6 +205,176 @@ extension EngineGlobalStateSelfTests {
             server.stop()
         }
 
+        /// Final-review Important #1 (RED before the fix): a peer's PRIVATE
+        /// `.appearsAs` reply-announce -- the 1998 client's standard response
+        /// to our own channel-wide avatar announce -- arrives as a bare
+        /// `PRIVMSG <ourNick> :# Appears as <name>` (token 0, no channel;
+        /// wire form verified against `AnnounceTests.privateReplyAnnounce`'s
+        /// own assertion of the OUTBOUND shape of the exact same line, which
+        /// this test drives INBOUND). Pre-fix, `handleLocked` routed this to
+        /// `sessionTranscript` (never replayed by `rebuildStripLocked`) and
+        /// gated `bridge.apply` on `isActiveRoom` (which a token-0 event can
+        /// never satisfy, since `isActiveRoom` requires `scopedRoom != nil`)
+        /// -- so the peer's avatar update was rendered nowhere, ever, and
+        /// lost completely on any later reflow.
+        ///
+        /// Setup: join #a (peer "Win" present) and #b on one connection, #a
+        /// active. Drive the private reply-announce, then:
+        ///   1. assert it landed in EVERY joined room's transcript (#a AND
+        ///      #b) -- the fan-out this fix adds, proving replay-survival for
+        ///      a room that isn't even the one active when the announce
+        ///      arrived;
+        ///   2. assert the live strip actually re-composed (a fresh
+        ///      `onStripImage` fires) -- proving the "regardless of active
+        ///      room" apply, not just a transcript write with no visible
+        ///      effect;
+        ///   3. switch away to #b and back to #a (a real `setActiveRoom`
+        ///      rebuild, replaying #a's transcript from scratch) -- assert
+        ///      the strip recomposes again without error and #a's transcript
+        ///      still carries the `.appearsAs` entry, proving the avatar
+        ///      assignment SURVIVES a rebuild rather than being a one-shot
+        ///      live-only effect.
+        @Test(.timeLimit(.minutes(1)))
+        func privateAppearsAsReplyAnnounceFansOutToAllRoomsAndSurvivesRebuild() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#a", artDir: art))
+            let images = MRImagesBox()
+            model.onStripImage = { _, _ in images.bump() }
+
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#a", otherMembers: "Win")
+
+            try await model.joinRoom("#b")
+            try await server.waitForClientLine(containing: "JOIN #b")
+            try await server.send(
+                ":Mac!mac@h JOIN :#b",
+                ":srv 353 Mac = #b :Mac",
+                ":srv 366 Mac #b :End of NAMES list")
+            try await pollUntil { model.roomInfos.count == 2 }
+            #expect(model.currentRoom == "#a", "sanity: #a is active going into the announce")
+
+            let imagesBeforeAnnounce = images.count
+
+            // The private reply-announce -- token 0, no channel prefix. Wire
+            // form matches AnnounceTests.privateReplyAnnounce's outbound
+            // assertion exactly (`PRIVMSG <nick> :# Appears as <name>\r\n`),
+            // driven here as an INBOUND line from the peer.
+            try await server.send(":Win!u@h PRIVMSG Mac :# Appears as Armando")
+
+            // Polled (rather than an `AsyncStream` await) since a prior
+            // recompose's yield could otherwise be mistaken for this one --
+            // polling the actual counter sidesteps that ordering hazard.
+            try await pollUntil { images.count > imagesBeforeAnnounce }
+            #expect(images.count > imagesBeforeAnnounce,
+                    "the private reply-announce must trigger a live strip recompose regardless of which room is active")
+
+            func appearsAsLanded(in transcript: [ProtocolEvent]) -> Bool {
+                transcript.contains {
+                    if case .appearsAs(let nick, let avatarName, _) = $0 {
+                        return nick == "Win" && avatarName == "Armando"
+                    }
+                    return false
+                }
+            }
+            try await pollUntil { appearsAsLanded(in: model.transcript(for: "#a")) }
+            #expect(appearsAsLanded(in: model.transcript(for: "#a")),
+                    "the private announce must land in the ACTIVE room's transcript")
+            #expect(appearsAsLanded(in: model.transcript(for: "#b")),
+                    "the private announce must ALSO land in a BACKGROUND room's transcript (the fan-out fix) so its own later rebuild re-avatars Win too")
+
+            // Rebuild #a from scratch (switch away, then back) -- proves the
+            // avatar assignment is REPLAY-DURABLE, not merely a one-shot live
+            // mutation that a reflow would silently lose (the exact pre-fix
+            // failure mode: the event was never IN any transcript, so a
+            // rebuild had nothing to replay it from).
+            model.setActiveRoom("#b")
+            try await pollUntil { model.currentRoom == "#b" }
+            model.setActiveRoom("#a")
+            try await pollUntil { model.currentRoom == "#a" }
+            try await pollUntil { model.panelCount > 0 }
+            #expect(appearsAsLanded(in: model.transcript(for: "#a")),
+                    "the announce must still be in #a's transcript after a rebuild replayed it from scratch")
+
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Final-review Important #2 (RED before the fix): `changeCharacter`
+        /// only appends its synthetic `.appearsAs` to rooms that already
+        /// exist AT SWITCH TIME (`self.roomOrder` in that method, at the
+        /// moment it runs) -- a room joined AFTER the switch has no switch
+        /// entry anywhere in its transcript. That room's very first rebuild
+        /// (`setUpStripLocked`'s `isReflow` seeding) seeds the self
+        /// participant from `initialCharacterName` (the character the
+        /// SESSION started with) and then replays a transcript with nothing
+        /// in it to move the avatar forward -- self renders as the ORIGINAL
+        /// character in the new room, even though every other room (and the
+        /// wheel/preview) has shown the switched character ever since.
+        ///
+        /// Setup: join #a (initial, character "anna"), switch to "armando",
+        /// THEN join #b, send a line there, activate it. Assert:
+        ///   1. #b's transcript's FIRST event is the seeded `.appearsAs` for
+        ///      our own nick naming "Armando" -- landing at position 0, i.e.
+        ///      before the line sent afterward, so ANY replay of #b renders
+        ///      self as the switched character from the very first panel;
+        ///   2. panelCount coherence after activating #b (title + the one
+        ///      line sent there) -- proves the seed didn't corrupt the
+        ///      strip's own panel bookkeeping.
+        @Test(.timeLimit(.minutes(1)))
+        func roomJoinedAfterCharacterSwitchSeedsSwitchInNewRoomTranscript() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#a",
+                                                       characterName: "anna", artDir: art))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#a")
+
+            // Switch character BEFORE #b is ever joined.
+            model.changeCharacter("armando")
+            try await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                model.settleEngineQueue { cont.resume() }
+            }
+
+            // Join #b -- AFTER the switch. Pre-fix, #b's box is created with
+            // an empty transcript (`ensureRoomBoxLocked`); this fix seeds it
+            // with the switch synthetic at creation time.
+            try await model.joinRoom("#b")
+            try await server.waitForClientLine(containing: "JOIN #b")
+            try await server.send(
+                ":Mac!mac@h JOIN :#b",
+                ":srv 353 Mac = #b :Mac",
+                ":srv 366 Mac #b :End of NAMES list")
+            try await pollUntil { model.roomInfos.count == 2 }
+
+            func seededAppearsAs(in transcript: [ProtocolEvent]) -> Bool {
+                guard let first = transcript.first, case .appearsAs(let nick, let avatarName, _) = first else {
+                    return false
+                }
+                return nick == "Mac" && avatarName == "Armando"
+            }
+            try await pollUntil { !model.transcript(for: "#b").isEmpty }
+            let bTranscript = model.transcript(for: "#b")
+            #expect(seededAppearsAs(in: bTranscript),
+                    "room #b (joined AFTER the character switch) must have the switch seeded as its FIRST transcript event, got: \(bTranscript)")
+
+            // Send a line into #b, activate it, and check panel coherence:
+            // title + the seeded appearsAs (no panel of its own -- appearsAs
+            // doesn't add a panel) + the one line = title + 1 message.
+            try await server.send(":Al!a@h PRIVMSG #b :hello b")
+            try await pollUntil { model.transcript(for: "#b").filter { isText($0) }.count == 1 }
+
+            model.setActiveRoom("#b")
+            try await pollUntil { model.currentRoom == "#b" }
+            try await pollUntil { model.panelCount == 2 }   // title + 1 message
+            #expect(model.panelCount == 2, "#b strip: title + 1 message (the seed itself adds no panel); got \(model.panelCount)")
+
+            model.shutdown()
+            server.stop()
+        }
+
         private func isText(_ ev: ProtocolEvent) -> Bool {
             if case .text = ev { return true }
             return false

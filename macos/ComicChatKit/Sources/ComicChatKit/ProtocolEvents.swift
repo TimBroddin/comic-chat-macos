@@ -160,6 +160,30 @@ public enum ProtocolEvent: Sendable, Codable, Equatable {
     case statusLine(text: String)
 }
 
+extension ProtocolEvent {
+    /// Detects whether a `.text` event is actually a WHISPER wearing a plain
+    /// `.text` shape (final-review Important #4a/4b's shared predicate,
+    /// factored out of `ChatSessionModel.handleLocked`'s own `.text` case so
+    /// `AppState.recomputeTranscriptText` can reuse the EXACT same detection
+    /// rather than re-deriving it and risking drift). Two independent
+    /// signals, either sufficient (same OR `handleLocked` has always used):
+    ///   - the PRIVMSG's `target` is our own nick (plain-IRC private message,
+    ///     §8 Topology A — the engine classifies this `CC_EV_TEXT`, never
+    ///     `CC_EV_WHISPER`; see `WhisperRoutingTests`' top doc comment for the
+    ///     verified `ircsock.cpp` citations);
+    ///   - cooked SM_WHISPER-mode annotations (`annotations.mode == 2`) —
+    ///     mode is set on OUTBOUND sends by `ChatSessionModel.send`'s
+    ///     `Self.smMode(for:)` table and may also arrive on an INBOUND cooked
+    ///     `.text` from a peer whisper-posing into a PRIVMSG.
+    /// Returns `false` for any other `ProtocolEvent` case (only `.text` can
+    /// be whisper-shaped this way — a `.whisper` event is already unambiguous
+    /// via its own case).
+    public static func isWhisperShapedText(_ event: ProtocolEvent, ownNick: String) -> Bool {
+        guard case .text(_, _, let target, _, _, let annotations) = event else { return false }
+        return target.caseInsensitiveCompare(ownNick) == .orderedSame || annotations?.mode == 2
+    }
+}
+
 /// A `ProtocolEvent` paired with the CHANNEL it is scoped to (Plan 4b Task 7:
 /// true multi-room). `ProtocolSession.events` yields these so a consumer that
 /// has joined N rooms on one connection can route each event to the right

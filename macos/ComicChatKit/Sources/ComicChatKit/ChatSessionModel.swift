@@ -525,6 +525,17 @@ public final class ChatSessionModel: @unchecked Sendable {
         engineQueue.sync { activeRoom }
     }
 
+    /// Thread-safe snapshot of our own current nick (final-review Important
+    /// #4a): `AppState.recomputeTranscriptText`'s text-view filter needs this
+    /// to call the shared `ProtocolEvent.isWhisperShapedText` predicate the
+    /// same way `handleLocked` does internally via `currentOwnNick` — that
+    /// property itself is engine-queue-owned/private (its own doc comment
+    /// explains why a bare read isn't safe), so this is the thread-safe
+    /// read-through, same `engineQueue.sync` posture as `currentRoom`.
+    public var ownNick: String {
+        engineQueue.sync { currentOwnNick }
+    }
+
     /// Thread-safe snapshot of the strip's current panel count (`Strip.panelCount`,
     /// 0 if no strip has been built yet — e.g. before `start()`). Exposed for
     /// callers/tests that need to observe a recompose actually having
@@ -852,24 +863,67 @@ public final class ChatSessionModel: @unchecked Sendable {
             }
 
         case .appearsAs(let nick, let avatarName, let url):
-            // A character-appearance announce. It rides a room PRIVMSG/DATA so
-            // it is channel-scoped on the wire (clarification 4) — it lives in
-            // THAT room's transcript (appended above) and drives the live
-            // strip only when that room is active. The reply-announce greets a
-            // PEER whose avatar we're seeing for the first time; it must NEVER
-            // fire for our own synthetic (`!fromServer`) or a server-echoed
-            // announce of our OWN nick. `announcedBackTo` stays session-level
-            // (a nick is greeted once across the whole session).
+            // A character-appearance announce. Two wire shapes reach here
+            // (final-review Important #1, `ircsock.cpp:923-928` — the engine
+            // explicitly delegates this fan-out decision to Swift):
+            //   - CHANNEL-scoped (clarification 4): the common case, a
+            //     "# Appears as" riding a room PRIVMSG/DATA — `scopedRoom` is
+            //     non-nil, it already lives in THAT room's transcript
+            //     (appended by the routing block above) and drives the live
+            //     strip only when that room is active. Left as-is here.
+            //   - PRIVATE (token 0, `scopedRoom == nil`): the 1998 client's
+            //     STANDARD response to our own channel-wide announce is a
+            //     private "# Appears as" reply-announce, which arrives as a
+            //     bare PRIVMSG to our own nick (see `AnnounceTests
+            //     .privateReplyAnnounce`'s wire form / `handleLocked`'s
+            //     transcript-routing doc comment on the token-registration
+            //     race) — that has NO channel token, so the routing block
+            //     above filed it under `sessionTranscript`, which is NEVER
+            //     replayed by `rebuildStripLocked`. Pre-multi-room (single
+            //     transcript) this same event applied unconditionally; the
+            //     multi-room split silently dropped it. Fixed here: fan it
+            //     out to EVERY joined room's transcript (so a later
+            //     `setActiveRoom` rebuild of ANY room still re-avatars this
+            //     peer) and apply it to the live strip regardless of which
+            //     room is active (the peer's avatar update is not really
+            //     "about" any one room — it has none).
+            //   KNOWN LESSER VARIANT (recorded debt, not fixed here): a
+            //   CHANNEL-scoped `.appearsAs` for a nick who is ALSO a member
+            //   of some OTHER joined room only updates that other room's
+            //   transcript once THAT room independently sees its own
+            //   `.appearsAs`/roster refresh for the same nick — i.e. the
+            //   avatar doesn't fan out across rooms just because the nick is
+            //   present in more than one. This is the same root cause (a
+            //   peer's avatar identity is session-wide, not room-scoped) but
+            //   deliberately left alone: fixing it would mean cross-
+            //   referencing room membership on every channel-scoped
+            //   `.appearsAs`, a bigger change than this finding's minimal fix
+            //   calls for.
+            let isPrivateAnnounce = (scopedRoom == nil)
+            if isPrivateAnnounce {
+                appendToAllRoomTranscriptsLocked(ev)
+            }
+            // The reply-announce greets a PEER whose avatar we're seeing for
+            // the first time; it must NEVER fire for our own synthetic
+            // (`!fromServer`) or a server-echoed announce of our OWN nick.
+            // `announcedBackTo` stays session-level (a nick is greeted once
+            // across the whole session).
             let isOwnAnnounce = !fromServer || nick.caseInsensitiveCompare(currentOwnNick) == .orderedSame
             if !isOwnAnnounce, !announcedBackTo.contains(nick) {
                 announcedBackTo.insert(nick)
                 let name = config.characterName.capitalized
                 let announceChannel = scopedRoom ?? activeRoom
-                Task { [session] in
-                    try? await session.announceAvatar(channel: announceChannel, toNick: nick, name: name)
+                // Final-review minor: `activeRoom` can be "" (no room joined
+                // yet, or the last room just left) — a reply-announce with an
+                // empty channel has nowhere sensible to go on the wire, so
+                // skip it rather than sending a malformed announce.
+                if !announceChannel.isEmpty {
+                    Task { [session] in
+                        try? await session.announceAvatar(channel: announceChannel, toNick: nick, name: name)
+                    }
                 }
             }
-            if isActiveRoom { try? bridge?.apply(ev); recomposeLocked() }
+            if isActiveRoom || isPrivateAnnounce { try? bridge?.apply(ev); recomposeLocked() }
             // Plan 4b Task 6 (D4 §4): a PEER's announce naming art we don't
             // have locally AND carrying a fetchable URL enters the
             // auto-download path. Fires once regardless of room — the in-flight
@@ -879,7 +933,7 @@ public final class ChatSessionModel: @unchecked Sendable {
                 downloadAvatarIfNeededLocked(nick: nick, avatarName: avatarName, url: url)
             }
 
-        case .text(let nick, _, let target, let text, _, let annotations):
+        case .text(let nick, _, _, let text, _, _):
             // Plan 4b Task 4 fix (§8 Topology A / plain-IRC interop finding):
             // a private whisper on plain IRC arrives as a bare `PRIVMSG
             // <ourNick> :text` -- the engine classifies this `CC_EV_TEXT`
@@ -887,11 +941,13 @@ public final class ChatSessionModel: @unchecked Sendable {
             // comment for the verified ircsock.cpp citations), so it must
             // ALSO be routed to the whisper box, alongside strip rendering.
             // Whispers stay SESSION-level (clarification 2) — the whisper-box
-            // routing runs regardless of which room is active. Detected by the
-            // PRIVMSG target being our own nick or cooked SM_WHISPER-mode
-            // (mode == 2) annotations. Runs AFTER the own-echo dedup guard
-            // above (which already `return`ed for a matching echo).
-            let isWhisper = target.caseInsensitiveCompare(currentOwnNick) == .orderedSame || annotations?.mode == 2
+            // routing runs regardless of which room is active. Detected via
+            // `ProtocolEvent.isWhisperShapedText` (final-review Important
+            // #4a: factored into a shared predicate so `AppState`'s text-view
+            // filter uses the EXACT same rule rather than a re-derived copy).
+            // Runs AFTER the own-echo dedup guard above (which already
+            // `return`ed for a matching echo).
+            let isWhisper = ProtocolEvent.isWhisperShapedText(ev, ownNick: currentOwnNick)
             if isWhisper {
                 whisperBoxRoutingLocked(nick: nick, text: text)
             }
@@ -911,13 +967,32 @@ public final class ChatSessionModel: @unchecked Sendable {
         case .whisper(let nick, _, let text, _):
             // Plan 4b Task 4: the IRCX WHISPER verb path -- see
             // `whisperBoxRoutingLocked`'s doc comment for both wire forms.
-            // Whisper-box routing is session-level (clarification 2). The 4a
-            // main-strip whisper-balloon rendering is kept, gated on the
-            // whisper's room being active (a channel-scoped WHISPER) or
-            // session-scoped (`channel == nil` -> render on the active strip,
-            // matching pre-Task-7 behavior). A whisper does NOT bump unread.
+            // Whisper-box routing is session-level (clarification 2).
+            //
+            // FINAL-REVIEW COORDINATOR RULING (Important #4b, binding):
+            // session-scoped (PRIVATE) whispers render in the whisper box
+            // ONLY -- the strip `bridge.apply` for a session-scoped whisper
+            // (`channel == nil`) is REMOVED. Pre-this-fix, a session-scoped
+            // whisper balloon rendered on the strip ONCE (via this branch's
+            // old `channel == nil` clause) and then vanished the next time
+            // ANY reflow replayed that room's transcript -- a session-scoped
+            // event is never IN a room's transcript (it lives in
+            // `sessionTranscript`, `handleLocked`'s routing block above), so
+            // `rebuildStripLocked`'s replay simply never re-applies it. That
+            // is worse than either fully-consistent behavior (balloon
+            // forever vs. never) and contradicts the original, which renders
+            // private whispers box-only (never on the main strip at all --
+            // `whisprbx.cpp`'s dedicated whisper-window rendering path, no
+            // `CUnitPanel`/strip involvement). ROOM-scoped WHISPER events
+            // (an IRCX `WHISPER <chan> ...` naming a real channel) are
+            // UNCHANGED: they keep rendering their strip balloon when that
+            // room is active, exactly like before -- `isActiveRoom` already
+            // requires `scopedRoom != nil`, so this reduces to "only apply
+            // when room-scoped and active," dropping the old `|| channel ==
+            // nil` fallback entirely. A whisper does NOT bump unread either
+            // way.
             whisperBoxRoutingLocked(nick: nick, text: text)
-            if isActiveRoom || channel == nil { try? bridge?.apply(ev); recomposeLocked() }
+            if isActiveRoom { try? bridge?.apply(ev); recomposeLocked() }
 
         case .userJoined:
             // A peer joining is strip-relevant (renders a JOIN panel) AND
@@ -948,6 +1023,21 @@ public final class ChatSessionModel: @unchecked Sendable {
             emitStatus(text)
         case .error(let code, let text):
             emitStatus("error \(code): \(text)")
+            // Final-review minor: if the server ERRORS a LIST request instead
+            // of ever sending `.roomListBegin`/`.roomListEnd`,
+            // `roomListRequestInFlight` (set true the moment the wire LIST
+            // went out, `requestRoomList()`'s own doc comment) would
+            // otherwise never clear — permanently wedging every subsequent
+            // `requestRoomList()` call into a silent no-op for the rest of
+            // the session. Clearing it here unconditionally on ANY `.error`
+            // is a coarser trigger than "only a LIST-caused error" (this
+            // event carries no correlation back to which request caused it),
+            // but a spurious clear is harmless (worst case: an unrelated
+            // error lets a still-in-flight LIST send an early second wire
+            // LIST, the same class of redundant-request the in-flight guard
+            // exists to avoid, not a correctness break) whereas never
+            // clearing is a permanent wedge — the asymmetry favors clearing.
+            roomListRequestInFlight = false
         case .disconnectedHint(let text):
             emitStatus(text)
 
@@ -1008,12 +1098,59 @@ public final class ChatSessionModel: @unchecked Sendable {
         }
     }
 
+    /// ENGINE QUEUE ONLY (final-review Important #1). Appends `ev` to EVERY
+    /// currently-joined room's transcript — used for a PRIVATE `.appearsAs`
+    /// reply-announce (token 0, `scopedRoom == nil`), which the routing block
+    /// in `handleLocked` files under `sessionTranscript` (never replayed by
+    /// `rebuildStripLocked`). Without this fan-out, a peer's avatar update
+    /// delivered this way survives only until the next `setActiveRoom`/
+    /// `setViewport` reflow of whichever room happened to be active when it
+    /// arrived, then is silently lost on every other room (and on that same
+    /// room too, once its transcript is replayed from scratch and this event
+    /// isn't in it). Mirrors `changeCharacter`'s own "record the switch in
+    /// every room's transcript" posture (Plan 4b Task 7 clarification 1) —
+    /// same shape, opposite direction (a PEER's avatar rather than our own).
+    private func appendToAllRoomTranscriptsLocked(_ ev: ProtocolEvent) {
+        for room in roomOrder {
+            rooms[room]?.transcript.append(ev)
+        }
+    }
+
     /// ENGINE QUEUE ONLY. Ensures a `RoomBox` and its tab-order slot exist for
     /// `room` (idempotent). Used defensively wherever an event might reference
     /// a room the normal join flow hasn't registered yet.
+    ///
+    /// Final-review Important #2: this is the SINGLE chokepoint every room
+    /// box is actually created through after `start()`'s own initial-room
+    /// seeding (`joinRoom`'s eager registration, `.selfJoined`'s confirm, and
+    /// `handleLocked`'s defensive token-race path all call this) — so it is
+    /// also the right place to seed a JOIN-AFTER-CHARACTER-SWITCH fix:
+    /// `changeCharacter` only appends its synthetic `.appearsAs` to rooms that
+    /// already exist at switch time (`self.roomOrder` at that moment) — a room
+    /// joined LATER has no switch recorded in its transcript at all, so its
+    /// first-ever rebuild (`rebuildStripLocked`, e.g. the very first
+    /// `setActiveRoom` into it) seeds the self participant from
+    /// `initialCharacterName` (`setUpStripLocked`'s `isReflow` seeding) and
+    /// then replays a transcript with NO switch entry to move it forward —
+    /// self renders as the character we STARTED the session with, not the one
+    /// we're actually currently wearing. Seeding the brand-new box's
+    /// transcript with the same synthetic `.appearsAs` shape `changeCharacter`
+    /// uses, BEFORE any real event lands in it, closes the gap: the room's
+    /// very first replay already carries the switch at position 0.
+    /// `config.characterName` is read here (not `initialCharacterName`) since
+    /// this only needs to fire when they've actually diverged (a switch
+    /// happened at some point before this room existed); if they're still
+    /// equal, seeding would be a no-op anyway (replaying the same avatar the
+    /// fresh self-participant is already seeded with), so the guard is a
+    /// direct translation of "only seed when there's something to seed."
     private func ensureRoomBoxLocked(_ room: String) {
         if rooms[room] == nil {
-            rooms[room] = RoomBox()
+            var box = RoomBox()
+            if config.characterName != initialCharacterName {
+                box.transcript.append(.appearsAs(nick: currentOwnNick,
+                                                  avatarName: config.characterName.capitalized, url: ""))
+            }
+            rooms[room] = box
             roomOrder.append(room)
         }
     }

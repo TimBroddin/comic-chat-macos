@@ -129,3 +129,75 @@ import Foundation
         #expect(String(result.characters).isEmpty)
     }
 }
+
+// Final-review Important #4a/4b — the shared whisper-shape predicate
+// (`ProtocolEvent.isWhisperShapedText`) `AppState.recomputeTranscriptText`
+// filters `sessionEvents` with, and `ChatSessionModel.handleLocked`'s `.text`
+// case uses for its own whisper-box routing decision. Pure logic, no
+// engine/strip involvement (same posture as `TranscriptTextBuilderTests`
+// above) — `AppState` itself lives in the app target (no test target exists
+// there per this repo's structure), so this pins the SHARED predicate the fix
+// depends on at the Kit level, plus an end-to-end demonstration of the exact
+// filter `recomputeTranscriptText` applies to `sessionEvents` before handing
+// events to `TranscriptTextBuilder`.
+@Suite struct WhisperShapedTextPredicateTests {
+    @Test func plainPrivmsgToOwnNickIsWhisperShaped() {
+        let event = ProtocolEvent.text(nick: "Bob", ident: "b@h", target: "Mac", text: "psst",
+                                       kind: 0, annotations: nil)
+        #expect(ProtocolEvent.isWhisperShapedText(event, ownNick: "Mac"))
+    }
+
+    @Test func ownNickMatchIsCaseInsensitive() {
+        let event = ProtocolEvent.text(nick: "Bob", ident: "b@h", target: "mac", text: "psst",
+                                       kind: 0, annotations: nil)
+        #expect(ProtocolEvent.isWhisperShapedText(event, ownNick: "Mac"))
+    }
+
+    @Test func cookedWhisperModeAnnotationIsWhisperShaped() {
+        var annotations = Annotations()
+        annotations.mode = 2   // SM_WHISPER
+        let event = ProtocolEvent.text(nick: "Bob", ident: "b@h", target: "#room", text: "psst",
+                                       kind: 0, annotations: annotations)
+        #expect(ProtocolEvent.isWhisperShapedText(event, ownNick: "Mac"))
+    }
+
+    @Test func channelMessageToOthersIsNotWhisperShaped() {
+        let event = ProtocolEvent.text(nick: "Bob", ident: "b@h", target: "#room", text: "hello all",
+                                       kind: 0, annotations: nil)
+        #expect(!ProtocolEvent.isWhisperShapedText(event, ownNick: "Mac"))
+    }
+
+    @Test func nonTextEventIsNeverWhisperShaped() {
+        // `.whisper` is already unambiguous via its own case -- the predicate
+        // only classifies `.text`-shaped events, per its own doc comment.
+        let event = ProtocolEvent.whisper(nick: "Bob", ident: "b@h", text: "psst", annotations: nil)
+        #expect(!ProtocolEvent.isWhisperShapedText(event, ownNick: "Mac"))
+    }
+
+    /// End-to-end demonstration of `AppState.recomputeTranscriptText`'s own
+    /// filter (Important #4a): given a `sessionEvents`-shaped mix of a plain
+    /// private whisper (`.text` to our own nick), an IRCX `.whisper`, and a
+    /// genuine session-scoped line (`.statusLine`), only the status line
+    /// should survive into what reaches `TranscriptTextBuilder` — the two
+    /// whisper shapes must be dropped BEFORE the builder ever sees them
+    /// (against the "whisper box, NOT text view" ruling), while a room's own
+    /// `.text` (not whisper-shaped) still renders normally.
+    @Test func recomputeTranscriptTextStyleFilterDropsWhisperShapedSessionEvents() {
+        let ownNick = "Mac"
+        let sessionEvents: [ProtocolEvent] = [
+            .text(nick: "Bob", ident: "b@h", target: "Mac", text: "private aside", kind: 0, annotations: nil),
+            .whisper(nick: "Carol", ident: "c@h", text: "ircx whisper", annotations: nil),
+            .statusLine(text: "Connected to server"),
+        ]
+        // The exact filter `recomputeTranscriptText` applies.
+        let filtered = sessionEvents.filter { event in
+            if case .whisper = event { return false }
+            if ProtocolEvent.isWhisperShapedText(event, ownNick: ownNick) { return false }
+            return true
+        }
+        let result = String(TranscriptTextBuilder.attributedString(for: filtered).characters)
+        #expect(!result.contains("private aside"), "a private plain-IRC whisper must not leak into the text view")
+        #expect(!result.contains("ircx whisper"), "an IRCX whisper must not leak into the text view")
+        #expect(result.contains("Connected to server"), "a genuine session-scoped status line must still render")
+    }
+}

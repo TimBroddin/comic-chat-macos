@@ -230,6 +230,27 @@ public final class AppState {
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
+        // Final-review Important #3 (gate race): `NSOpenPanel.runModal()`
+        // above pumps the main-queue run loop for as long as the panel is
+        // showing — a `connect()` already queued on the main queue (e.g. the
+        // user had also just hit Connect) can land and fully establish a
+        // live session WHILE the panel is up. The `model == nil` check
+        // above only proves there was no session at the moment the panel was
+        // OPENED; it says nothing about the moment it CLOSED. Re-checking
+        // here, immediately after `runModal()` returns and before any
+        // decode/render happens, catches that window and refuses with the
+        // same alert rather than building a second concurrent `Strip`
+        // against a now-live session (engine UB — the same one-strip-at-a-
+        // time hazard the FIRST check exists for).
+        guard model == nil else {
+            let alert = NSAlert()
+            alert.messageText = "Disconnect First"
+            alert.informativeText = "A session connected while the Open panel was showing. Opening a saved transcript renders it through the same comic engine as a live session, which only supports one strip at a time. Disconnect the current session before opening a saved transcript."
+            alert.alertStyle = .warning
+            alert.runModal()
+            return
+        }
+
         do {
             let file = try ConversationFile.read(from: url)
             let viewportTwips = Int32((currentWindowWidthPoints * 20).rounded())
@@ -542,7 +563,28 @@ public final class AppState {
     /// interleaving is ever required.
     private func recomputeTranscriptText() {
         guard let model else { transcriptText = AttributedString(); return }
-        let events = model.transcript + model.sessionEvents
+        // Final-review Important #4a: `model.sessionEvents` carries every
+        // SESSION-scoped event, including inbound plain-IRC whispers
+        // (`.text` shaped as a PRIVMSG-to-self — `ChatSessionModel
+        // .handleLocked`'s own `.text` case routes these to the whisper box
+        // via the SAME `isWhisperShapedText` predicate used here) and IRCX
+        // `.whisper` events with no room token. Against the "whisper box,
+        // NOT text view" coordinator ruling (Important #4b), those must NOT
+        // also leak into this plain-text transcript — `TranscriptTextBuilder`
+        // has no room/session distinction of its own, so the filter has to
+        // happen at this call site, on the raw event feed, before it ever
+        // reaches the builder. Room-scoped whispers are UNAFFECTED (they're
+        // already mixed into `model.transcript`, not `sessionEvents`, and are
+        // real room chat, not a private aside) — this is systematic on §8
+        // Topology A (every plain-IRC whisper takes this shape), not a rare
+        // edge case.
+        let ownNick = model.ownNick
+        let sessionOnly = model.sessionEvents.filter { event in
+            if case .whisper = event { return false }
+            if ProtocolEvent.isWhisperShapedText(event, ownNick: ownNick) { return false }
+            return true
+        }
+        let events = model.transcript + sessionOnly
         transcriptText = TranscriptTextBuilder.attributedString(for: events)
     }
 
@@ -678,7 +720,25 @@ public final class AppState {
             Task { @MainActor in self?.playSound(nick: nick, file: file) } }
         model = m
         do { try await m.start(); showConnectSheet = false }
-        catch { statusLine = "Connect failed: \(error)" }
+        catch {
+            statusLine = "Connect failed: \(error)"
+            // Final-review minor: `m.start()` can throw AFTER `model = m`
+            // above already published the half-started session (e.g. the TCP
+            // connect itself fails) — without this, `model` stays non-nil
+            // pointing at a `ChatSessionModel` that was never `shutdown()`'d
+            // (the mandatory-teardown contract `disconnect()`'s own doc
+            // comment states: "no `deinit`, so dropping one without calling
+            // this leaves a dangling engine global") and whose UI surface
+            // (member list, rooms, strip) never got a chance to populate
+            // either, leaving the app in a half-connected-looking limbo.
+            // Mirrors `disconnect()`'s own model-teardown + replay-server
+            // stop subset (not the full reset — this path hasn't shown any
+            // session UI yet, so there's nothing else to clear).
+            m.shutdown()
+            model = nil
+            replayServer?.stop()
+            replayServer = nil
+        }
     }
 
     /// Reads `--replay-fixture <path>` out of the process arguments, if

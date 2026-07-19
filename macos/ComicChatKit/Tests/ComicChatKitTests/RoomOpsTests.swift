@@ -175,11 +175,80 @@ extension EngineGlobalStateSelfTests {
             server.stop()
         }
 
+        /// Final-review minor: if the server ERRORS a LIST request instead of
+        /// ever completing the usual 321/322×N/323 sequence,
+        /// `roomListRequestInFlight` must still clear -- otherwise every
+        /// SUBSEQUENT `requestRoomList()` call for the rest of the session
+        /// becomes a permanent silent no-op (the in-flight guard, set the
+        /// moment the wire LIST goes out, is never reset by anything other
+        /// than `.roomListEnd` pre-fix). Drives a genuine `CC_EV_ERROR`
+        /// (`ERR_NOSUCHNICK`/401 -- `ircsock.cpp`'s numeric-reply handler,
+        /// verified as the simplest reliable trigger for the event this fix
+        /// actually watches) in place of `.roomListEnd`, then proves a SECOND
+        /// `requestRoomList()` call still reaches the wire.
+        @Test(.timeLimit(.minutes(1)))
+        func listErrorClearsInFlightGuardSoASubsequentRequestStillReachesTheWire() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            let statusBox = RoomOpsStatusBox()
+            model.onStatus = { text in statusBox.append(text) }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            try await model.requestRoomList()
+            try await server.waitForClientLine(containing: "LIST")
+
+            // The server errors instead of ever sending .roomListBegin/.../.roomListEnd.
+            try await server.send(":srv 401 Mac ghost :No such nick/channel")
+            try await pollUntil { !statusBox.entries.isEmpty }
+
+            // Pre-fix, this second call is a silent no-op forever (the
+            // in-flight guard never cleared) -- the wire never sees a second
+            // LIST. Bounded poll (rather than `waitForClientLine`, which
+            // loops forever relying on the test's own `.timeLimit` trait to
+            // eventually fail it with a generic timeout, not this test's own
+            // diagnostic) so a wrongly-suppressed second LIST fails fast with
+            // a clear message instead of burning the full time limit.
+            try await model.requestRoomList()
+            var sawSecondList = false
+            for _ in 0..<200 {   // ~1s at 5ms/poll
+                let text = String(data: server.receivedBytes, encoding: .isoLatin1) ?? ""
+                let listCount = text.components(separatedBy: "\r\n").filter { $0 == "LIST" || $0.hasPrefix("LIST ") }.count
+                if listCount >= 2 { sawSecondList = true; break }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(sawSecondList, "expected a SECOND wire LIST after the first round-trip errored out, but none arrived (roomListRequestInFlight never cleared)")
+
+            model.shutdown()
+            server.stop()
+        }
+
         private func pollUntil(_ condition: @escaping () -> Bool) async throws {
             while !condition() {
                 try await Task.sleep(nanoseconds: 5_000_000)
             }
         }
+    }
+}
+
+/// Thread-safe accumulator for `onStatus`'s `String` callback (same
+/// lock-guarded-box shape as `WhisperRoutingTests`' `StatusBox`, duplicated
+/// here rather than shared across files per this test target's existing
+/// per-file-private-box convention).
+private final class RoomOpsStatusBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    func append(_ text: String) {
+        lock.lock(); defer { lock.unlock() }
+        storage.append(text)
+    }
+
+    var entries: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
     }
 }
 

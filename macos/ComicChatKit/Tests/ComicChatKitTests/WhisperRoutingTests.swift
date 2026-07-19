@@ -206,6 +206,67 @@ extension EngineGlobalStateSelfTests {
             model.shutdown()
             server.stop()
         }
+
+        /// Final-review Important #4b (RED before the fix) — COORDINATOR
+        /// RULING: a SESSION-scoped (private) whisper renders in the whisper
+        /// box ONLY, never on the main comic strip, matching the original's
+        /// box-only private-whisper posture (`whisprbx.cpp` — a dedicated
+        /// whisper window, no `CUnitPanel`/strip involvement at all). Pre-fix,
+        /// `handleLocked`'s `.whisper` case applied to the strip whenever
+        /// `isActiveRoom || channel == nil` -- the `channel == nil` half meant
+        /// a session-scoped whisper balloon rendered ONCE on the strip and
+        /// then silently vanished on the NEXT reflow (a session-scoped event
+        /// is never IN any room's transcript, so `rebuildStripLocked`'s
+        /// replay never re-applies it) -- worse than either fully-consistent
+        /// behavior. This test drives a WHISPER wire form the engine parser
+        /// classifies session-scoped: `WHISPER <arg> <targetlist> :<text>`
+        /// where `<arg>` does NOT carry a channel prefix (`#`/`%`/`&`) --
+        /// `ircsock.cpp`'s `cmdidWhisper` handler only resolves a room token
+        /// when `CHANNELPREFIX(args[1][0])` holds (`defines.h:162`); here
+        /// `args[1]` is the bare nick "Mac", so `room_token` stays 0 and the
+        /// event is session-scoped, distinct from `inboundWhisperRoutesToHistoryAndCallback`'s
+        /// `WHISPER #p4 Mac :psst` (which DOES carry a channel-prefixed first
+        /// arg and is therefore room-scoped -- that test is unaffected by
+        /// this fix, its strip balloon behavior is unchanged and it never
+        /// asserted on `panelCount` anyway).
+        ///
+        /// Asserts: the line lands in `whisperHistories` (the box) exactly as
+        /// before, AND `panelCount` never grows past the title-only baseline
+        /// -- proving the strip stays untouched, box-only, for a
+        /// session-scoped whisper.
+        @Test(.timeLimit(.minutes(1)))
+        func sessionScopedWhisperRendersBoxOnlyNeverOnStrip() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            while model.panelCount == 0 {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            let baselinePanelCount = model.panelCount
+
+            // Session-scoped IRCX WHISPER: first arg "Mac" carries no channel
+            // prefix, so the engine resolves room_token == 0 (see this test's
+            // doc comment for the verified ircsock.cpp citation).
+            try await server.send(":Bob!u@h WHISPER Mac Mac :psst")
+
+            while model.whisperHistories["Bob"] == nil {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(model.whisperHistories["Bob"] == [WhisperLine(nick: "Bob", text: "psst", isOwn: false)])
+
+            // Settling window long enough for a pre-fix-style strip balloon
+            // to have landed, before asserting panelCount never moved.
+            try await Task.sleep(nanoseconds: 200_000_000)
+            #expect(model.panelCount == baselinePanelCount,
+                    "a session-scoped whisper must NOT add a strip panel (box-only ruling); baseline \(baselinePanelCount), got \(model.panelCount)")
+
+            model.shutdown()
+            server.stop()
+        }
     }
 }
 
