@@ -124,10 +124,18 @@ static cc_own_identity ccSessionGetOwnIdentity() {
 // rooms this session has registered a token for" -- a linear scan of the
 // (small, at most a handful of rooms) channel table. Good enough for this
 // task's scope; Task 7 can index this properly if it ever matters.
+//
+// Plan 4b live-fix 6, Fix 1 (p4b-bugB-diagnosis.md): case-INSENSITIVE
+// compare (`stricmp`), mirroring `ccSessionRoomTokenForChannel`'s identical
+// fix in engine/ircsock.cpp -- same fidelity source (`LookupDoc`'s `stricmp`,
+// v2.5-beta-1-modern/chatdoc.cpp:2021-2031), same reasoning: this is the
+// bridge-side twin of that byte-exact scan the diagnosis flagged, and must
+// not diverge from it or the two resolvers would disagree about which
+// channel casings are "joined".
 static BOOL ccSessionIsJoinedChannel(const char* encodedChannel) {
     CCSession* s = ccSession();
     for (size_t i = 1; i < s->channels.size(); i++)
-        if (s->channels[i] == encodedChannel) return TRUE;
+        if (stricmp(s->channels[i].c_str(), encodedChannel) == 0) return TRUE;
     return FALSE;
 }
 
@@ -146,9 +154,14 @@ const char* cc_session_room_channel(cc_session* h, uint32_t room_token) {
 
 // Live-fix 1 (Plan 4b): see comicchat.h's doc comment for the full rationale
 // -- overwrites s->channels[room_token] IN PLACE (same token, no new
-// registration), so ccSessionRoomTokenForChannel's byte-exact scan (and this
-// function's own cc_session_room_channel) agree with whatever casing the
-// server most recently confirmed for this room.
+// registration), so ccSessionRoomTokenForChannel's scan (case-insensitive as
+// of live-fix 6, Fix 1 -- see that function's doc comment, engine/ircsock.cpp)
+// and this function's own cc_session_room_channel agree with whatever casing
+// the server most recently confirmed for this room. Still needed post-live-
+// fix-6: case-insensitivity makes TOKEN RESOLUTION agree regardless of
+// casing, but cc_session_room_channel (used by outbound builders to put a
+// channel STRING back on the wire) must still be kept pointed at the
+// server's freshest casing, not whatever casing we originally registered.
 int32_t cc_session_update_room_channel(cc_session* h, uint32_t room_token, const char* channel) {
     CCSession* s = reinterpret_cast<CCSession*>(h);
     if (!s || !channel || room_token == CC_ROOM_TOKEN_NONE || room_token >= s->channels.size()) return 1;

@@ -4507,6 +4507,46 @@ static int cc_selftest_parse_join_privmsg() {
     return 0;
 }
 
+// Plan 4b live-fix 6, Fix 1: channel<->room_token resolution must be
+// case-insensitive, matching the original's LookupDoc (v2.5-beta-1-modern/
+// chatdoc.cpp:2021-2031, `stricmp`). Registers the room under one casing
+// ("#crypt", exactly what Swift's ProtocolSession.join would have sent) and
+// then feeds a PRIVMSG naming a THIRD, different casing ("#CRYPT" -- neither
+// the registered casing nor a join-echo the live-fix-1 in-place-rename path
+// would ever see) straight at the C engine, below any Swift-side roomKey
+// folding. Before this fix, ccSessionRoomTokenForChannel's byte-exact `==`
+// scan misses and the event is emitted session-scoped (room_token == 0,
+// CC_ROOM_TOKEN_NONE) -- exactly the p4b-bugB-diagnosis.md failure mode
+// ("Tinkerbelle's greeting never renders"). After the fix, the case-folded
+// match resolves the SAME token the room was registered under.
+static int cc_selftest_room_token_case_insensitive() {
+    struct Cap { std::vector<int> types; std::vector<uint32_t> tokens; } cap;
+    cc_session_config cfg = {};
+    cfg.user_data = &cap; cfg.send = [](void*,const uint8_t*,size_t){};
+    cfg.own_nick = [](void*){ return "JefPober"; };
+    cfg.on_event = [](void* ud, const cc_proto_event* ev){
+        Cap* c = static_cast<Cap*>(ud);
+        c->types.push_back(ev->type);
+        c->tokens.push_back(ev->room_token);
+    };
+    cc_session* s = cc_session_create(&cfg);
+    uint32_t token = cc_session_register_room(s, "#crypt");
+    CC_CHECK(token != CC_ROOM_TOKEN_NONE);
+
+    // A PRIVMSG naming "#CRYPT" -- upper-case, never registered or
+    // join-echoed under this exact casing.
+    const char* wire = ":Tinkerbelle!belle@h PRIVMSG #CRYPT :hi\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)wire, strlen(wire));
+
+    int ti = -1;
+    for (size_t i = 0; i < cap.types.size(); i++) if (cap.types[i] == CC_EV_TEXT) { ti = (int)i; break; }
+    CC_CHECK(ti >= 0);
+    CC_CHECK(ti >= 0 && cap.tokens[ti] == token);   // room-scoped, NOT CC_ROOM_TOKEN_NONE (0)
+
+    cc_session_destroy(s);
+    return 0;
+}
+
 // ============================================================================
 // Plan 3 Task 5b Step 6: coverage vectors -- one selftest per event family,
 // with the FULL expected event stream hand-traced from the exercised handler +
@@ -5288,6 +5328,7 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_outbound_say_chunking();        // Plan 3 Task 4: bChatSendToTarget multi-chunk path
     cc_selftest_event_union();                  // Plan 3 Task 5a: cc_proto_event union completeness
     cc_selftest_parse_join_privmsg();           // Plan 3 Task 5b: parse-vector event stream
+    cc_selftest_room_token_case_insensitive();  // Plan 4b live-fix 6: LookupDoc-fidelity case fold
     // Plan 3 Task 5b Step 6: per-event-family coverage vectors (hand-traced)
     cc_selftest_pv_selfjoin_autoqueries();      // self-JOIN + auto MODE/WHO + 324/352/315
     cc_selftest_pv_nick_across_users();         // NICK other + self

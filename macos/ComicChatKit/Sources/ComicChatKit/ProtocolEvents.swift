@@ -226,6 +226,15 @@ extension ProtocolEvent {
     static func from(_ ev: cc_proto_event, encoding: WireEncoding) -> (event: ProtocolEvent, roomToken: UInt32)? {
         func str(_ p: UnsafePointer<CChar>?) -> String { WireCodec.decode(p, encoding: encoding) }
         func ann(_ a: cc_annotations) -> Annotations { Annotations(cAnnotations: a, encoding: encoding) }
+        // Plan 4b live-fix 6, Fix 2 (RECORDED DEVIATION -- see
+        // WireCodec.stripMircFormatting's doc comment for the fidelity
+        // check): applied ONLY to the message-BODY text field of `.text`/
+        // `.action`/`.whisper` -- never to nick/ident/target/channel or to
+        // annotation addressees, and never to the wire bytes themselves
+        // (this runs on the already-`str`-decoded copy, at the C-event ->
+        // Swift-event boundary, well after WireCodec.decode and outbound
+        // encode are both out of the picture).
+        func displayText(_ p: UnsafePointer<CChar>?) -> String { WireCodec.stripMircFormatting(str(p)) }
 
         var result: ProtocolEvent?
         switch ev.type {
@@ -267,7 +276,7 @@ extension ProtocolEvent {
         case CC_EV_TEXT:
             let hasAnn = ev.u.text.has_annotations != 0
             result = .text(nick: str(ev.u.text.nick), ident: str(ev.u.text.ident),
-                          target: str(ev.u.text.target), text: str(ev.u.text.text),
+                          target: str(ev.u.text.target), text: displayText(ev.u.text.text),
                           kind: ev.u.text.kind,
                           annotations: hasAnn ? ann(ev.u.text.annotations) : nil)
         case CC_EV_DATA:
@@ -275,11 +284,11 @@ extension ProtocolEvent {
         case CC_EV_WHISPER:
             let hasAnn = ev.u.whisper.has_annotations != 0
             result = .whisper(nick: str(ev.u.whisper.nick), ident: str(ev.u.whisper.ident),
-                             text: str(ev.u.whisper.text),
+                             text: displayText(ev.u.whisper.text),
                              annotations: hasAnn ? ann(ev.u.whisper.annotations) : nil)
         case CC_EV_ACTION:
             let hasAnn = ev.u.action.has_annotations != 0
-            result = .action(nick: str(ev.u.action.nick), text: str(ev.u.action.text),
+            result = .action(nick: str(ev.u.action.nick), text: displayText(ev.u.action.text),
                             annotations: hasAnn ? ann(ev.u.action.annotations) : nil)
         case CC_EV_SOUND:
             result = .sound(nick: str(ev.u.sound.nick), file: str(ev.u.sound.file),

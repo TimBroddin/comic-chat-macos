@@ -132,6 +132,85 @@ public enum WireCodec {
         return String(scalars)
     }
 
+    /// Strips mIRC inline-formatting control codes from already-decoded
+    /// display text. RECORDED DEVIATION (Plan 4b live-fix 6, Fix 2;
+    /// modern-usability, coordinator-sanctioned) -- NOT a fidelity fix.
+    ///
+    /// FIDELITY CHECK (p4b-bugB-diagnosis.md's mandated first step, verified
+    /// against the read-only original at v2.5-beta-1-modern/): the 1998
+    /// client does NOT strip mIRC control codes from inbound message text.
+    /// `ProcessLine` (chatdoc.cpp:447-466) forwards `szMesg` to `AddLine`
+    /// unmodified; `CChatDoc::AddLine` (chatdoc.cpp:328-340) forwards it to
+    /// `CUnitPanelPage::AddLine` -> `MakeBalloon` (panel.cpp:1036-1136)
+    /// unmodified; `ProcessSay` (protsupp.cpp:1545-1922), the inbound PRIVMSG
+    /// handler, only does CTCP low-level UNquoting (`\r`/`\n`, protsupp.cpp:
+    /// 1563) and this port's own "(#...)" annotation-block parsing -- no
+    /// 0x03/0x02/0x1F/0x16/0x0F handling anywhere in that chain.
+    /// `protsupp.cpp` has NO `StripFormatting`-shaped function; `format.cpp`'s
+    /// `chCtlColor`/`chCtlBold`/etc. scheme is this client's OWN outbound
+    /// `^`-prefixed line-wrap/RTF-export formatting for locally composed
+    /// text, unrelated to mIRC's wire-level codes. So a literal mIRC control
+    /// byte in inbound text reaches the original's balloon/RTF renderer RAW
+    /// -- e.g. the captured "\x034 Hi JefPober" (mIRC color 4, no bg) would
+    /// render as whatever glyph GDI maps 0x03 to, immediately followed by a
+    /// bare, uncolored "4". The port's current passthrough behavior (keep
+    /// the bytes, let the renderer show whatever it shows) is therefore
+    /// ALREADY faithful -- this fix does not touch WIRE bytes, outbound
+    /// text, or annotations; it only cleans up the copy that reaches
+    /// on-screen UI/strip rendering (`ProtocolEvent.from`'s `.text`/
+    /// `.action`/`.whisper` text field, applied AFTER `decode` above), since
+    /// CoreText silently drops the raw control byte and leaves an orphaned,
+    /// confusing digit like "4 Hi JefPober" on screen -- worse than either
+    /// the original's own rendering or a clean strip.
+    ///
+    /// Grammar stripped (mIRC's documented inline-formatting codes):
+    ///   0x03 ("\u{03}") color, optionally followed by `\d{1,2}(,\d{1,2})?`
+    ///        (foreground[,background], 1-2 digits each)
+    ///   0x02 bold, 0x1F underline, 0x16 reverse, 0x0F reset -- all lone,
+    ///        no following digits.
+    /// The code itself is removed; any character(s) immediately after it
+    /// (e.g. the space in "\x034 Hi ...") are left exactly as-is -- only the
+    /// control byte (and a color code's own digit run) are consumed, so
+    /// "\x034 Hi JefPober" strips to " Hi JefPober" (leading space kept,
+    /// documented choice: the space is real, separately-typed content the
+    /// color code merely prefixed, not part of the code's own grammar).
+    public static func stripMircFormatting(_ text: String) -> String {
+        guard text.utf8.contains(where: { $0 == 0x03 || $0 == 0x02 || $0 == 0x1F || $0 == 0x16 || $0 == 0x0F }) else {
+            return text
+        }
+        var out = String.UnicodeScalarView()
+        var scalars = Substring(text).unicodeScalars[...]
+        while let c = scalars.first {
+            switch c.value {
+            case 0x03:
+                scalars.removeFirst()
+                // Optional foreground digits (1-2).
+                var digits = 0
+                while digits < 2, let d = scalars.first, ("0"..."9").contains(Character(d)) {
+                    scalars.removeFirst(); digits += 1
+                }
+                // Optional ",background" digits (1-2), only if a foreground
+                // color was actually present (mIRC's own grammar: a bare
+                // "\x03," is not a valid color-with-background lead-in).
+                if digits > 0, let comma = scalars.first, comma == "," {
+                    let save = scalars
+                    scalars.removeFirst()
+                    var bgDigits = 0
+                    while bgDigits < 2, let d = scalars.first, ("0"..."9").contains(Character(d)) {
+                        scalars.removeFirst(); bgDigits += 1
+                    }
+                    if bgDigits == 0 { scalars = save }   // not actually a bg run; restore the comma
+                }
+            case 0x02, 0x1F, 0x16, 0x0F:
+                scalars.removeFirst()
+            default:
+                out.append(c)
+                scalars.removeFirst()
+            }
+        }
+        return String(out)
+    }
+
     /// Encode a `String` to wire bytes per `encoding`, for outbound sends.
     public static func encode(_ s: String, encoding: WireEncoding) -> [UInt8] {
         switch encoding {

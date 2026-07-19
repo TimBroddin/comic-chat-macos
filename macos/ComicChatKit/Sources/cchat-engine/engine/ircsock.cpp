@@ -441,10 +441,34 @@ static void ccParseChannelMode(CIrcProto& proto, const char *szFlags,
 //=--------------------------------------------------------------------------=
 
 // Resolve an encoded channel name to the session's room_token (0 if unknown).
+//
+// Plan 4b live-fix 6, Fix 1 (p4b-bugB-diagnosis.md): case-INSENSITIVE
+// compare, matching the original's channel->doc lookup, `LookupDoc`
+// (v2.5-beta-1-modern/chatdoc.cpp:2021-2031):
+//   if (stricmp(doc->m_proto->m_strChannel, channel) == 0) return doc;
+// Every inbound channel line in the original resolves its target room
+// through that `stricmp` (ircsock.cpp:1293, 1434, 1631, 1671, 1785, ... in
+// the original). A byte-exact `==` here (the pre-fix shape) is a fidelity
+// regression: a server that echoes/relays a channel in different casing than
+// we registered (e.g. we JOIN "#crypt", the server calls it "#Crypt") would
+// silently strand every inbound event for that channel as session-scoped
+// (room_token 0) instead of routing it to the joined room -- see the
+// diagnosis for the full "Tinkerbelle's greeting never renders" trace.
+// `stricmp` (shim/mfc_compat.h) is the same case-fold this port already uses
+// at every other channel-name comparison site in this file (e.g.
+// ircsock.cpp:1391's `stricmp(pParse->args[2], sess.proto.m_strChannel)`).
+// This is a plain ASCII fold (strcasecmp), not RFC 1459 section 2.3.1's extended
+// `[]\^` <-> `{}|~` fold -- that's fine here: `ChatSessionModel.roomKey(_:)`
+// (Swift) re-folds whatever casing this resolver's caller hands back
+// (`cc_session_room_channel`) through its OWN RFC-1459-extended fold before
+// ever comparing it to `activeRoom` (ChatSessionModel.swift:925-927), so the
+// two layers do not need to agree on the fold's exact character class --
+// only on "the same channel resolves to the same token/key", which any
+// case-insensitive fold here guarantees.
 static uint32_t ccSessionRoomTokenForChannel(CCSession& sess, const char* channel) {
 	if (!channel) return CC_ROOM_TOKEN_NONE;
 	for (size_t i = 1; i < sess.channels.size(); i++)
-		if (sess.channels[i] == channel) return (uint32_t)i;
+		if (stricmp(sess.channels[i].c_str(), channel) == 0) return (uint32_t)i;
 	return CC_ROOM_TOKEN_NONE;
 }
 

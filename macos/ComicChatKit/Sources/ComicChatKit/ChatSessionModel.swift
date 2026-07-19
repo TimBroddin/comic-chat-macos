@@ -85,8 +85,10 @@ public struct WhisperLine: Sendable, Equatable {
 /// Live-fix 1 (crypthome.com, live-reproduced): `rooms`/`roomOrder` are keyed
 /// by `ChatSessionModel.roomKey(_:)` — a case-folded canonical form — NOT the
 /// raw channel string, since IRC channel names are case-insensitive
-/// (RFC 1459 §2.3.1) but our own bookkeeping used to be byte-exact, so a
-/// server that echoes `JOIN #crypt` back as `#Crypt` (a real, observed
+/// (RFC 1459 §2.3.1) but our own bookkeeping used to be byte-exact (and, pre
+/// live-fix 6, so was the ENGINE's own channel<->room_token table — see
+/// `roomKey`'s own doc comment below for the current state of both layers),
+/// so a server that echoes `JOIN #crypt` back as `#Crypt` (a real, observed
 /// behavior) created a SECOND room box for the same channel. `displayName`
 /// carries the presentation-form name shown in the tab bar/strip title/wire
 /// calls — seeded from whatever casing FIRST created the box (typically our
@@ -314,19 +316,27 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// channel name for internal room-bookkeeping keys (`rooms`/`roomOrder`/
     /// `activeRoom`), matching IRC's case-insensitive channel-name rule
     /// (RFC 1459 §2.3.1: channels fold ASCII letters AND `[]\^` <->`{}|~`).
-    /// This is Swift-side-only: the C engine's own room-token table
-    /// (`bridge/cc_session.cpp`'s `cc_session_register_room`/
-    /// `ccSessionIsJoinedChannel`) does a byte-exact `==` comparison with NO
-    /// folding of its own (verified — no `tolower`/casemap helper exists
-    /// anywhere in `engine/ircsock.cpp`'s channel-comparison call sites), so
-    /// there is nothing on the engine side to "match" — the engine simply
-    /// keys its token table off whatever string Swift hands
-    /// `cc_session_register_room` via `ProtocolSession.join(_:)`. As long as
-    /// THIS type always calls `session.join`/`.part`/etc. with a single
-    /// consistent per-room string (this fix uses `displayName`, updated to
-    /// the server's own casing on `.selfJoined` — see `RoomBox`'s doc
-    /// comment), the engine's separate token table stays internally
-    /// consistent with no folding needed there.
+    ///
+    /// Plan 4b live-fix 6, Fix 1 update: the C engine's own room-token table
+    /// (`ccSessionRoomTokenForChannel`, `engine/ircsock.cpp`; mirrored by
+    /// `ccSessionIsJoinedChannel`, `bridge/cc_session.cpp`) is now ALSO
+    /// case-insensitive (`stricmp` — a plain ASCII fold, matching the
+    /// original's `LookupDoc`, chatdoc.cpp:2021-2031), closing a fidelity
+    /// gap where inbound events on a differently-cased channel (peer
+    /// messages/joins arriving before or between join-confirms, or naming a
+    /// THIRD casing the join-confirm never used) were stranded
+    /// session-scoped. The two layers do NOT need to agree on the exact fold
+    /// (`stricmp`'s plain ASCII vs. this method's RFC-1459-extended
+    /// `[]\^`<->`{}|~` fold) — this method re-folds whatever casing the
+    /// engine hands back through `roomKey` before ever comparing it to
+    /// `activeRoom` (see `handleLocked`'s `scopedKey = scopedRoom.map(roomKey)`),
+    /// so any case-insensitive engine fold is sufficient; only THIS type's
+    /// own fold needs to be the RFC-1459-correct one for keys/UI-visible
+    /// comparisons. The engine's token table still keys off whatever string
+    /// Swift last registered/renamed via `cc_session_register_room`/
+    /// `cc_session_update_room_channel` (`ProtocolSession.join(_:)`/the
+    /// `.selfJoined` rename path) — this method's own fold remains the
+    /// authority for Swift-side bookkeeping identity.
     private func roomKey(_ channel: String) -> String {
         var folded = channel.lowercased()
         // RFC 1459 §2.3.1's extended fold: `[]\^` <-> `{}|~` are the

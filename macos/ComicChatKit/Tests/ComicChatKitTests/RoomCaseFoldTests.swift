@@ -123,6 +123,61 @@ extension EngineGlobalStateSelfTests {
             server.stop()
         }
 
+        /// Plan 4b live-fix 6, Fix 1 (p4b-bugB-diagnosis.md): join with ONE
+        /// casing ("#crypt"), let the server confirm the JOIN under a SECOND
+        /// casing ("#Crypt" -- live-fix-1's `cc_session_update_room_channel`
+        /// rewrites the engine's registered channel string to this, in
+        /// place, on the join-confirm), and THEN have a peer's message name
+        /// a THIRD, still-different casing ("#CRYPT"). The join-confirm
+        /// rewrite alone cannot save this: the engine's channel table now
+        /// holds "#Crypt", byte-distinct from the wire's "#CRYPT" — only a
+        /// case-insensitive `ccSessionRoomTokenForChannel` (this fix)
+        /// resolves it to the joined room's token instead of stranding the
+        /// event session-scoped (`channel == nil`, never rendered — the
+        /// diagnosis's root cause).
+        @Test(.timeLimit(.minutes(1)))
+        func thirdCasingNeverSeenInJoinEchoStillRendersOnStrip() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "JefPober", room: "#crypt", artDir: art))
+            try await model.start()
+
+            try await server.startCollectingReceivedBytes()
+            try await server.waitForClientLine(containing: "MODE ISIRCX\r\n")
+            try await server.send(":srv 451 * :not registered")
+            try await server.waitForClientLine(containing: "USER ")
+            try await server.send(":srv 001 JefPober :Welcome")
+            try await server.waitForClientLine(containing: "JOIN #crypt\r\n")
+            // Join-confirm casing #2 -- "#Crypt" (matches live-fix-1's own
+            // scenario; the in-place rename now holds this casing).
+            try await server.send(
+                ":JefPober!jp@h JOIN :#Crypt",
+                ":srv 353 JefPober = #Crypt :JefPober",
+                ":srv 366 JefPober #Crypt :End of NAMES list")
+            try await pollUntil { model.roomInfos.first?.name == "#Crypt" }
+
+            // A THIRD casing, "#CRYPT", never registered nor join-echoed.
+            let panelsBefore = model.panelCount
+            try await server.send(":Tinkerbelle!belle@h PRIVMSG #CRYPT :Hi JefPober")
+            try await pollUntil { model.panelCount > panelsBefore }
+            #expect(model.panelCount > panelsBefore,
+                    "a message naming a THIRD channel casing (never seen in the join-confirm) must still render on the live strip")
+
+            #expect(model.roomInfos.count == 1,
+                    "the third-cased message must not spawn a new room tab either; got \(model.roomInfos.map(\.name))")
+
+            let transcript = model.transcript
+            let hasMessage = transcript.contains {
+                if case .text(_, _, _, let text, _, _) = $0 { return text == "Hi JefPober" }
+                return false
+            }
+            #expect(hasMessage, "the message must land in the (single) room's transcript")
+
+            model.shutdown()
+            server.stop()
+        }
+
         /// Polls `condition` (5ms cadence) until true; the test's own
         /// `.timeLimit` trait fails a never-true condition rather than hanging.
         private func pollUntil(_ condition: @escaping () -> Bool) async throws {

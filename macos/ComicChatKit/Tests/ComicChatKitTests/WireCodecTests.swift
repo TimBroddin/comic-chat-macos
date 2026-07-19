@@ -65,3 +65,51 @@ import Foundation
     #expect(WireCodec.decode(nil, encoding: .cp1252) == "")
     #expect(WireCodec.decode(UnsafePointer<CChar>?.none, len: 0, encoding: .cp1252) == "")
 }
+
+// Plan 4b live-fix 6, Fix 2 (RECORDED DEVIATION, modern-usability -- see
+// WireCodec.stripMircFormatting's doc comment for the fidelity check: the
+// 1998 original does NOT strip these codes; this is a Swift-display-boundary
+// deviation, never applied to wire bytes/outbound text/annotations).
+@Test func stripMircFormattingRemovesTheExactCapturedOrphanedColorDigit() {
+    // The exact live wire bytes from the task/diagnosis: 0x03 0x34 (color
+    // code "4", no background) followed by " Hi JefPober". Built from hex,
+    // not retyped, per the task's instruction.
+    let bytes: [UInt8] = [0x03, 0x34, 0x20, 0x48, 0x69, 0x20, 0x4A, 0x65, 0x66, 0x50, 0x6F, 0x62, 0x65, 0x72]
+    let decoded = WireCodec.decode(bytes, encoding: .cp1252)
+    #expect(decoded == "\u{03}4 Hi JefPober")   // decode itself must NOT strip (wire bytes stay intact)
+
+    let stripped = WireCodec.stripMircFormatting(decoded)
+    // Documented choice: strip the code (and its digit run) only; the space
+    // that followed it in the original text is real content, not part of
+    // the color code's own grammar, so it survives -- " Hi JefPober" (one
+    // leading space), not "Hi JefPober".
+    #expect(stripped == " Hi JefPober")
+}
+
+@Test func stripMircFormattingHandlesEveryControlCode() {
+    // 0x02 bold, 0x1F underline, 0x16 reverse, 0x0F reset -- all lone, no
+    // following digits to consume.
+    #expect(WireCodec.stripMircFormatting("\u{02}bold\u{02}") == "bold")
+    #expect(WireCodec.stripMircFormatting("\u{1F}under\u{1F}") == "under")
+    #expect(WireCodec.stripMircFormatting("\u{16}rev\u{16}") == "rev")
+    #expect(WireCodec.stripMircFormatting("plain\u{0F}reset") == "plainreset")
+}
+
+@Test func stripMircFormattingHandlesColorWithBackground() {
+    // "\x03<fg>,<bg>" -- 1-2 digits each side of the comma.
+    #expect(WireCodec.stripMircFormatting("\u{03}4,8red on gray") == "red on gray")
+    #expect(WireCodec.stripMircFormatting("\u{03}12,08two-digit both") == "two-digit both")
+    #expect(WireCodec.stripMircFormatting("\u{03}bare color, no digits") == "bare color, no digits")
+}
+
+@Test func stripMircFormattingLeavesPlainTextUntouched() {
+    let s = "Hello, World! No control codes here."
+    #expect(WireCodec.stripMircFormatting(s) == s)
+}
+
+@Test func stripMircFormattingDoesNotConsumeATrailingCommaWithNoBackgroundDigits() {
+    // "\x034," -- a foreground color immediately followed by a bare comma
+    // with NO background digits after it is not a valid "fg,bg" pair per
+    // mIRC's own grammar; the comma is ordinary text and must survive.
+    #expect(WireCodec.stripMircFormatting("\u{03}4,hi") == ",hi")
+}
