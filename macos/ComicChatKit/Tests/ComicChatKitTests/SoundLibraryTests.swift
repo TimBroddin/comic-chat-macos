@@ -133,4 +133,51 @@ struct SoundLibraryTests {
 
         #expect(resolved == nil)
     }
+
+    // MARK: - list() (outbound-sound task: the Send Sound picker's enumeration)
+
+    @Test func listReturnsWavBasenamesSortedCaseInsensitively() throws {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Data("RIFF".utf8).write(to: dir.appendingPathComponent("zebra.wav"))
+        try Data("RIFF".utf8).write(to: dir.appendingPathComponent("Apple.wav"))
+        try Data("RIFF".utf8).write(to: dir.appendingPathComponent("banana.WAV"))
+
+        let library = SoundLibrary(folder: dir)
+        let names = library.list()
+
+        #expect(names == ["Apple", "banana", "zebra"])
+    }
+
+    @Test func listExcludesMidiFiles() throws {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Data("RIFF".utf8).write(to: dir.appendingPathComponent("boing.wav"))
+        try Data("MThd".utf8).write(to: dir.appendingPathComponent("chime.mid"))
+
+        let library = SoundLibrary(folder: dir)
+        let names = library.list()
+
+        #expect(names == ["boing"])
+    }
+
+    @Test func listOnNonexistentFolderReturnsEmptyRatherThanCrashing() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sound-library-tests-never-created-\(UUID().uuidString)")
+
+        let library = SoundLibrary(folder: dir)
+        let names = library.list()
+
+        #expect(names == [])
+    }
+
+    @Test func listOnEmptyFolderReturnsEmpty() throws {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let library = SoundLibrary(folder: dir)
+        let names = library.list()
+
+        #expect(names == [])
+    }
 }

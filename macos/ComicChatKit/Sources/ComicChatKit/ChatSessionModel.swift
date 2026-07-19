@@ -442,6 +442,20 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// removes (at most) one matching entry per server-originated `.text`
     /// with our own nick.
     private var pendingLocalEchoes: [String] = []
+    /// The `.sound` sibling of `pendingLocalEchoes` above (outbound-sound
+    /// task). `sendSound` already renders/plays the own sound immediately via
+    /// a synthetic local `.sound` event (see that method's doc comment) — a
+    /// server echo of the SAME sound line (round-tripping back through this
+    /// engine's own `ccPrepareSound` parser, same as any other self-sent
+    /// PRIVMSG some servers echo) must be dropped rather than played/appended
+    /// a second time. Keyed on `file` alone (not `file+text`): unlike `send`'s
+    /// free-form message text, sound's `text` argument is near-always empty
+    /// in this UI (the picker never asks for one, matching the original's
+    /// dialog default), so two back-to-back sends of the SAME file with
+    /// different text would be a rare, deliberately-distinct case anyway —
+    /// `file` is the wire-identifying field (`ccPrepareSound`'s `outFile`) and
+    /// is what actually drives playback, so it's the correct dedup key.
+    private var pendingLocalSoundEchoes: [String] = []
     /// Engine-queue-local mirror of `session.ownNick`, kept in sync from the
     /// same events `ProtocolSession` itself uses (`.loggedIn`, `.nickChanged`
     /// with `isSelf`). Exists ONLY so `handleLocked`'s echo-dedup check
@@ -998,6 +1012,18 @@ public final class ChatSessionModel: @unchecked Sendable {
            fromServer, nick == currentOwnNick,
            let i = pendingLocalEchoes.firstIndex(of: text) {
             pendingLocalEchoes.remove(at: i)
+            return
+        }
+
+        // Own-sound echo dedup (outbound-sound task, same shape as the
+        // own-say dedup just above): `sendSound` already rendered/played the
+        // own line via a synthetic local `.sound` event; drop exactly one
+        // server copy per pending send, BEFORE the transcript append, same
+        // reflow-safety reasoning as the `.text` case.
+        if case .sound(let nick, let file, _) = ev,
+           fromServer, nick == currentOwnNick,
+           let i = pendingLocalSoundEchoes.firstIndex(of: file) {
+            pendingLocalSoundEchoes.remove(at: i)
             return
         }
 
@@ -2288,6 +2314,48 @@ public final class ChatSessionModel: @unchecked Sendable {
         // 7) so it lands in that room's transcript and renders on the live
         // strip when that room is active (own-say is never counted unread —
         // `handleLocked`'s message-vs-active gate handles a background target).
+        enqueueHandle(synthetic, channel: targetRoom, fromServer: false)
+    }
+
+    // MARK: - Send Sound (outbound-sound task)
+
+    /// Send Sound: sends `\x01SOUND "<file>" <text>\x01` to the ACTIVE room
+    /// (`session.sendSound`, `cc_session_send_sound`) and renders/plays the
+    /// own line the SAME WAY an inbound `.sound` event does — the original
+    /// plays the sound locally too (sounddlg.cpp:416-434's dialog is
+    /// "browse, preview, and send" — sending always includes local playback,
+    /// not just an announce) — by enqueueing a synthetic `.sound` event
+    /// through the SAME `handleLocked` path an inbound `CC_EV_SOUND` takes,
+    /// so `onSound`'s callback (and therefore `AppState.playSound`'s
+    /// settings-gated `AVAudioPlayer`) fires identically for both directions;
+    /// there is no separate/parallel playback call here.
+    ///
+    /// `text` mirrors `send`'s free-form message parameter but defaults to
+    /// `""` — the picker UI (a simple "browse your sounds folder and send"
+    /// popover, no message-composition field) never supplies one, matching
+    /// the original dialog's own "just pick a sound" common path; a caller
+    /// that DOES have accompanying text may still pass it.
+    public func sendSound(file: String, text: String = "") async throws {
+        // Same `config`/`activeRoom` read-hazard fix as `send(_:mode:)`'s own
+        // doc comment (Plan 4b Task 5/7: both are engine-queue-owned).
+        let targetRoom: String = session.performOnEngineQueue { [self] in
+            rooms[activeRoom]?.displayName ?? activeRoom
+        }
+        try await session.sendSound(targetRoom, file: file, text: text)
+        // Registered BEFORE the synthetic event is enqueued -- same ordering
+        // reasoning as `send(_:mode:)`'s own doc comment: a server echo of
+        // this same sound line can only arrive after `session.sendSound`
+        // above has already put the PRIVMSG on the wire, so the pending
+        // entry always exists first regardless of how the two async paths
+        // interleave.
+        engineQueue.async { [weak self] in self?.pendingLocalSoundEchoes.append(file) }
+        let ownNick = session.ownNick
+        let synthetic = ProtocolEvent.sound(nick: ownNick, file: file, text: text)
+        // Route through the target room's channel (Plan 4b Task 7, same
+        // posture as `send(_:mode:)`) so it lands in that room's transcript
+        // and — via `handleLocked`'s `.sound` case — fires `onSound`
+        // regardless of which room is currently active (playback is
+        // session-level, matching the inbound case's own posture).
         enqueueHandle(synthetic, channel: targetRoom, fromServer: false)
     }
 

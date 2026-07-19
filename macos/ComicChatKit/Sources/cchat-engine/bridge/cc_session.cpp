@@ -565,6 +565,37 @@ int32_t cc_session_announce_avatar(cc_session* h, uint32_t room_token, const cha
     return rc;
 }
 
+// --- cc_session_send_sound (Plan 4b outbound-sound task) --------------------
+// See comicchat.h's doc comment for the full finding/grammar citation. Builds
+// "\x01SOUND \"<file>\" <text>\x01" byte-for-byte per bChatSendSound's sprintf
+// (protsupp.cpp:3349) and sends it as the MESSAGE argument (not annotations)
+// via bChatSendToChannel with uModes=BM_SOUND, mirroring the original's
+// non-whisper branch (saywnd.cpp:889's `else bChatSendSound(..., BM_SAY,
+// NULL)` -- BM_SAY there names the ANNOTATION mode for the visual "action"
+// echo line, not the wire uModes passed to bChatSendToChannel, which the
+// original hardcodes to BM_SOUND at protsupp.cpp:3363-3364; this bridge
+// reproduces that same hardcoded BM_SOUND).
+int32_t cc_session_send_sound(cc_session* h, uint32_t room_token, const char* file, const char* text) {
+    CCSession* s = reinterpret_cast<CCSession*>(h);
+    if (!s || !file || !*file) return 1;
+    g_session = s;
+    int32_t rc = 1;
+    if (ccSessionSelectRoom(s, room_token)) {
+        char payload[512];
+        // g_nSoundLen (6) is soundID's byte length ("\x01SOUND", no trailing
+        // space -- ircproto.h:105/92); the format below supplies the space
+        // itself, exactly like the original's "%.*s %s %s%c".
+        int n = snprintf(payload, sizeof(payload), "%.*s \"%s\" %s%c",
+                          g_nSoundLen, soundID, file, text ? text : "", 0x1);
+        if (n < 0) n = 0;
+        if ((size_t)n >= sizeof(payload)) n = (int)sizeof(payload) - 1;
+        BOOL ok = s->proto.bChatSendToChannel(nullptr, payload, nullptr, BM_SOUND, ccSessionGetOwnIdentity);
+        rc = ok ? 0 : 1;
+    }
+    g_session = nullptr;
+    return rc;
+}
+
 int32_t cc_session_send_whisper(cc_session* h, uint32_t room_token, const cc_annotations* ann, const char* text, const char* const* nicks, int32_t nick_count) {
     CCSession* s = reinterpret_cast<CCSession*>(h);
     if (!s || !text || !nicks || nick_count <= 0) return 1;

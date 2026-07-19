@@ -31,8 +31,15 @@ struct ComposeBar: View {
     /// pass one (none currently exist, but kept optional-shaped) behave
     /// exactly as before this task.
     var selectedMembers: Set<String> = []
+    /// The user's sounds folder (outbound-sound task, `settings.soundsFolder`)
+    /// — plain `String`, not `AppState`, so this view stays testable/preview-
+    /// able without an `@Environment` dependency (matches this file's existing
+    /// posture of taking plain values, per `ChatWindow`'s own doc comment
+    /// about `ComicStripView`'s parameter-passing contract).
+    var soundsFolder: String = ""
 
     @State private var mode: SendMode = .say
+    @State private var showSoundPicker = false
 
     var body: some View {
         HStack {
@@ -46,6 +53,21 @@ struct ComposeBar: View {
             .pickerStyle(.segmented)
             .frame(width: 180)
             .labelsHidden()
+            // Send Sound (outbound-sound task): a compact popover matching
+            // the original's CSoundDlg spirit (browse the sounds folder,
+            // send one) without a whole separate dialog window — the folder
+            // is small/local (no rating/search UI the original dialog had,
+            // R20: those are a full-file-browser concern, not core to
+            // "pick a sound and send it").
+            Button {
+                showSoundPicker = true
+            } label: {
+                Image(systemName: "speaker.wave.2")
+            }
+            .help("Send Sound…")
+            .popover(isPresented: $showSoundPicker) {
+                SoundPickerPopover(soundsFolder: soundsFolder, model: model)
+            }
             Button("Send", action: send).keyboardShortcut(.defaultAction)
         }
         .padding(8)
@@ -70,5 +92,67 @@ struct ComposeBar: View {
         // but stable and predictable.
         let addressees = selectedMembers.sorted()
         Task { try? await model.send(text, mode: sendMode, addressees: addressees) }
+    }
+}
+
+/// The Send Sound popover's contents: lists every `.wav` in `soundsFolder`
+/// (`SoundLibrary.list()`, outbound-sound task) with a Send button per row,
+/// and an empty state that reveals the folder in Finder (mirrors
+/// `SoundsSettingsView.revealSoundsFolder`'s own "ensure it exists, then
+/// show it" posture) when there's nothing to send yet — the common first-run
+/// case, since the folder ships empty (D1 §4.2, `SoundLibrary`'s own doc
+/// comment: no bundled WAVs exist anywhere in this repo's trees).
+private struct SoundPickerPopover: View {
+    @Environment(\.dismiss) private var dismiss
+    let soundsFolder: String
+    let model: ChatSessionModel?
+
+    @State private var names: [String] = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if names.isEmpty {
+                VStack(spacing: 8) {
+                    Text("No Sounds")
+                        .font(.headline)
+                    Text("Drop .wav files into your sounds folder, then reopen this menu.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    Button("Open Sounds Folder") { revealSoundsFolder() }
+                }
+                .padding()
+                .frame(width: 260)
+            } else {
+                List(names, id: \.self) { name in
+                    HStack {
+                        Text(name)
+                        Spacer()
+                        Button("Send") { sendSound(name) }
+                    }
+                }
+                .frame(width: 260, height: min(CGFloat(names.count) * 28 + 16, 320))
+            }
+        }
+        .task { reload() }
+    }
+
+    private func reload() {
+        guard !soundsFolder.isEmpty else { return }
+        let folder = URL(fileURLWithPath: soundsFolder, isDirectory: true)
+        names = SoundLibrary(folder: folder).list()
+    }
+
+    private func sendSound(_ name: String) {
+        guard let model else { return }
+        Task { try? await model.sendSound(file: name) }
+        dismiss()
+    }
+
+    private func revealSoundsFolder() {
+        guard !soundsFolder.isEmpty else { return }
+        let url = URL(fileURLWithPath: soundsFolder, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 }

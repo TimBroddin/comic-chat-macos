@@ -248,9 +248,15 @@ void cc_set_metrics_canvas(cc_canvas* canvas);
  * concurrent calls are undefined behavior. The Swift Strip wrapper (Task 11)
  * documents and enforces the same single-threaded contract.
  *
- * Modes mirror defines.h BM_* values exactly (defines.h:63-66). */
+ * Modes mirror defines.h BM_* values exactly (defines.h:63-67). CC_MODE_SOUND
+ * (Plan 4b outbound-sound task, append-only) mirrors BM_SOUND (0x0010) -- it
+ * is not a mode cc_session_send_say/send_whisper are meant to be called with
+ * (those two never compose the SOUND CTCP themselves, see
+ * cc_session_send_sound's doc comment); it exists so callers/tests can name
+ * the bit symbolically when inspecting `modes`/wire behavior. */
 enum { CC_MODE_SAY = 0x0001, CC_MODE_WHISPER = 0x0002,
-       CC_MODE_THINK = 0x0004, CC_MODE_ACTION = 0x0008 };
+       CC_MODE_THINK = 0x0004, CC_MODE_ACTION = 0x0008,
+       CC_MODE_SOUND = 0x0010 };
 
 /* ---- Annotation codec (Plan 3 Task 3) --------------------------------------
  * Decoded comic annotation block ("User Display Info"). Values are indices,
@@ -882,6 +888,62 @@ int32_t cc_session_login(cc_session* s);
 int32_t cc_session_announce_avatar(cc_session* s, uint32_t room_token,
                                    const char* to_nick, const char* name,
                                    const char* url);
+
+/* Plan 4b outbound-sound task: the Swift-driven equivalent of
+ * bChatSendSound (v2.5-beta-1-modern/protsupp.cpp:3292-3409 -- READ-ONLY
+ * original; the lifted engine's protsupp.cpp only ever ported the RECEIVE
+ * side of SOUND, ccPrepareSound -- there is no bChatSendSound in this
+ * port's engine/protsupp.cpp at all, same structural gap
+ * cc_session_announce_avatar's own doc comment documents for
+ * ChatAnnounceNewAvatar). This is a bridge-side reimplementation, not an
+ * un-wrap, following that same precedent.
+ *
+ * FINDING (recorded per the task brief): cc_session_send_say/send_whisper do
+ * NOT compose the SOUND CTCP for a caller that merely passes CC_MODE_SOUND/
+ * BM_SOUND as `modes` -- they hand `text` straight through as bChatSendToTarget's
+ * `szMesg` parameter unmodified (see cc_session.cpp's own bodies). In the
+ * original, the CTCP framing is built by bChatSendSound itself, BEFORE
+ * bChatSendToChannel is ever called -- bChatSendToChannel/bChatSendToTarget
+ * only chunk/wrap an ALREADY-composed message, they never build the
+ * "\x01SOUND ...\x01" bytes from a bare filename. So a dedicated builder is
+ * required; this function is that builder.
+ *
+ * WIRE GRAMMAR (byte-for-byte from bChatSendSound's sprintf,
+ * protsupp.cpp:3349: `sprintf(GetOutBuff(), "%.*s %s %s%c", g_nSoundLen,
+ * soundID, szQuotedSnd, szControlFull ? szControlFull : szMesg, 0x1)`):
+ *   \x01SOUND "<file>" <text>\x01
+ * `file` is wrapped in literal double-quotes here (matching the selftest's
+ * VECTOR 17 ground truth, cc_selftest_pv_sound_ctcp: `:Bob!bob@h PRIVMSG
+ * #comicrig :\x01SOUND "boing.wav"\x01`) -- the quoted form needs no CTCP
+ * low-level escaping (histent.cpp's CTCPQuoteString, out of this lifted
+ * engine's scope, same deviation ccPrepareSound's own doc comment records
+ * for the receive side) and matches ccPrepareSound's quoted-filename parse
+ * branch exactly, so a self-send round-trips through this engine's own
+ * inbound parser. `text` may be empty (an empty trailing message is legal --
+ * ccPrepareSound's parser only special-cases an EMPTY szSound, i.e. no
+ * filename at all, not an empty message).
+ *
+ * Sent via CIrcProto::bChatSendToChannel with `uModes = BM_SOUND` (so the
+ * ALREADY-lifted verbatim multi-chunk fallback in bChatSendToTarget --
+ * ircproto.cpp's `case BM_SOUND: nPrefixLen = g_nSoundLen + 1` branch, and
+ * the "re-prefix following chunks as ACTION" continuation logic just below
+ * it -- applies for free to an oversized sound line, exactly as it does in
+ * the original). No whisper form (the original's whisper-sound path,
+ * saywnd.cpp's `bWhisperInBox(... BM_WHISPER|BM_SOUND)`, is out of this
+ * task's scope -- the brief only asks for "sends to the ACTIVE room").
+ *
+ * Local playback is NOT this function's job (R20/R21 posture, matching
+ * cc_session_announce_avatar's own connection-status-gating precedent) --
+ * bFindAndPlaySound is UI-side; Swift's ChatSessionModel.sendSound plays the
+ * file locally itself and fires the same onSound callback path the inbound
+ * CC_EV_SOUND case uses, per the task brief.
+ *
+ * 0 = ok, non-zero on a NULL session, NULL/empty `file`, or an unknown/
+ * unregistered room_token. `text` NULL is treated as "" (an empty trailing
+ * message), matching cc_session_send_say's NULL-annotations posture of
+ * tolerating an absent optional field rather than failing. */
+int32_t cc_session_send_sound(cc_session* s, uint32_t room_token,
+                              const char* file, const char* text /*nullable*/);
 
 #ifdef __cplusplus
 }

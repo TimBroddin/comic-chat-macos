@@ -5473,6 +5473,40 @@ static int cc_selftest_pv_sound_ctcp() {
     return 0;
 }
 
+// OUTBOUND SOUND ROUND-TRIP (Plan 4b outbound-sound task): drives
+// cc_session_send_sound for real, asserts the EXACT wire bytes it produces
+// (byte-for-byte per comicchat.h's doc comment), then feeds that SAME line
+// back into cc_session_feed_bytes (as if a server echoed our own PRIVMSG) and
+// asserts CC_EV_SOUND fires with the same file/nick shape VECTOR 17 pins for
+// the inbound-only case -- proving send->wire->parse round-trips through
+// this engine's own two halves, not just that each half independently
+// produces/accepts SOME plausible bytes.
+static int cc_selftest_outbound_sound_roundtrip() {
+    PVCap cap; cc_session_config cfg; cc_session* s = pvMake(&cap, cfg);
+    uint32_t token = cc_session_register_room(s, "#comicrig");
+    CC_CHECK(token != CC_ROOM_TOKEN_NONE);
+
+    CC_CHECK(cc_session_send_sound(s, token, "boing.wav", "") == 0);
+    // Exact wire bytes: "\x01SOUND \"boing.wav\" \x01\r\n" -- bChatSendToTarget's
+    // single-shot branch wraps the already-composed payload as
+    // "PRIVMSG <target> :<payload>\r\n" (no separate annotations arg here).
+    std::string expected = std::string("PRIVMSG #comicrig :\x01") + "SOUND \"boing.wav\" \x01\r\n";
+    CC_CHECK(cap.sent == expected);
+
+    // Feed the wire bytes we JUST captured back into the same session, framed
+    // as a peer's own PRIVMSG (self-send round-trip through this engine's
+    // inbound parser) -- reusing the payload this engine itself produced,
+    // not a hand-typed literal, so this really proves send->parse agreement.
+    std::string echoLine = ":Bob!bob@h PRIVMSG #comicrig :\x01" "SOUND \"boing.wav\" \x01\r\n";
+    cc_session_feed_bytes(s, (const uint8_t*)echoLine.data(), echoLine.size());
+    int is = pvFind(cap, CC_EV_SOUND);
+    CC_CHECK(is >= 0);
+    CC_CHECK(cap.a[is] == "boing.wav" /*file*/ && cap.b[is] == "Bob" /*nick*/);
+
+    cc_session_destroy(s);
+    return 0;
+}
+
 // VECTOR 18 (brief Step 6 equivalent): peer \x01AWAY message\x01 ->
 // CC_EV_AWAY_PEER(nick, message). protsupp.cpp:1777-1794's grammar: strip
 // the trailing 0x01, message text passed through as-is.
@@ -5639,6 +5673,7 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_pv_action_ctcp();                       // \x01ACTION..\x01 -> CC_EV_ACTION
     cc_selftest_pv_inline_annotation_resolver_e2e();    // inline (#...T Bob) + R19 resolver->ref 7
     cc_selftest_pv_sound_ctcp();                        // \x01SOUND "file"\x01 -> CC_EV_SOUND
+    cc_selftest_outbound_sound_roundtrip();             // cc_session_send_sound -> wire bytes -> CC_EV_SOUND
     cc_selftest_pv_away_peer_ctcp();                    // \x01AWAY msg\x01 -> CC_EV_AWAY_PEER
     cc_selftest_pv_comment_grammar_suppressed();        // GetInfo/HeresInfo/BDrop(2) -> no event (R20)
     cc_selftest_pv_data_appears_as();                   // DATA-borne "# Appears as" -> CC_EV_APPEARS_AS

@@ -63,7 +63,8 @@ struct ChatWindow: View {
                     }
                     Divider()
                     ComposeBar(composeText: $composeText, model: appState.model,
-                              selectedMembers: appState.selectedMembers)
+                              selectedMembers: appState.selectedMembers,
+                              soundsFolder: appState.settings.soundsFolder)
                     Text(appState.statusLine)
                         .font(.caption).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)

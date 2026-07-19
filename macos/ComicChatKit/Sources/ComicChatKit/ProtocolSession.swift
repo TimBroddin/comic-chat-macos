@@ -582,6 +582,28 @@ public final class ProtocolSession: @unchecked Sendable {
         }
     }
 
+    /// Outbound Send Sound ("\x01SOUND \"<file>\" <text>\x01", `cc_session_send_sound`
+    /// — see that C function's comicchat.h doc comment for the full wire-grammar
+    /// citation and the "cc_session_send_say doesn't compose this CTCP" finding
+    /// that makes a dedicated builder necessary). `text` defaults to "" (an
+    /// empty trailing message, matching the picker's common "just send the
+    /// sound" case) — `cc_session_send_sound` treats a NULL `text` the same
+    /// way, so passing `""` here is purely a Swift-side convenience default,
+    /// not a distinct wire form.
+    public func sendSound(_ channel: String, file: String, text: String = "") async throws {
+        try await onQueueGated { s in
+            guard let token = self.roomTokenFor(channel) else {
+                throw ProtocolSessionError.commandFailed("sendSound: unknown channel \(channel)")
+            }
+            let rc = self.withEncodedCString(file) { filePtr in
+                self.withEncodedCString(text) { textPtr in
+                    cc_session_send_sound(s, token, filePtr, textPtr)
+                }
+            }
+            guard rc == 0 else { throw ProtocolSessionError.commandFailed("sendSound failed") }
+        }
+    }
+
     /// Outbound avatar announce ("# Appears as <name>" / "# Appears as
     /// <name>.<url>", `cc_session_announce_avatar` — see that C function's
     /// comicchat.h doc comment for the full grammar/lift rationale). `toNick`

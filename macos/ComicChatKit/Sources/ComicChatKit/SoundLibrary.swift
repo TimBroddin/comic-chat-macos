@@ -67,4 +67,28 @@ public struct SoundLibrary: Sendable {
         }
         return nil
     }
+
+    /// Lists every `.wav` basename (without extension) in `folder`, for the
+    /// Send Sound picker popover (outbound-sound task) — the enumeration half
+    /// of this type's existing resolve-half (`resolve(_:)` above). Sorted
+    /// case-insensitively for a stable, predictable popover row order (folder
+    /// listing order is filesystem-dependent, not user-meaningful).
+    ///
+    /// `.wav`-only, matching `resolve`'s own MIDI-dropped posture (spec §5) —
+    /// a `.mid` file in the same folder is never listed. Returns `[]` (not a
+    /// crash) for a missing/unreadable folder — same "ships empty until the
+    /// user drops files in" posture as `resolve`'s own doc comment describes,
+    /// so a fresh install's popover shows the empty state rather than
+    /// erroring.
+    public func list() -> [String] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: nil
+        ) else {
+            return []
+        }
+        return entries
+            .filter { $0.pathExtension.caseInsensitiveCompare("wav") == .orderedSame }
+            .map { $0.deletingPathExtension().lastPathComponent }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
 }
