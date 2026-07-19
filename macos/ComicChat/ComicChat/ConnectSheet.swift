@@ -190,7 +190,10 @@ struct ConnectSheet: View {
                         Spacer()
                         protocolBadge(server.protocolNote)
                     }
-                    Text("\(server.host):\(server.port)")
+                    // verbatim: Text's LocalizedStringKey interpolation
+                    // locale-groups Ints ("6,667") -- the same defect class as
+                    // the 4a T10 port-field fix (.grouping(.never), line 86).
+                    Text(verbatim: "\(server.host):\(server.port)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text(server.blurb)
