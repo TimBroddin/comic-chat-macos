@@ -228,6 +228,89 @@ extension EngineGlobalStateSelfTests {
     }
 }
 
+extension EngineGlobalStateSelfTests {
+    @Suite(.serialized)
+    struct GetInfoWhoLoopbackTests {
+        /// Fix round 1 (review Important #2): `getInfo`/`.whoResult` had zero
+        /// loopback coverage. `getInfo("Bob")` is `ProtocolSession.who(_:)`
+        /// (ChatSessionModel.swift:1493-1494) -- there is no `whois` builder
+        /// on the outbound surface, so Get Info rides the WHO query. Confirms:
+        /// (1) the wire carries "WHO Bob", (2) a real RPL_WHOREPLY (352) line
+        /// shaped exactly as the engine parser expects --
+        /// ":srv 352 <me> <channel> <user> <host> <server> <nick> <flags>
+        /// :<hops> <realname>" -- drives `onUserInfo` with (nick, a formatted
+        /// string containing the user/host), and (3) the end-of-WHO (315)
+        /// closes the query without a second `onUserInfo` firing.
+        ///
+        /// Arg-layout citation (ircsock.cpp RPL_WHOREPLY handler,
+        /// cchat-engine/engine/ircsock.cpp:1640-1667): `pParse->args[0]` is
+        /// the numeric itself (`NGetCmd(pParse->args[0])` at line 553 proves
+        /// args are 0-indexed from the command, not the prefix), so for this
+        /// line args[2]="#comicrig" (channel), args[3]="bob" (user),
+        /// args[4]="bob.host" (host), args[6]="Bob" (nick) -- matching the
+        /// handler's `pParse->args[2]`/`args[3]`/`args[4]`/`args[6]` reads and
+        /// requiring `nArgs >= 8`, satisfied by the 8 space-separated tokens
+        /// before the trailing `:<hops> <realname>`.
+        @Test(.timeLimit(.minutes(1)))
+        func getInfoRoundTripsThroughWhoReply() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#comicrig", artDir: art))
+            let box = UserInfoBox()
+            model.onUserInfo = { nick, text in box.append((nick, text)) }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#comicrig")
+
+            try await model.getInfo("Bob")
+            try await server.waitForClientLine(containing: "WHO Bob")
+
+            try await server.send(
+                ":srv 352 Mac #comicrig bob bob.host irc.example Bob H :0 Bob Realname",
+                ":srv 315 Mac Bob :End of WHO list")
+
+            try await pollUntil { box.count >= 1 }
+            // Give a wrongly-doubled firing (e.g. 315 also emitting) a chance
+            // to land before asserting the count.
+            try await Task.sleep(nanoseconds: 100_000_000)
+            #expect(box.count == 1, "onUserInfo must fire exactly once per WHO round-trip, got \(box.count)")
+            let (nick, text) = box.all().first ?? ("", "")
+            #expect(nick == "Bob")
+            #expect(text.contains("bob"), "formatted onUserInfo text must contain the WHO reply's user; got: \(text)")
+            #expect(text.contains("bob.host"), "formatted onUserInfo text must contain the WHO reply's host; got: \(text)")
+
+            model.shutdown()
+            server.stop()
+        }
+
+        private func pollUntil(_ condition: @escaping () -> Bool) async throws {
+            while !condition() {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+        }
+    }
+}
+
+/// Thread-safe accumulator for `onUserInfo`'s delivered `(nick, formatted)`
+/// results, in delivery order (same lock-guarded-box shape as `RoomListBox`
+/// below / `ChatSessionModelTests`'s `MembersBox`).
+private final class UserInfoBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [(String, String)] = []
+    func append(_ item: (String, String)) {
+        lock.lock(); defer { lock.unlock() }
+        storage.append(item)
+    }
+    func all() -> [(String, String)] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return storage.count
+    }
+}
+
 /// Thread-safe accumulator for `onRoomList`'s delivered snapshots, in
 /// delivery order (same lock-guarded-box shape as `ChatSessionModelTests`'
 /// `MembersBox`).

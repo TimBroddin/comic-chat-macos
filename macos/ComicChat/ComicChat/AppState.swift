@@ -26,6 +26,12 @@ public final class AppState {
     /// or `nil` before connect. Derived from `rooms` (the active one), kept as
     /// a convenience for the tab bar's selection binding.
     public var activeRoom: String? { rooms.first { $0.isActive }?.name }
+    /// The active room name as of the LAST `onRoomsChanged` delivery (Fix
+    /// round 1, review Important #1) — lets `handleRoomsChanged` detect when
+    /// the active room actually CHANGES (vs. an unrelated `rooms` update,
+    /// e.g. an unread-count bump) so it clears `selectedMembers` exactly
+    /// once per real switch, not on every snapshot.
+    private var lastKnownActiveRoom: String?
     /// Bound to the Enter Room sheet's text field (⌘J / RoomTabBar "+").
     public var showEnterRoomSheet = false
     public var enterRoomText = ""
@@ -77,18 +83,24 @@ public final class AppState {
     /// "Go To" a room from the LIST browser (Plan 4b Task 8): join + activate
     /// (opens a NEW tab — no part-first, `ChatSessionModel.goToRoom`'s own doc
     /// comment). Normalizes a bare name the same way `joinRoom(_:)` does.
+    ///
+    /// Fix round 1 (review Important #1): no longer clears `selectedMembers`
+    /// here directly — see `onRoomsChanged`'s doc comment for why the
+    /// chokepoint moved there.
     public func goToRoom(_ raw: String) {
         guard let channel = normalizedChannel(raw), let model else { return }
-        selectedMembers = []   // per-room addressee state — see setActiveRoom's doc comment
         Task { try? await model.goToRoom(channel) }
     }
 
     /// Creates a room and goes to it (Plan 4b Task 8, the Create Room… sheet):
     /// `createRoom` (the wire CREATE, which server-side joins us) then
     /// `goToRoom` opens the tab locally the same way any other join does.
+    ///
+    /// Fix round 1 (review Important #1): no longer clears `selectedMembers`
+    /// here directly — see `onRoomsChanged`'s doc comment for why the
+    /// chokepoint moved there.
     public func createRoom(_ raw: String) {
         guard let channel = normalizedChannel(raw), let model else { return }
-        selectedMembers = []   // per-room addressee state — see setActiveRoom's doc comment
         Task {
             try? await model.createRoom(channel)
             try? await model.goToRoom(channel)
@@ -220,14 +232,44 @@ public final class AppState {
     /// Switches the one live strip to `room` (Plan 4b Task 7) — the tab bar's
     /// tap handler. Fire-and-forget on the model (engine-queue-hopped there).
     ///
-    /// Plan 4b Task 8 self-review fix: clears `selectedMembers` — the
-    /// member-list selection is per-room addressee state (D1 §1.5); carrying
-    /// a stale selection across a tab switch would silently address whoever
-    /// happened to share those nicks (or no one) in the NEW room's member
-    /// list on the next send.
+    /// Fix round 1 (review Important #1): no longer clears `selectedMembers`
+    /// here directly — see `onRoomsChanged`'s doc comment for why the
+    /// chokepoint moved there.
     public func setActiveRoom(_ room: String) {
-        selectedMembers = []
         model?.setActiveRoom(room)
+    }
+
+    /// THE single chokepoint (Fix round 1, review Important #1) for clearing
+    /// `selectedMembers` on an active-room change. Wired to
+    /// `ChatSessionModel.onRoomsChanged` in `connect()` — every path that
+    /// changes the active room ends up here, because `onRoomsChanged`/
+    /// `emitRooms()` fires on every one of them (`setActiveRoom`, `goToRoom`,
+    /// `createRoom`, and — the bug this fixes — `ChatSessionModel.leaveRoom`'s
+    /// OWN internal fallback-activation of a surviving room when the CLOSED
+    /// tab was the active one, which reassigns the active room without ever
+    /// routing back through `AppState.setActiveRoom`).
+    ///
+    /// Previously each call site (`setActiveRoom`/`goToRoom`/`createRoom`)
+    /// cleared `selectedMembers` itself. That missed `leaveRoom`'s fallback
+    /// activation entirely: closing the ACTIVE room's tab carries the stale
+    /// nick selection into whichever room the model falls back to, silently
+    /// addressing whoever happens to share those nicks (or no one) on the
+    /// next send. Moving the clear here, keyed on the active room NAME
+    /// actually changing between deliveries, covers every path uniformly
+    /// (including `leaveRoom`) and removes the need to remember to clear it
+    /// at each new call site.
+    ///
+    /// `disconnect()` keeps its OWN clear (not covered here): the rooms list
+    /// empties there without necessarily routing through this handler for a
+    /// final "no active room" transition, and it also resets
+    /// `lastKnownActiveRoom` so a fresh connect starts clean.
+    private func handleRoomsChanged(_ infos: [RoomInfo]) {
+        rooms = infos
+        let newActive = infos.first { $0.isActive }?.name
+        if newActive != lastKnownActiveRoom {
+            selectedMembers = []
+        }
+        lastKnownActiveRoom = newActive
     }
 
     /// Joins an ADDITIONAL room on the same connection (Plan 4b Task 7) — the
@@ -339,7 +381,7 @@ public final class AppState {
         m.onWhisper = { [weak self] peer, line in
             Task { @MainActor in self?.recordWhisper(peer: peer, line: line) } }
         m.onRoomsChanged = { [weak self] infos in
-            Task { @MainActor in self?.rooms = infos } }
+            Task { @MainActor in self?.handleRoomsChanged(infos) } }
         m.onRoomList = { [weak self] items in Task { @MainActor in self?.roomList = items } }
         m.onSelfOp = { [weak self] isOp in Task { @MainActor in self?.selfIsOp = isOp } }
         m.onUserInfo = { [weak self] nick, text in
@@ -380,7 +422,16 @@ public final class AppState {
         roomList = []
         selfIsOp = false
         isAway = false
+        // Kept here even though `handleRoomsChanged` is the chokepoint for
+        // every OTHER active-room transition (Fix round 1): `rooms = []`
+        // above may not route back through `onRoomsChanged`/
+        // `handleRoomsChanged` at all (no model to fire it once `shutdown()`
+        // has run), so this is the one path that still needs its own
+        // explicit clear. Also resets `lastKnownActiveRoom` so a fresh
+        // `connect()` starts from a clean "no room seen yet" state rather
+        // than comparing against a stale name from the torn-down session.
         selectedMembers = []
+        lastKnownActiveRoom = nil
         memberIconCache = [:]
         inFlightMemberIconResolves = []
         userInfoResult = nil
