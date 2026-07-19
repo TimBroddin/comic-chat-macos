@@ -125,6 +125,63 @@ extension EngineGlobalStateSelfTests {
             server.stop()
         }
 
+        /// Comic hit-testing (Plan 4b): the model's `participantNick(for:)`
+        /// reverse-map and the `hitTestNick` engine-queue hop. Coordinate-exact
+        /// HIT assertions live at the deterministic Strip layer
+        /// (StripTests.hitTestAvatarAndBalloon, fake-metrics snapshot geometry);
+        /// this test covers the MODEL glue that layer can't: (1) a valid
+        /// participant id reverses to its nick; an unknown id -> nil; (2)
+        /// `hitTestNick` for a far-off-page point completes on the main thread
+        /// with nil (the miss path through the full model hop). Real CoreText
+        /// metrics make the live strip's body pixel positions non-snapshot, so
+        /// a HIT here would be brittle — the miss + reverse-map are the
+        /// model-specific behavior worth pinning.
+        @Test(.timeLimit(.minutes(1)))
+        func hitTestNickReverseMapAndMiss() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            let imagesArrived = AsyncStream<Void>.makeStream()
+            model.onStripImage = { _, _ in imagesArrived.continuation.yield() }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+            // A peer speaks -> a peer participant is created + a strip composes.
+            try await server.send(":Win!u@h PRIVMSG #p4 :(#G295E193M1)hello mac")
+            var iter = imagesArrived.stream.makeAsyncIterator()
+            _ = await iter.next()
+
+            // (1) reverse-map: SOME participant id (1...8, the strip caps well
+            // under this) reverses to "Win", and the self nick "Mac" is also
+            // reversible; an id far out of range -> nil.
+            var winFound = false, macFound = false
+            for id in Int32(1)...Int32(8) {
+                switch model.participantNick(for: id) {
+                case "Win": winFound = true
+                case "Mac": macFound = true
+                default: break
+                }
+            }
+            #expect(winFound, "expected some participant id to reverse-map to the peer nick Win")
+            #expect(macFound, "expected some participant id to reverse-map to the self nick Mac")
+            #expect(model.participantNick(for: 9999) == nil)   // unknown id
+            #expect(model.participantNick(for: 0) == nil)      // 0 is never valid
+
+            // (2) hitTestNick miss: a point far below/right of any page content
+            // completes on the main thread with nil.
+            let missArrived = AsyncStream<String?>.makeStream()
+            model.hitTestNick(atTwips: 1_000_000, 1_000_000) { nick in
+                missArrived.continuation.yield(nick)
+                missArrived.continuation.finish()
+            }
+            var missIter = missArrived.stream.makeAsyncIterator()
+            let miss = await missIter.next()
+            #expect(miss == .some(nil))   // completion fired, with nil (no avatar)
+
+            model.shutdown()
+            server.stop()
+        }
+
         /// Final review (Plan 4a) regression test for the `.userJoined` ->
         /// `emitMembers()` fix: after login/join, a peer JOINing mid-session
         /// must refresh the member sidebar (`onMembers`), not just the strip.

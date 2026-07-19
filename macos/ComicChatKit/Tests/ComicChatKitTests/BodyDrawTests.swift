@@ -121,4 +121,19 @@ struct EngineGlobalStateSelfTests {
         let avatar = fixture("anna.avb")   // COMPLEX (two-part) avatar
         #expect(cc_run_selfpose_preview_selftest(avatar) == 0)
     }
+
+    // Comic hit-testing (Plan 4b): cc_strip_hit_test_avatar/_balloon -- the
+    // click-an-avatar-to-set-talk-to + balloon-text-tooltip port of the
+    // original CPageView::FindAvatarUnderPoint/FindLabelUnderPoint. Builds the
+    // fixed 2x4 conversation (a switched onto armando mid-strip so the
+    // AVATAR->PARTICIPANT id reversal is exercised), composes, then hit-tests
+    // points derived from the LIVE body/balloon bboxes: body center -> that
+    // body's PARTICIPANT id (1 or 2, never the raw avatar id), empty margin
+    // -> 0, balloon center -> "HELLO THERE" text, plus miss/truncation/NULL
+    // guards.
+    @Test func hitTestSelfTestPasses() {
+        let avatar = fixture("anna.avb")
+        let other = fixture("armando.avb")
+        #expect(cc_run_hit_test_selftest(avatar, other) == 0)
+    }
 }

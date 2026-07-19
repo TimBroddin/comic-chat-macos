@@ -353,4 +353,39 @@ public final class Strip {
             throw StripError(message: "compose failed")
         }
     }
+
+    // MARK: - Comic hit-testing (Plan 4b)
+
+    /// The PARTICIPANT id of the avatar whose body contains the page-twips point
+    /// `(xTwips, yTwips)` (y-up, the same space as `size`/`compose`), or `nil`
+    /// for no avatar there. Ports the original `CPageView::FindAvatarUnderPoint`
+    /// inner loop; the returned id is always a participant id (an id from
+    /// `addParticipant`), never a raw avatar-registry id, even after a
+    /// `setParticipantAvatar` switch (the engine reverses the body's avatar id
+    /// through the session user table). Engine-queue only, like every `Strip`
+    /// call.
+    public func hitTestAvatar(xTwips: Int32, yTwips: Int32) -> Int32? {
+        guard let h = handle else { return nil }
+        let id = cc_strip_hit_test_avatar(h, xTwips, yTwips)
+        return id > 0 ? id : nil
+    }
+
+    /// The displayed text of the balloon whose bbox contains the page-twips
+    /// point `(xTwips, yTwips)`, or `nil` for no balloon there — the balloon-text
+    /// tooltip (the richer sibling of the original's screen-name `OnToolHitTest`).
+    /// The text is the balloon's on-strip line (already uppercased at layout
+    /// time, matching what the reader sees); decoded from the engine's CP-1252
+    /// bytes. Engine-queue only.
+    public func hitTestBalloon(xTwips: Int32, yTwips: Int32,
+                               encoding: WireEncoding = .cp1252) -> String? {
+        guard let h = handle else { return nil }
+        // 512 bytes comfortably covers a single balloon's displayed line (a
+        // panel caps its balloon text well under this); the C side truncates
+        // to buflen-1 and NUL-terminates regardless.
+        var buf = [CChar](repeating: 0, count: 512)
+        let n = cc_strip_hit_test_balloon(h, xTwips, yTwips, &buf, Int32(buf.count))
+        guard n >= 0 else { return nil }
+        // The C side NUL-terminates `buf`; decode the CP-1252/UTF-8 bytes.
+        return WireCodec.decode(&buf, len: n, encoding: encoding)
+    }
 }

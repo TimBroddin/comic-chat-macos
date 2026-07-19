@@ -1845,6 +1845,71 @@ public final class ChatSessionModel: @unchecked Sendable {
         }
     }
 
+    // MARK: - comic hit-testing (Plan 4b): click-to-talk-to + balloon tooltips
+
+    /// Reverse-map a strip PARTICIPANT id (as returned by
+    /// `Strip.hitTestAvatar` / `cc_strip_hit_test_avatar`) to the nick the
+    /// bridge assigned it. Engine-queue-owned read of the bridge's
+    /// `participantIDs` map (nick -> id), reversed. Returns `nil` for an
+    /// unknown id (including 0) or before a strip/bridge exists. ENGINE QUEUE
+    /// ONLY — call from within an `engineQueue` block (e.g. `hitTestNick`
+    /// below), never from the main thread directly (`participantIDs` is
+    /// engine-queue-owned like every other bridge/strip touch on this type).
+    private func participantNickLocked(for id: Int32) -> String? {
+        guard id > 0, let bridge else { return nil }
+        for (nick, pid) in bridge.participantIDs where pid == id {
+            return nick
+        }
+        return nil
+    }
+
+    /// Thread-safe reverse-map of a strip PARTICIPANT id to its nick (the
+    /// bridge's `participantIDs` map reversed) — `nil` for an unknown id (incl.
+    /// 0) or before a strip/bridge exists. Same `engineQueue.sync` read-through
+    /// posture as `transcript`/`currentRoom`; exposed for the app/tests (the
+    /// on-queue callers use `participantNickLocked` directly to avoid a
+    /// same-queue reentrant `sync`).
+    public func participantNick(for id: Int32) -> String? {
+        engineQueue.sync { participantNickLocked(for: id) }
+    }
+
+    /// Hit-test a page-twips point against the composed strip's avatars and
+    /// deliver the nick of the avatar there (or `nil` for no avatar) on the
+    /// MAIN thread. The single engine-queue hop the view's click handler needs:
+    /// `cc_strip_hit_test_avatar` is a `cc_*` call (engine queue only), and the
+    /// result (a nick) is what the UI toggles in its talk-to selection. `x`/`y`
+    /// are PAGE TWIPS, y-up (the same space `Strip.size`/`compose` use) — the
+    /// caller (`ComicStripView`) converts the AppKit view point + the twips
+    /// y-flip before calling. `completion` always runs on the main thread,
+    /// exactly once.
+    public func hitTestNick(atTwips x: Int32, _ y: Int32,
+                            completion: @escaping @Sendable (String?) -> Void) {
+        engineQueue.async { [weak self] in
+            var nick: String? = nil
+            if let self, !self.isShutDown, let strip = self.strip,
+               let id = strip.hitTestAvatar(xTwips: x, yTwips: y) {
+                nick = self.participantNickLocked(for: id)
+            }
+            DispatchQueue.main.async { completion(nick) }
+        }
+    }
+
+    /// Hit-test a page-twips point against the composed strip's balloons and
+    /// deliver the balloon's displayed text (or `nil` for no balloon there) on
+    /// the MAIN thread — the balloon-text tooltip. Same engine-queue-hop +
+    /// page-twips y-up contract as `hitTestNick`. `completion` always runs on
+    /// the main thread, exactly once.
+    public func hitTestBalloonText(atTwips x: Int32, _ y: Int32,
+                                   completion: @escaping @Sendable (String?) -> Void) {
+        engineQueue.async { [weak self] in
+            var text: String? = nil
+            if let self, !self.isShutDown, let strip = self.strip {
+                text = strip.hitTestBalloon(xTwips: x, yTwips: y, encoding: self.config.encoding)
+            }
+            DispatchQueue.main.async { completion(text) }
+        }
+    }
+
     // MARK: - character / backdrop switching (Plan 4b Task 5)
 
     /// Switches the SELF participant's avatar to `name` (a bare comicart name,

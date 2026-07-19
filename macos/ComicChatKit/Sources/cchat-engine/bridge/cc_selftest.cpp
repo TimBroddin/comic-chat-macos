@@ -2744,6 +2744,214 @@ extern "C" int32_t cc_run_avatar_api_selftest(const char* avatarPath,
     return g_failures;
 }
 
+// --- Comic hit-testing (Plan 4b): cc_strip_hit_test_avatar/_balloon ----------
+// Builds the fixed 2x4 A,B,A,B conversation (same fixture/nicks/lines as
+// cc_selftest_strip), composes, then drives the two hit-test entries against
+// points DERIVED FROM THE LIVE panel/body/balloon bboxes rather than hardcoded
+// pixel coords -- deterministic under fake metrics (cc_strip_create seeds
+// srand(0x5EED)), and robust to any future re-freeze of the compose snapshot.
+//
+// Coordinate model (matches cc_strip_hit_test_avatar's own doc): a panel's
+// bodies/elements carry PANEL-LOCAL bboxes (twips, y-up, local y in [-unitH,0]);
+// its page-space origin is (ulx, uly) with ulx = colNum*(unitW+vInter),
+// uly = -rowNum*(unitH+hInter). A page-space point for a panel-local bbox
+// center is (ulx + (Left+Right)/2, uly + (Top+Bottom)/2).
+static int cc_selftest_hit_test(const char* avatarPath, const char* otherAvatarPath) {
+    int startFailures = g_failures;
+
+    static CCRecordingCanvas hitTestMetrics;
+    cc_set_metrics_canvas(hitTestMetrics.handle());
+
+    cc_strip* s = cc_strip_create();
+    CC_CHECK(s != NULL);
+    if (!s) return g_failures - startFailures;
+
+    int32_t a = cc_strip_add_participant(s, "Anna", avatarPath);
+    int32_t b = cc_strip_add_participant(s, "Boris", avatarPath);
+    CC_CHECK(a == 1);
+    CC_CHECK(b == 2);
+    if (a < 0 || b < 0) { cc_strip_destroy(s); return g_failures - startFailures; }
+
+    // Switch participant a onto a DIFFERENT avatar BEFORE any line, so a's body
+    // avatar id (a fresh registry id from the switch) diverges from its
+    // participant id (still 1) -- this exercises participantForAvatarID's
+    // avatar->participant reversal, the whole reason the return value is the
+    // participant id and not the raw body avatar id (live-fix 3/4).
+    CC_CHECK(cc_strip_set_participant_avatar(s, a, otherAvatarPath) == 0);
+
+    int32_t aAddr[1] = { b };
+    int32_t bAddr[1] = { a };
+    CC_CHECK(cc_strip_add_line(s, a, "Hello there", CC_MODE_SAY, aAddr, 1) == 0);
+    CC_CHECK(cc_strip_add_line(s, b, "Hi yourself", CC_MODE_SAY, bAddr, 1) == 0);
+    CC_CHECK(cc_strip_add_line(s, a, "How are you", CC_MODE_SAY, aAddr, 1) == 0);
+    CC_CHECK(cc_strip_add_line(s, b, "Doing great", CC_MODE_SAY, bAddr, 1) == 0);
+
+    CCRecordingCanvas compose;
+    CC_CHECK(cc_strip_compose(s, compose.handle()) == 0);
+
+    CUnitPanelPage* page = cc_strip_page(s);
+    CC_CHECK(page != NULL);
+    if (!page) { cc_strip_destroy(s); return g_failures - startFailures; }
+
+    const int perRow = CUnitPanelPage::m_panelsPerRow;
+    const int unitW  = CUnitPanelPage::m_unitWidth;
+    const int unitH  = CUnitPanelPage::m_unitHeight;
+    const int vInter = CUnitPanelPage::m_vInterstice;
+    const int hInter = CUnitPanelPage::m_hInterstice;
+
+    // ---- (a) every body: its bbox-center point hit-tests to its participant.
+    // Also confirms the AVATAR->PARTICIPANT reversal: the body carries a fresh
+    // registry avatar id (>= 3 after the switch for a; b keeps id 2), but the
+    // hit-test returns the participant id (1 for a, 2 for b) either way.
+    int bodiesChecked = 0;
+    int aHits = 0, bHits = 0;
+    {
+        int pNum = 0;
+        POSITION pos = page->m_panels.GetHeadPosition();
+        while (pos != NULL) {
+            CPanel* panel = (CPanel*)page->m_panels.GetNext(pos);
+            int rowNum = pNum / perRow;
+            int colNum = pNum % perRow;
+            int ulx =  colNum * (unitW + vInter);
+            int uly = -rowNum * (unitH + hInter);
+            pNum++;
+
+            POSITION bp = panel->m_bodies.GetHeadPosition();
+            while (bp != NULL) {
+                CBody* body = (CBody*)panel->m_bodies.GetNext(bp);
+                // Sample a point in the INTERSECTION of the body bbox and the
+                // panel unit rect: bodies can be TALLER than the 2300-twip unit
+                // panel (a large emotion-pose zoom, panel.cpp:866 -- e.g. panels
+                // 3/4's B-3968 local bottom), and the hit-test (like the
+                // original FindAvatarUnderPoint) requires the point to be inside
+                // the panel's unit rect FIRST (pageview.cpp:687), since the
+                // compositor clips each panel to that rect. So clamp the body
+                // bbox to the unit rect [-unitH, 0] before taking the center --
+                // the visible, clickable part of the body.
+                int bL = body->m_bbox.Left, bR = body->m_bbox.Right;
+                int bB = body->m_bbox.Bottom, bT = body->m_bbox.Top;
+                if (bB < -unitH) bB = -unitH;   // clamp to the panel unit rect
+                if (bT > 0)      bT = 0;
+                int cx = ulx + (bL + bR) / 2;
+                int cy = uly + (bB + bT) / 2;
+
+                // The participant this body's avatar currently maps to.
+                int32_t expected = 0;
+                CCSessionSettings& sess = ccContext().session;
+                for (int i = 0; i < sess.userCount; i++)
+                    if (sess.users[i].info.GetAvatarID() == body->m_avatarID)
+                        expected = (int32_t)sess.users[i].id;
+                CC_CHECK(expected == 1 || expected == 2);   // a or b
+
+                int32_t got = cc_strip_hit_test_avatar(s, cx, cy);
+                CC_CHECK(got == expected);
+                if (got == 1) aHits++;
+                if (got == 2) bHits++;
+                bodiesChecked++;
+            }
+        }
+    }
+    CC_CHECK(bodiesChecked > 0);
+    CC_CHECK(aHits > 0);   // participant a's body(ies) were hit at least once
+    CC_CHECK(bHits > 0);   // participant b's too
+
+    // ---- (b) an empty margin -> 0. A point far below the last panel row is in
+    // no panel slot at all (page grows toward -y; y well below -pageH is empty).
+    {
+        int32_t pw = 0, ph = 0;
+        cc_strip_get_size(s, &pw, &ph);
+        CC_CHECK(cc_strip_hit_test_avatar(s, pw / 2, -(ph + unitH)) == 0);   // below the page
+        CC_CHECK(cc_strip_hit_test_avatar(s, pw + unitW, -unitH) == 0);      // right of the page
+        // A point at y=+unitH (ABOVE the top row, positive y) is also empty --
+        // panel 0's slot spans y in [-unitH, 0].
+        CC_CHECK(cc_strip_hit_test_avatar(s, unitW / 2, unitH) == 0);
+    }
+
+    // ---- (c) balloon tooltip: a point inside panel 0's balloon returns its
+    // text bytes. Panel 0's balloon is the FIRST line, "Hello there" (uppercased
+    // to "HELLO THERE" by CBWoodringNormal's Capitalize, exactly as the strip
+    // snapshot's "text ... HELLO THERE" shows). Find panel 0's balloon bbox and
+    // hit its center.
+    {
+        POSITION pos = page->m_panels.GetHeadPosition();
+        CPanel* panel0 = pos ? (CPanel*)page->m_panels.GetNext(pos) : NULL;
+        CC_CHECK(panel0 != NULL);
+        bool foundBalloon = false;
+        if (panel0) {
+            POSITION ep = panel0->m_elements.GetHeadPosition();
+            while (ep != NULL && !foundBalloon) {
+                CPanelElement* el = (CPanelElement*)panel0->m_elements.GetNext(ep);
+                if (!(el->GetType() & PE_BALLOON)) continue;
+                RECT bb; el->GetBBox(&bb);
+                // panel 0 origin is (0,0), so panel-local == page coords here.
+                int cx = (bb.left + bb.right) / 2;
+                int cy = (bb.top + bb.bottom) / 2;
+                char buf[128] = {0};
+                int32_t n = cc_strip_hit_test_balloon(s, cx, cy, buf, (int32_t)sizeof(buf));
+                CC_CHECK(n > 0);
+                CC_CHECK((int)strlen(buf) == n);
+                // The balloon carries the (uppercased) first line.
+                CC_CHECK(strcmp(buf, "HELLO THERE") == 0);
+                foundBalloon = true;
+            }
+        }
+        CC_CHECK(foundBalloon);
+    }
+
+    // ---- (d) balloon miss + arg guards: an empty margin -> -1 and buf[0]=='\0';
+    // a NULL buf or non-positive buflen -> -1.
+    {
+        int32_t pw = 0, ph = 0;
+        cc_strip_get_size(s, &pw, &ph);
+        char buf[16]; buf[0] = 'X';
+        CC_CHECK(cc_strip_hit_test_balloon(s, pw + unitW, -unitH, buf, (int32_t)sizeof(buf)) == -1);
+        CC_CHECK(buf[0] == '\0');
+        CC_CHECK(cc_strip_hit_test_balloon(s, 0, 0, NULL, 16) == -1);
+        CC_CHECK(cc_strip_hit_test_balloon(s, 0, 0, buf, 0) == -1);
+    }
+
+    // ---- (e) truncation: a 4-byte buffer holds "HEL" + NUL and returns 3.
+    {
+        POSITION pos = page->m_panels.GetHeadPosition();
+        CPanel* panel0 = pos ? (CPanel*)page->m_panels.GetNext(pos) : NULL;
+        if (panel0) {
+            POSITION ep = panel0->m_elements.GetHeadPosition();
+            while (ep != NULL) {
+                CPanelElement* el = (CPanelElement*)panel0->m_elements.GetNext(ep);
+                if (!(el->GetType() & PE_BALLOON)) continue;
+                RECT bb; el->GetBBox(&bb);
+                int cx = (bb.left + bb.right) / 2;
+                int cy = (bb.top + bb.bottom) / 2;
+                char small[4];
+                int32_t n = cc_strip_hit_test_balloon(s, cx, cy, small, 4);
+                CC_CHECK(n == 3);
+                CC_CHECK(strcmp(small, "HEL") == 0);
+                break;
+            }
+        }
+    }
+
+    // ---- (f) NULL/degenerate strip guards.
+    CC_CHECK(cc_strip_hit_test_avatar(NULL, 0, 0) == 0);
+    {
+        char buf[8];
+        CC_CHECK(cc_strip_hit_test_balloon(NULL, 0, 0, buf, 8) == -1);
+    }
+
+    cc_strip_destroy(s);
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift wrapper (StripTests.swift), which passes the
+// anna.avb + armando.avb fixture paths. Runs standalone (resets g_failures).
+extern "C" int32_t cc_run_hit_test_selftest(const char* avatarPath,
+                                            const char* otherAvatarPath) {
+    g_failures = 0;
+    if (avatarPath == NULL || otherAvatarPath == NULL) return 1;
+    cc_selftest_hit_test(avatarPath, otherAvatarPath);
+    return g_failures;
+}
+
 // --- Plan 4a Task 7: title/starring lift (un-R11 AddTitle/UpdateTitle/
 //     AddStars/AddStarsAux + CStarLabel::Draw) + cc_strip_set_title/set_self.
 // Two participants -> set_self(p1) -> set_title("MY COMIC") -> two lines ->

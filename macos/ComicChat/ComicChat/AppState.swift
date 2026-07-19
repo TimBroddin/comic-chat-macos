@@ -468,6 +468,26 @@ public final class AppState {
         Task { try? await model.getInfo(nick) }
     }
 
+    /// Comic hit-testing (Plan 4b): click-an-avatar-in-the-strip toggles that
+    /// nick in `selectedMembers` — the SAME canonical talk-to state a member
+    /// grid cell tap toggles (`MemberGrid.toggleSelection`), so the member grid
+    /// highlight and `ComposeBar`'s addressees update for free. Guarded to
+    /// ACTUAL members (a hit-test can only ever return a participant the strip
+    /// knows, but a stale/own click shouldn't add a non-selectable addressee) —
+    /// the case-insensitive match mirrors the nick comparison posture used
+    /// elsewhere, and resolves to the member list's own casing for the set key
+    /// so the grid's `selectedMembers.contains(row.nick)` highlight matches.
+    public func toggleTalkTo(_ nick: String) {
+        guard let member = members.first(where: {
+            $0.nick.caseInsensitiveCompare(nick) == .orderedSame
+        }) else { return }
+        if selectedMembers.contains(member.nick) {
+            selectedMembers.remove(member.nick)
+        } else {
+            selectedMembers.insert(member.nick)
+        }
+    }
+
     /// In-flight guard for `resolveMemberIcon` (Plan 4b Task 8 self-review
     /// fix) — mirrors `ChatSessionModel`'s own `inFlightAvatarDownloads`
     /// pattern for the identical redundant-fetch problem: SwiftUI `List` can

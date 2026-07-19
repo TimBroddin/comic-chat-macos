@@ -653,6 +653,136 @@ extern "C" int32_t cc_strip_compose(cc_strip* s, cc_canvas* canvas) {
 }
 
 // ============================================================================
+// Comic hit-testing (Plan 4b) -- click-an-avatar-to-set-talk-to + balloon-text
+// tooltips. Both transliterate the original CPageView::FindAvatarUnderPoint /
+// FindLabelUnderPoint inner loops (v2.5-beta-1-modern/pageview.cpp:663-702,
+// :704-745 -- READ-ONLY originals) as bridge code: walk m_panels, derive each
+// panel's page-space slot from the SAME grid arithmetic the compositor's origin
+// walk uses (panel.cpp:1338-1342, rowNum/colNum), and test the point against the
+// panel's element bboxes IN PANEL-LOCAL COORDINATES (the original subtracts the
+// panel's upper-left before testing -- pageview.cpp:688-690). Dropped: the
+// original's DPtoLP + AddScrollOffset device<->logical view machinery
+// (pageview.cpp:670-671) -- the caller passes page twips directly, exactly as
+// cc_strip_get_size reports them.
+//
+// PANEL SLOT (page twips, y-up): panel n (0-based) sits at column colNum =
+// n % panelsPerRow, row rowNum = n / panelsPerRow; its upper-left is
+//   ulx =  colNum * (unitWidth  + vInterstice)
+//   uly = -rowNum * (unitHeight + hInterstice)
+// (pageview.cpp:683-684; note the +v/+h interstice pairing matches the
+// compositor's own loc advance in cc_strip_compose above, which advances x by
+// unitWidth+vInterstice and y by -(unitHeight+hInterstice)). The panel spans
+// x in [ulx, ulx+unitWidth], y in [uly-unitHeight, uly] (y-up: uly is the TOP).
+
+// Reverse a body's AVATAR-registry id back to the PARTICIPANT id the caller
+// uses. At add-participant time they are equal, but cc_strip_set_participant_
+// avatar re-points a participant's session user at a fresh avatar under a NEW
+// registry id (live-fix 3/4's divergence) -- so the body carries the avatar id,
+// and the participant id is the session-user id whose CUserInfo::GetAvatarID()
+// currently equals it. Returns 0 if no live session user owns that avatar id.
+static int32_t participantForAvatarID(UINT avatarID) {
+    CCSessionSettings& sess = ccContext().session;
+    for (int i = 0; i < sess.userCount; i++) {
+        if (sess.users[i].info.GetAvatarID() == (USHORT)avatarID)
+            return (int32_t)sess.users[i].id;
+    }
+    return 0;
+}
+
+// Shared panel-grid walk for both hit-test entries: find the panel containing
+// (x, y) in page twips, translate the point into that panel's local coords, and
+// hand the panel + local point to `onHit`. Returns onHit's result on the first
+// panel that contains the point; `missValue` if the point is in no panel.
+// Mirrors FindAvatarUnderPoint/FindLabelUnderPoint's identical outer loop.
+template <typename Fn>
+static int32_t hitTestWalk(const cc_strip* s, int32_t x, int32_t y,
+                           int32_t missValue, Fn onHit) {
+    if (!s || !s->page) return missValue;
+
+    const int perRow  = CUnitPanelPage::m_panelsPerRow;
+    const int unitW   = CUnitPanelPage::m_unitWidth;
+    const int unitH   = CUnitPanelPage::m_unitHeight;
+    const int vInter  = CUnitPanelPage::m_vInterstice;
+    const int hInter  = CUnitPanelPage::m_hInterstice;
+    if (perRow <= 0) return missValue;
+
+    POINT point; point.x = x; point.y = y;
+
+    int pNum = 0;
+    POSITION pos = s->page->m_panels.GetHeadPosition();
+    while (pos != NULL) {
+        CPanel* panel = (CPanel*)s->page->m_panels.GetNext(pos);
+        int rowNum = pNum / perRow;
+        int colNum = pNum % perRow;
+        int ulx =  colNum * (unitW + vInter);       // pageview.cpp:683
+        int uly = -rowNum * (unitH + hInter);       // pageview.cpp:684
+        pNum++;
+
+        RECT panelBBox;                              // pageview.cpp:685
+        SetRect(&panelBBox, ulx, uly, ulx + unitW, uly - unitH);
+        // panelBBox = { left=ulx, top=uly, right=ulx+unitW, bottom=uly-unitH }
+        // (y-up: top uly > bottom uly-unitH). inside_bbox tests
+        // bottom <= y <= top and left <= x <= right (lifted_singles.cpp:120).
+        if (inside_bbox(&point, &panelBBox)) {       // pageview.cpp:687
+            POINT panelPt = point;                   // panel-local (pageview.cpp:688-690)
+            panelPt.x -= panelBBox.left;
+            panelPt.y -= panelBBox.top;              // top is uly; local y in [-unitH, 0]
+            return onHit(panel, panelPt);
+        }
+    }
+    return missValue;
+}
+
+extern "C" int32_t cc_strip_hit_test_avatar(const cc_strip* s, int32_t x, int32_t y) {
+    return hitTestWalk(s, x, y, 0, [](CPanel* panel, POINT panelPt) -> int32_t {
+        // Walk the panel's bodies; return the participant id of the first whose
+        // bbox contains the point (pageview.cpp:691-696). m_bbox is an SRECT
+        // (panel-local twips) -- convert to RECT and use the RECT inside_bbox
+        // overload (the SRECT overload is only declared, not lifted; the
+        // conversion is exact -- SRECTToRECT, lifted_singles.cpp:144).
+        POSITION bodyPos = panel->m_bodies.GetHeadPosition();
+        while (bodyPos != NULL) {
+            CBody* body = (CBody*)panel->m_bodies.GetNext(bodyPos);
+            RECT bboxRect = SRECTToRECT(body->m_bbox);
+            if (inside_bbox(&panelPt, &bboxRect))    // pageview.cpp:694
+                return participantForAvatarID(body->m_avatarID);  // pageview.cpp:695 (mapped)
+        }
+        return 0;                                    // in-panel but no body under point
+    });
+}
+
+extern "C" int32_t cc_strip_hit_test_balloon(const cc_strip* s, int32_t x, int32_t y,
+                                             char* buf, int32_t buflen) {
+    if (!buf || buflen <= 0) return -1;
+    buf[0] = '\0';   // miss default (also covers the "in no panel" path below)
+
+    return hitTestWalk(s, x, y, -1, [&](CPanel* panel, POINT panelPt) -> int32_t {
+        // The tooltip sibling of FindLabelUnderPoint (pageview.cpp:704-745):
+        // scan the panel's ELEMENTS (not bodies) for the first CBalloon whose
+        // bbox contains the point, and copy its displayed text. CBalloon derives
+        // from CLabel (m_str = the line bytes) and overrides GetType() to
+        // PE_BALLOON and GetBBox() to the cloud bbox -- so a GetType() filter +
+        // the virtual GetBBox() gives the balloon's real (cloud) hit region.
+        POSITION elPos = panel->m_elements.GetHeadPosition();
+        while (elPos != NULL) {
+            CPanelElement* el = (CPanelElement*)panel->m_elements.GetNext(elPos);
+            if (!(el->GetType() & PE_BALLOON)) continue;
+            RECT elBBox;
+            el->GetBBox(&elBBox);                    // CBalloon's virtual cloud bbox
+            if (inside_bbox(&panelPt, &elBBox)) {
+                const char* text = ((CLabel*)el)->m_str;   // pageview.cpp:735-737 analogue
+                if (!text) { buf[0] = '\0'; return 0; }
+                int n = 0;
+                while (text[n] != '\0' && n < buflen - 1) { buf[n] = text[n]; n++; }
+                buf[n] = '\0';
+                return n;
+            }
+        }
+        return -1;   // in-panel but no balloon under point
+    });
+}
+
+// ============================================================================
 // Plan 4a Task 7: title/starring panel (un-R11 lift of AddTitle/UpdateTitle/
 // AddStars/AddStarsAux + CStarLabel::Draw -- see comicchat.h's doc comment for
 // the full contract).

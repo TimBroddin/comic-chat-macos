@@ -161,6 +161,47 @@ extension EngineGlobalStateSelfTests {
         }
     }
 
+    // Comic hit-testing (Plan 4b): the Strip.hitTestAvatar/hitTestBalloon Swift
+    // wrappers over cc_strip_hit_test_avatar/_balloon (the C selftest
+    // cc_run_hit_test_selftest covers the engine internals in BodyDrawTests).
+    // The fixed 2x4 conversation (anna+anna) composes to the frozen snapshot
+    // geometry, so these page-twips points are deterministic:
+    //   Panel 0 spans page x[0,2300] y[-2300,0]; Anna is the LEFT body (torso
+    //   blit 457..951, head 406..911 -> x~[406,951]), Boris the RIGHT (1355..
+    //   1892). Body height spans y~[-2300,-1090] (strip-golden.txt panel-1
+    //   blits). A point mid-body on each side hits that participant; a point in
+    //   panel 0's TOP margin (above every body, y near 0) hits no avatar.
+    @Test func hitTestAvatarAndBalloon() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            let strip = try Strip()
+            let (a, b) = try buildFixedConversation(strip)   // a==1 (Anna), b==2 (Boris)
+            let recorder = RecordingCanvas()
+            try strip.compose(onto: recorder)                // lay out the bodies
+
+            // HIT: a point inside Anna's (left) body in panel 0 -> participant a.
+            #expect(strip.hitTestAvatar(xTwips: 680, yTwips: -1600) == a)
+            // HIT: a point inside Boris's (right) body in panel 0 -> participant b.
+            #expect(strip.hitTestAvatar(xTwips: 1620, yTwips: -1600) == b)
+            // MISS: panel 0's top margin (above the bodies) -> nil.
+            #expect(strip.hitTestAvatar(xTwips: 1150, yTwips: -50) == nil)
+            // MISS: a point off the page entirely (in the empty margin) -> nil.
+            #expect(strip.hitTestAvatar(xTwips: 10_000, yTwips: -50) == nil)
+
+            // BALLOON: panel 0's balloon is the first line "Hello there",
+            // uppercased to "HELLO THERE" at layout time (strip-golden.txt's
+            // "text 735,-80 ... HELLO THERE"). Its cloud spans the panel top;
+            // a point near the balloon text baseline hits it.
+            let balloon = strip.hitTestBalloon(xTwips: 1000, yTwips: -150)
+            #expect(balloon == "HELLO THERE")
+            // BALLOON MISS: off the page -> nil.
+            #expect(strip.hitTestBalloon(xTwips: 10_000, yTwips: -150) == nil)
+        }
+    }
+
     // (b) THE EXIT MILESTONE: the same conversation composited through CGCanvas
     // into real pixels. Asserts non-empty PNG data, expected pixel dimensions
     // (page size in twips / 20 points, at 2x scale), and >1% non-white pixels

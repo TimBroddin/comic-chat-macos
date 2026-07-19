@@ -47,9 +47,17 @@ struct ChatWindow: View {
                     // `TranscriptTextView` — same event log, two renderings, one
                     // shown at a time (never both).
                     if appState.comicMode {
+                        // Comic hit-testing (Plan 4b): a click in the strip
+                        // toggles the clicked avatar's nick in the talk-to
+                        // selection (`AppState.selectedMembers`), the same
+                        // canonical state a member-grid cell tap toggles — so
+                        // the grid highlight + ComposeBar addressees update for
+                        // free. `onAvatarClick` fires on the main thread
+                        // (ChatSessionModel.hitTestNick's completion contract).
                         ComicStripView(image: appState.stripImage,
                                         sizePoints: appState.stripSizePoints,
-                                        model: appState.model)
+                                        model: appState.model,
+                                        onAvatarClick: { nick in appState.toggleTalkTo(nick) })
                     } else {
                         TranscriptTextView(attributedText: appState.transcriptText)
                     }

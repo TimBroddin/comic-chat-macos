@@ -89,6 +89,18 @@ int32_t cc_run_self_emotion_selftest(const char* avatar_path, const char* other_
  * fixture path. */
 int32_t cc_run_selfpose_preview_selftest(const char* avatar_path);
 
+/* Comic hit-testing selftest (Plan 4b): opens avatarPath TWICE (two
+ * participants) plus other_avatar_path (a third, switched onto participant 1
+ * mid-strip so the AVATAR-vs-PARTICIPANT id reversal is exercised), builds the
+ * fixed 2x4 conversation, composes, then drives cc_strip_hit_test_avatar /
+ * cc_strip_hit_test_balloon against points derived from the LIVE panel/body/
+ * balloon bboxes (deterministic under fake metrics): a point inside a known
+ * body bbox -> that body's PARTICIPANT id; a point in an empty page margin -> 0;
+ * a point inside a balloon -> its text bytes; the participant-id reversal after
+ * a set_participant_avatar switch. Returns 0 on success (failure count
+ * otherwise). Kept out of cc_run_selftests because it needs two fixture paths. */
+int32_t cc_run_hit_test_selftest(const char* avatar_path, const char* other_avatar_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env
@@ -380,6 +392,51 @@ void      cc_strip_get_panel_geometry(const cc_strip* s, int32_t* unit_w,
 /* Composite the finished page onto `canvas` (the R16 headless replacement for
  * CUnitPanelPage::Draw). Returns 0 on success. */
 int32_t   cc_strip_compose(cc_strip* s, cc_canvas* canvas); /* 0 ok */
+
+/* ---- Comic hit-testing (Plan 4b) -------------------------------------------
+ * Click-an-avatar-in-the-strip to set your talk-to target, plus balloon-text
+ * tooltips. Both transliterate the original's CPageView hit-test loops
+ * (v2.5-beta-1-modern/pageview.cpp:663-702 FindAvatarUnderPoint /
+ * :704-745 FindLabelUnderPoint) as bridge code walking m_panels -> per-panel
+ * grid arithmetic -> element bboxes, WITHOUT the original's view-layer
+ * DPtoLP/AddScrollOffset device<->logical machinery (the caller passes page
+ * twips directly). Engine-queue only (every cc_* call, threading contract). */
+
+/* cc_strip_hit_test_avatar: x/y in PAGE TWIPS (y-up, the SAME coordinate space
+ * as cc_strip_get_size -- x in [0, width], y in [-height, 0]). Walks m_panels,
+ * finds the panel whose grid slot contains the point (the original's
+ * rowNum/colNum arithmetic, pageview.cpp:681-687), then walks that panel's
+ * m_bodies and returns the PARTICIPANT id (>= 1, the same id space
+ * cc_strip_add_participant returns and the caller/bridge use) of the first body
+ * whose bbox contains the point, or 0 for no avatar there.
+ *
+ * PARTICIPANT vs AVATAR id (mind the two id spaces): CBody::m_avatarID is an
+ * AVATAR-registry id, which equals the participant id at add-participant time
+ * but DIVERGES after cc_strip_set_participant_avatar (which loads a fresh
+ * avatar under a NEW registry id while the participant's session-user id is
+ * unchanged -- the same divergence live-fix 3/4 handle). This function reverses
+ * the body's avatar id back to the participant id via the session user table
+ * (the entry whose CUserInfo::GetAvatarID() == body->m_avatarID), so the
+ * returned id is always the one the bridge's participantIDs map and the UI's
+ * talk-to selection key on -- never a stale avatar id. Returns 0 if no session
+ * user currently owns that avatar id (a body from a since-replaced avatar). */
+int32_t   cc_strip_hit_test_avatar(const cc_strip* s, int32_t x, int32_t y);
+
+/* cc_strip_hit_test_balloon: the tooltip sibling. Same page-twips point + same
+ * panel-grid walk, but scans the panel's m_elements for the first CBalloon
+ * (GetType() & PE_BALLOON) whose bbox contains the point and copies its text
+ * bytes (CBalloon's CLabel::m_str, the balloon's displayed line -- CP-1252,
+ * already Capitalize'd at layout time) into `buf` (NUL-terminated, truncated to
+ * buflen-1 bytes). Returns the number of bytes written (excluding the NUL, >= 0)
+ * on a hit, or -1 for no balloon at that point / a NULL buf / buflen <= 0. On
+ * a miss buf[0] is set to '\0' when buf/buflen allow. NOTE: this is the
+ * balloon-TEXT tooltip the Plan 4b brief asked for, NOT the original's
+ * OnToolHitTest, which showed the AVATAR's screen name (pageview.cpp:638-661) --
+ * the balloon text is the strictly richer tooltip and CBalloon carries it
+ * cleanly (m_str + a bbox), so the engine half lands here rather than being
+ * skipped. */
+int32_t   cc_strip_hit_test_balloon(const cc_strip* s, int32_t x, int32_t y,
+                                     char* buf, int32_t buflen);
 
 /* Plan 4a Task 7: title/starring panel (un-R11 lift of AddTitle/UpdateTitle/
  * AddStars/AddStarsAux + CStarLabel::Draw).
