@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// App-wide menu commands. `File > New Connection` reopens the connect
 /// sheet; `Room > Leave/Disconnect` tears down the current session (routing
@@ -17,6 +18,46 @@ struct AppCommands: Commands {
                 appState.showConnectSheet = true
             }
             .keyboardShortcut("n", modifiers: .command)
+        }
+
+        // Plan 4b Task 10: save/reopen JSON transcript + PNG/PDF export.
+        // Grouped `.saveItem` (right after New/Open, before the standard
+        // Close/Save/Save As… block SwiftUI already supplies for a
+        // WindowGroup-backed document-less app — this app has no
+        // NSDocument, so `.saveItem` is otherwise empty and safe to replace).
+        CommandGroup(replacing: .saveItem) {
+            Button("Save Transcript…") {
+                appState.saveTranscript()
+            }
+            .keyboardShortcut("s", modifiers: .command)
+            .disabled(appState.model == nil)
+
+            Button("Open Transcript…") {
+                appState.openTranscript(currentWindowWidthPoints: NSApp.mainWindow?.contentView?.bounds.width ?? 640)
+                if appState.showTranscriptViewer {
+                    openWindow(id: "transcriptViewer")
+                }
+            }
+
+            Divider()
+
+            Button("Export as PNG…") {
+                appState.exportPNG()
+            }
+            .disabled(appState.model == nil || appState.stripImage == nil)
+
+            Button("Export as PDF…") {
+                appState.exportPDF()
+            }
+            .disabled(appState.model == nil || appState.stripImage == nil)
+        }
+
+        CommandGroup(replacing: .printItem) {
+            Button("Print…") {
+                appState.printTranscript()
+            }
+            .keyboardShortcut("p", modifiers: .command)
+            .disabled(appState.model == nil || appState.stripImage == nil)
         }
 
         CommandMenu("Room") {

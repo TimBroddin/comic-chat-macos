@@ -534,6 +534,26 @@ public final class ChatSessionModel: @unchecked Sendable {
         engineQueue.sync { strip?.panelCount ?? 0 }
     }
 
+    /// Plan 4b Task 10: the config snapshot `conversationFile()` needs — read
+    /// through one `engineQueue.sync` (matching `transcript`/`currentRoom`'s
+    /// own thread-safe-read posture, since `config` is engine-queue-owned:
+    /// `changeCharacter`/`changeBackdrop` mutate it ON the engine queue).
+    /// `characterName` here is `initialCharacterName` (the character this
+    /// session's self participant was actually SEEDED with), NOT
+    /// `config.characterName` — see `ConversationFile.characterName`'s doc
+    /// comment for why a save must record the seed character, not whatever a
+    /// mid-session `changeCharacter` has since moved `config.characterName`
+    /// to (that switch is already replay-visible as a `.appearsAs` transcript
+    /// entry; seeding a reopen with the post-switch character instead would
+    /// repaint every pre-switch panel with the wrong avatar).
+    public var saveConfigSnapshot: (host: String, nick: String, characterName: String,
+                                     backdropName: String, encoding: WireEncoding, artDir: String) {
+        engineQueue.sync {
+            (config.host, config.nick, initialCharacterName, config.backdropName,
+             config.encoding, config.artDir)
+        }
+    }
+
     // MARK: - start()
 
     /// connect -> (auto-login, handled entirely inside `ProtocolSession`) ->

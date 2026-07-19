@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import CoreGraphics
 import AVFoundation
+import AppKit
 import ComicChatKit
 
 @Observable @MainActor
@@ -107,6 +108,153 @@ public final class AppState {
         guard let resolved = SoundLibrary(folder: folder).resolve(file) else { return }
         soundPlayer = try? AVAudioPlayer(contentsOf: resolved)
         soundPlayer?.play()
+    }
+
+    // MARK: Save/reopen transcript + PNG/PDF export + print (Plan 4b Task 10)
+
+    /// The reopened-transcript viewer's composed image, or `nil` when no
+    /// viewer is showing. `ChatWindow`'s "Transcript Viewer" window scene
+    /// reads this (mirrors `stripImage`'s own posture, but kept SEPARATE from
+    /// the live strip — reopening a saved transcript must never touch the
+    /// live session's own `stripImage`, which doesn't exist anyway while
+    /// disconnected, the only state `openTranscript()` permits).
+    public var viewerImage: CGImage?
+    public var viewerSizePoints: CGSize = .zero
+    /// Set by `openTranscript()` once a render succeeds. `ComicChatApp`'s
+    /// "Transcript" `Window` scene (fixed `id: "transcriptViewer"`, same
+    /// precedent as "whispers"/"roomList") is a plain always-open scene, not
+    /// gated on this itself — `AppCommands`' "Open Transcript…" button reads
+    /// this flag right after calling `openTranscript(...)` to decide whether
+    /// to actually call `openWindow(id: "transcriptViewer")` (a failed/
+    /// refused open must not pop an empty viewer window).
+    public var showTranscriptViewer = false
+
+    /// Save Transcript… (⌘S): snapshots the ACTIVE room's conversation via
+    /// `ChatSessionModel.conversationFile()` and writes it to a user-chosen
+    /// `.json` path via `NSSavePanel`. No-op with no live session (the menu
+    /// item is disabled in that case — see `AppCommands`).
+    public func saveTranscript() {
+        guard let model else { return }
+        let file = model.conversationFile()
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = (file.room.isEmpty ? "conversation" : file.room)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "#&")) + ".json"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try file.write(to: url)
+        } catch {
+            statusLine = "Save Transcript failed: \(error)"
+        }
+    }
+
+    /// Open Transcript… : REFUSES while connected (plan-review DECISION,
+    /// binding — a second concurrent `Strip` while a live session holds the
+    /// one process-global engine slot is engine UB, not a UI choice; see
+    /// `TranscriptRenderer`'s own doc comment). Presents an alert instead of
+    /// silently no-opping so the user understands why nothing happened.
+    /// Otherwise: `NSOpenPanel` for a `.json` file, decode via
+    /// `ConversationFile.read(from:)`, render via `TranscriptRenderer` at the
+    /// given viewport width (the CURRENT window width, matching a live
+    /// session's own `setViewport` geometry derivation), and present the
+    /// result in the transcript viewer.
+    public func openTranscript(currentWindowWidthPoints: CGFloat) {
+        guard model == nil else {
+            let alert = NSAlert()
+            alert.messageText = "Disconnect First"
+            alert.informativeText = "Opening a saved transcript renders it through the same comic engine as a live session, which only supports one strip at a time. Disconnect the current session before opening a saved transcript."
+            alert.alertStyle = .warning
+            alert.runModal()
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            let file = try ConversationFile.read(from: url)
+            let viewportTwips = Int32((currentWindowWidthPoints * 20).rounded())
+            let columns = PanelFit.columns(forViewportWidthTwips: viewportTwips)
+            let unit = PanelFit.unitPanelTwips(viewportWidthTwips: viewportTwips, columns: columns)
+            let renderer = TranscriptRenderer(file: file, artDir: artDir)
+            let (image, _) = try renderer.render(columns: columns, unitTwips: unit, scale: 2.0)
+            viewerImage = image
+            viewerSizePoints = CGSize(width: CGFloat(image.width) / 2.0, height: CGFloat(image.height) / 2.0)
+            showTranscriptViewer = true
+        } catch {
+            statusLine = "Open Transcript failed: \(error)"
+        }
+    }
+
+    /// Export as PNG… : the CURRENT live strip's last composed image
+    /// (`stripImage`) written to a user-chosen `.png` path. No-op with
+    /// nothing composed yet.
+    public func exportPNG() {
+        guard let image = stripImage else { return }
+        guard let png = Self.pngData(for: image) else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "comic.png"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try png.write(to: url, options: .atomic)
+        } catch {
+            statusLine = "Export as PNG failed: \(error)"
+        }
+    }
+
+    /// Export as PDF… : the current live strip's composed image, scaled to
+    /// fit an `NSPrintInfo`-derived page width with vertical pagination, via
+    /// `ComicPrintView.dataWithPDF(inside:)` (no print panel — a direct
+    /// save, unlike `printTranscript()`'s interactive `NSPrintOperation`).
+    public func exportPDF() {
+        guard let image = stripImage else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.pdf]
+        panel.nameFieldStringValue = "comic.pdf"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let printInfo = NSPrintInfo.shared
+        let pageWidth = printInfo.paperSize.width - printInfo.leftMargin - printInfo.rightMargin
+        let printView = ComicPrintView(image: image, pageWidthPoints: max(1, pageWidth))
+        let data = printView.dataWithPDF(inside: printView.bounds)
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            statusLine = "Export as PDF failed: \(error)"
+        }
+    }
+
+    /// Print… (⌘P): the current live strip's composed image through an
+    /// interactive `NSPrintOperation` (which also offers its own "Save as
+    /// PDF…" button — the brief's "PDF export = the print panel's PDF
+    /// button, plus a direct save for Export as PDF").
+    public func printTranscript() {
+        guard let image = stripImage else { return }
+        let printInfo = NSPrintInfo.shared
+        let pageWidth = printInfo.paperSize.width - printInfo.leftMargin - printInfo.rightMargin
+        let printView = ComicPrintView(image: image, pageWidthPoints: max(1, pageWidth))
+        let operation = NSPrintOperation(view: printView, printInfo: printInfo)
+        operation.run()
+    }
+
+    /// PNG-encodes a `CGImage` via ImageIO — the app-side twin of
+    /// `CGCanvas.pngData()` (that method encodes from its OWN live
+    /// `CGContext`; this one encodes an already-composed `CGImage` handed
+    /// back through `onStripImage`, which is all `AppState` retains).
+    private static func pngData(for image: CGImage) -> Data? {
+        let mutableData = CFDataCreateMutable(nil, 0)
+        guard let mutableData,
+              let dest = CGImageDestinationCreateWithData(mutableData, "public.png" as CFString, 1, nil)
+        else { return nil }
+        CGImageDestinationAddImage(dest, image, nil)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return mutableData as Data
     }
 
     /// Requests a fresh room list — `RoomListWindow`'s Refresh button / the

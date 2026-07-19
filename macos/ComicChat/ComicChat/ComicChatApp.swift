@@ -33,5 +33,14 @@ struct ComicChatApp: App {
         Window("Room List", id: "roomList") {
             RoomListWindow().environment(appState)
         }
+
+        // Plan 4b Task 10: the reopened-transcript viewer (File > Open
+        // Transcript…) — a fixed `id` `Window` scene, same "handed off via
+        // AppState, opened via openWindow(id:)" precedent as "whispers"/
+        // "roomList" above. `AppState.viewerImage` is the hand-off; there is
+        // no per-open parameter needed beyond that.
+        Window("Transcript", id: "transcriptViewer") {
+            TranscriptViewerWindow().environment(appState)
+        }
     }
 }

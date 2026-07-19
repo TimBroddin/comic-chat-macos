@@ -5,7 +5,7 @@ import cchat_engine
 /// Info" block (pose/emotion/mode/addressees). Values are indices, not the
 /// `+'0'` wire bytes (the engine already decodes those). `addressees` are
 /// display-ready nick strings (already run through `WireCodec`).
-public struct Annotations: Sendable, Equatable {
+public struct Annotations: Sendable, Equatable, Codable {
     public var gesturePose: Int32
     public var gestureEmotion: Int32
     public var gestureIntensity: Int32
@@ -113,7 +113,7 @@ public typealias MessageKind = Int32
 /// 1:1 with the C union, completeness-is-the-deliverable (matching Task 5a's
 /// contract on the C side). All string fields have already been transcoded
 /// from wire bytes via `WireCodec` by the time they reach this type.
-public enum ProtocolEvent: Sendable {
+public enum ProtocolEvent: Sendable, Codable, Equatable {
     // connection lifecycle
     case loggedIn(nick: String)
     case serverCaps(ircx: Bool, maxMsgLen: Int32)
