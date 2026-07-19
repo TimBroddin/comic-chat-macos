@@ -52,6 +52,21 @@ extern "C" void cc_set_metrics_canvas(cc_canvas* canvas) {
     ccContext().resetMetricsDC();
 }
 
+// Batch E: see comicchat.h's doc comment for the full contract (storage,
+// units, partial-update semantics). Config-storage only -- writes exactly
+// the two CCSessionSettings fields cc_compose.cpp's stripLogFontFromSession()
+// reads, nothing else.
+extern "C" void cc_set_comic_font(const char* face, int32_t size_points) {
+    CCSessionSettings& session = ccContext().session;
+    if (face != nullptr && face[0] != '\0') {
+        strncpy(session.comicsFontFace, face, LF_FACESIZE - 1);
+        session.comicsFontFace[LF_FACESIZE - 1] = '\0';
+    }
+    if (size_points > 0) {
+        session.comicsFontPts = size_points;
+    }
+}
+
 // Plan 2 Task 3 (R17): see engine_context.h for the lazy-construct contract.
 CDC* CCEngineContext::metricsDC() {
     ASSERT(metricsCanvas != nullptr);

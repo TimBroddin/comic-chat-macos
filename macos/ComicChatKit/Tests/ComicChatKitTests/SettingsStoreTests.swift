@@ -95,4 +95,39 @@ struct SettingsStoreTests {
         let reloaded = SettingsStore(defaults: defaults)
         #expect(reloaded.notificationsEnabled == false)
     }
+
+    /// Batch E: `comicFontFace`/`comicFontSize` default to "Comic Sans MS" /
+    /// 0 (the "engine default" sentinel `cc_set_comic_font` treats as
+    /// "leave unchanged") and round-trip.
+    @Test func comicFontDefaultsAndRoundTrips() {
+        let defaults = freshDefaults()
+        let store = SettingsStore(defaults: defaults)
+        #expect(store.comicFontFace == "Comic Sans MS")
+        #expect(store.comicFontSize == 0)
+
+        store.comicFontFace = "Chalkboard SE"
+        store.comicFontSize = 18
+        #expect(store.comicFontFace == "Chalkboard SE")
+        #expect(store.comicFontSize == 18)
+
+        let reloaded = SettingsStore(defaults: defaults)
+        #expect(reloaded.comicFontFace == "Chalkboard SE")
+        #expect(reloaded.comicFontSize == 18)
+    }
+
+    /// Batch E: `favorites` defaults to empty and round-trips a list of
+    /// `FavoriteConnection` through JSON `Data`.
+    @Test func favoritesDefaultsToEmptyAndRoundTrips() {
+        let defaults = freshDefaults()
+        let store = SettingsStore(defaults: defaults)
+        #expect(store.favorites == [])
+
+        let a = FavoriteConnection(name: "The Crypt", host: "www.crypthome.com", port: 6667, room: "#Crypt")
+        let b = FavoriteConnection(name: "Home rig", host: "127.0.0.1", port: 6668, room: "#comicrig")
+        store.favorites = [a, b]
+        #expect(store.favorites == [a, b])
+
+        let reloaded = SettingsStore(defaults: defaults)
+        #expect(reloaded.favorites == [a, b])
+    }
 }

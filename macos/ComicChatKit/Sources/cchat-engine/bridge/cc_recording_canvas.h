@@ -64,10 +64,19 @@ public:
     cc_canvas* handle() { return &canvas_; }
     const std::vector<std::string>& log() const { return log_; }
 
+    // Batch E: the `cc_font_spec::face` from the MOST RECENT draw_text call
+    // (empty string if none yet) -- a NON-LOG-FORMAT-AFFECTING addition (the
+    // "text ..." log line itself is unchanged, per this header's own STABLE
+    // CONTRACT above) that lets a selftest observe which face the layout
+    // engine actually asked the canvas to draw with, e.g. to prove a
+    // cc_set_comic_font change reaches cc_strip_create's next balloon.
+    const std::string& lastFontFace() const { return lastFontFace_; }
+
 private:
     static const cc_canvas_ops kOps;
     cc_canvas canvas_;
     std::vector<std::string> log_;
+    std::string lastFontFace_;
 
     static CCRecordingCanvas* self(void* ctx) {
         return static_cast<CCRecordingCanvas*>(ctx);

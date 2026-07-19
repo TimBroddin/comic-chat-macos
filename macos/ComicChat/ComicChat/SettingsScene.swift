@@ -129,9 +129,15 @@ private struct PersonaSettingsView: View {
 /// "persist + live-apply if connected" shape `CharacterPickerView.select`
 /// already uses for `changeCharacter`.
 ///
-/// NOTE (out of THIS batch's scope, per the brief): the comic FONT setting
-/// needs a new engine entry point that doesn't exist yet — ticketed
-/// separately, not attempted here.
+/// Batch E (the ticketed comic font surface): a face `TextField` + size
+/// `Stepper`, the same "persist + live-apply if connected" shape as the
+/// panels-per-row picker above — `ChatSessionModel.setComicFont` handles the
+/// live case (full reflow; fonts are per-strip, see that method's doc
+/// comment). A `NSFontManager`-backed system font picker would be more
+/// discoverable, but the brief calls it overkill for a CP-1252 LOGFONT face
+/// name the engine doesn't validate against installed fonts anyway — a plain
+/// text field (matching the original's own Options-dialog font-name edit
+/// box) is the simpler, honest control here.
 private struct ComicSettingsView: View {
     @Environment(AppState.self) private var appState
 
@@ -144,6 +150,11 @@ private struct ComicSettingsView: View {
                 Text("3").tag(3)
                 Text("4").tag(4)
                 Text("5").tag(5)
+            }
+            Section("Balloon Font") {
+                TextField("Face", text: comicFontFaceBinding)
+                Stepper("Size: \(appState.settings.comicFontSize == 0 ? "Default" : "\(appState.settings.comicFontSize) pt")",
+                        value: comicFontSizeBinding, in: 0...72)
             }
         }
         .padding()
@@ -159,12 +170,36 @@ private struct ComicSettingsView: View {
             }
         )
     }
+
+    private var comicFontFaceBinding: Binding<String> {
+        Binding(
+            get: { appState.settings.comicFontFace },
+            set: { newValue in
+                appState.settings.comicFontFace = newValue
+                appState.model?.setComicFont(face: newValue, sizePoints: appState.settings.comicFontSize)
+            }
+        )
+    }
+
+    private var comicFontSizeBinding: Binding<Int> {
+        Binding(
+            get: { appState.settings.comicFontSize },
+            set: { newValue in
+                appState.settings.comicFontSize = newValue
+                appState.model?.setComicFont(face: appState.settings.comicFontFace, sizePoints: newValue)
+            }
+        )
+    }
 }
 
 /// Sounds tab: enable toggle, folder path display + "Reveal in Finder"
 /// (`SettingsStore.soundsFolder`'s default is the app's Application Support
-/// directory — Task 9's inbound-sound-playback work is a later task; this
-/// tab only exposes the SETTING, not playback itself).
+/// directory), plus a caption documenting the three conventionally-named
+/// event-sound files (Batch E) — `SoundLibrary.resolve` looks these up by
+/// bare name against whatever the user has actually dropped into the
+/// folder; an absent file is silence, never a beep/error (that type's own
+/// doc comment), so this caption is the only place that convention is
+/// written down for the user.
 private struct SoundsSettingsView: View {
     @Environment(AppState.self) private var appState
 
@@ -181,6 +216,14 @@ private struct SoundsSettingsView: View {
                         .truncationMode(.middle)
                     Button("Reveal in Finder") { revealSoundsFolder() }
                 }
+            }
+            Section {
+                Text("Drop .wav files into the sounds folder using these names to enable event sounds:")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("mention.wav — someone mentions your name\nwhisper.wav — you receive a whisper\njoin.wav — someone joins the active room")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding()

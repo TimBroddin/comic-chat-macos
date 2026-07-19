@@ -63,7 +63,7 @@ void CCRecordingCanvas::font_metrics(void* ctx, const cc_font_spec* /*f*/,
     out->max_char_width = 240;
 }
 
-void CCRecordingCanvas::draw_text(void* ctx, const cc_font_spec* /*f*/,
+void CCRecordingCanvas::draw_text(void* ctx, const cc_font_spec* f,
                                    int32_t x, int32_t y, uint32_t color,
                                    int32_t /*bk_opaque*/, uint32_t /*bk_color*/,
                                    const char* bytes, int32_t len) {
@@ -71,6 +71,12 @@ void CCRecordingCanvas::draw_text(void* ctx, const cc_font_spec* /*f*/,
     std::string line = "text " + formatXY(x, y) + " color=" + formatColor(color) +
                         " \"" + std::string(bytes, bytes + len) + "\"";
     self->log_.push_back(line);
+    // Batch E: capture the face WITHOUT touching the log line above (the
+    // STABLE CONTRACT documented in the header) -- lastFontFace()'s own doc
+    // comment.
+    if (f != nullptr) {
+        self->lastFontFace_ = std::string(f->face);
+    }
 }
 
 void CCRecordingCanvas::fill_rect(void* ctx, int32_t l, int32_t t, int32_t r,

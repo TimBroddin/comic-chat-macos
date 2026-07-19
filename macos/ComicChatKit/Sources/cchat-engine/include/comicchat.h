@@ -116,6 +116,23 @@ int32_t cc_run_hit_test_selftest(const char* avatar_path, const char* other_avat
  * out of cc_run_selftests because it needs the fixture path. */
 int32_t cc_run_compose_panel_selftest(const char* avatar_path, const char* backdrop_path);
 
+/* Comic font selftest (Batch E): pins the session font defaults, exercises
+ * cc_set_comic_font's round trip (including its NULL/""-face and 0/negative-
+ * size "leave unchanged" partial-update rules), then proves the
+ * load-bearing behavior -- a strip CREATED AFTER a font change composes its
+ * balloon text with the NEW face (via a CCRecordingCanvas extension,
+ * lastFontFace(), that captures the cc_font_spec passed to draw_text without
+ * altering that canvas's existing log-line format), and that switching back
+ * and creating ANOTHER fresh strip re-measures with whatever face is CURRENT
+ * at that later create call (the reflow-is-a-fresh-strip contract every
+ * other per-strip setting in this API already follows). Restores the
+ * documented default ("Comic Sans MS" @ 12pt) before returning, so it leaves
+ * no dirty global state for a later selftest in the same process. Returns 0
+ * on success (failure count otherwise). Kept out of cc_run_selftests because
+ * it needs the fixture path (one real participant, so AddLine's
+ * FetchSpeaker->GetAvatar->m_body chain doesn't dereference null). */
+int32_t cc_run_comic_font_selftest(const char* avatar_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env
@@ -1044,6 +1061,49 @@ int32_t cc_session_send_version_reply(cc_session* s, uint32_t room_token,
                                       const char* to_nick, const char* version_text);
 int32_t cc_session_send_info_reply(cc_session* s, uint32_t room_token,
                                    const char* to_nick, const char* profile_text);
+
+/* Batch E: sets the comics balloon font face/size DEFAULTS consumed by the
+ * NEXT cc_strip_create -- NOT a cc_session_* (wire-session) call and NOT a
+ * cc_strip_* (per-strip) call, because the storage this sets is neither: it is
+ * ccContext().session (CCSessionSettings, engine_context.h), the SAME
+ * process-global "settings" struct fonts.cpp's SetFonts/UpdateTitleFonts read
+ * comicsFontFace/comicsFontPts/comicsFont/iFontHeightBalloon from (see that
+ * header's theApp-field-mapping table). cc_strip_create builds its LOGFONT
+ * from exactly these two fields (cc_compose.cpp's stripLogFontFromSession())
+ * at CREATE time -- fonts are measured and baked into the CFontInfo statics
+ * once per strip (fonts.cpp's SetFonts), so changing them here has NO effect
+ * on an already-created strip's ALREADY-LAID-OUT panels; a live change
+ * requires destroying and recreating the strip (a reflow) for the new font to
+ * take effect, exactly like a panels-per-row change (cc_strip_set_panel_geometry's
+ * own "FRESH STRIP ONLY" contract is the sibling precedent, though this
+ * setter -- unlike that one -- has no strip handle to gate against at all: it
+ * writes session-global state, never a live cc_strip*).
+ *
+ * face: CP-1252 bytes (LOGFONT lfFaceName's original byte convention, per
+ * every other lifted string in this API); NULL or "" leaves comicsFontFace
+ * UNCHANGED (a partial update -- lets a caller change only the size).
+ * Truncated to LF_FACESIZE-1 bytes + NUL, matching stripLogFontFromSession's
+ * own strncpy bound.
+ *
+ * size_points: POINTS, matching the original's ComicsFont LOGFONT height
+ * convention -- the session field this writes (comicsFontPts) is later
+ * multiplied by 20 (twips/point, MM_TWIPS) and NEGATED to build LOGFONT's
+ * lfHeight (cc_compose.cpp: "lf.lfHeight = -(sess.comicsFontPts * 20)"; the
+ * original's own CFont::CreatePointFont-style convention -- a POSITIVE point
+ * size in the session field, turned into GDI's negative "character height in
+ * device units" only at LOGFONT-build time, never stored negated). `0` (or
+ * negative) leaves comicsFontPts UNCHANGED -- the bridge-facing "0 = engine
+ * default" sentinel a Settings default of 0 is designed to preserve (the
+ * session field's OWN default, "Comic Sans MS" @ 12pt, is untouched by a
+ * caller who never calls this at all).
+ *
+ * Config-storage only: writes exactly the two session fields
+ * stripLogFontFromSession() reads and nothing else (no CFont/CDC/DC-lifetime
+ * touch of any kind) -- does not go near the fonts.cpp dangling-DC area (the
+ * Plan 4a Task 12 R13 fix in DestroyFonts) at all. Safe to call at any time,
+ * connected or not, strip live or not; it only affects the NEXT
+ * cc_strip_create. */
+void cc_set_comic_font(const char* face, int32_t size_points);
 
 #ifdef __cplusplus
 }

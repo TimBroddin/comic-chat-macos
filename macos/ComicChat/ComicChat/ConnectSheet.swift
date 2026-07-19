@@ -66,6 +66,16 @@ struct ConnectSheet: View {
         Form {
             header
 
+            // Batch E: Favorites (user-saved bookmarks) ABOVE Known Servers,
+            // same row UI (`favoriteRow` mirrors `serverRow`'s shape). Only
+            // shown when non-empty — an empty section header with nothing
+            // under it is just clutter on a fresh install.
+            if !appState.settings.favorites.isEmpty {
+                Section("Favorites") {
+                    favoritesPicker
+                }
+            }
+
             Section("Server") {
                 // Explicit Button rows: each writes its server's host/port/room
                 // through to `settings` AND sets `selectedServerID` (the
@@ -73,7 +83,23 @@ struct ConnectSheet: View {
                 // Typing a custom host in the field re-derives the selection to
                 // "Custom Server" via `serverFieldBinding`.
                 serverPicker
-                TextField("Server", text: serverFieldBinding)
+                HStack {
+                    TextField("Server", text: serverFieldBinding)
+                    // The star button (Batch E): saves whatever is CURRENTLY
+                    // in the fields as a new favorite. Dead simple per the
+                    // brief — no name-editing sheet; the favorite's `name`
+                    // defaults to the host (a context menu on its own row
+                    // offers no rename either, only Remove — "no folders, no
+                    // ordering UI" extends to "no rename UI" too).
+                    Button {
+                        saveCurrentFieldsAsFavorite()
+                    } label: {
+                        Image(systemName: "star")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Save as Favorite")
+                    .disabled(appState.settings.server.isEmpty || appState.settings.room.isEmpty)
+                }
             }
 
             Section("Identity") {
@@ -151,6 +177,99 @@ struct ConnectSheet: View {
         .padding(.bottom, 4)
         .listRowInsets(EdgeInsets())
         .listRowBackground(Color.clear)
+    }
+
+    /// Batch E: the favorites list — same row shape as `serverPicker`'s known
+    /// servers (`favoriteRow` mirrors `serverRow`), but backed by
+    /// `appState.settings.favorites` instead of the hardcoded `KnownServers`
+    /// list, and with a per-row context menu to remove. No trailing "Custom
+    /// Server" row here — that sentinel already lives in `serverPicker`
+    /// (there is exactly ONE "Custom Server" state shared by both pickers).
+    private var favoritesPicker: some View {
+        VStack(spacing: 0) {
+            ForEach(appState.settings.favorites) { favorite in
+                favoriteRow(favorite)
+                if favorite.id != appState.settings.favorites.last?.id {
+                    Divider()
+                }
+            }
+        }
+    }
+
+    /// A favorite row as a Button (mirrors `serverRow`'s shape exactly, minus
+    /// the protocol badge — a user-saved favorite carries no protocol note):
+    /// on tap it writes host/port/room through to `settings` and sets
+    /// `selectedServerID` to this favorite's own namespaced id
+    /// (`Self.favoriteSelectionID(_:)` — distinct from any `KnownServer.id`,
+    /// which is always a bare `host:port` string, so the two lists' rows can
+    /// never collide on the same highlight). A context menu offers Remove —
+    /// "no folders, no ordering UI" per the brief, so Remove is the only
+    /// per-row action besides selecting it.
+    private func favoriteRow(_ favorite: FavoriteConnection) -> some View {
+        Button {
+            appState.settings.server = favorite.host
+            appState.settings.port = favorite.port
+            appState.settings.room = favorite.room
+            selectedServerID = Self.favoriteSelectionID(favorite)
+        } label: {
+            HStack(spacing: 8) {
+                selectionMark(isSelected: selectedServerID == Self.favoriteSelectionID(favorite))
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Image(systemName: "star.fill")
+                            .foregroundStyle(.yellow)
+                            .imageScale(.small)
+                        Text(favorite.name)
+                            .font(.headline)
+                    }
+                    Text(verbatim: "\(favorite.host):\(favorite.port)  \(favorite.room)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button("Remove", role: .destructive) {
+                removeFavorite(favorite)
+            }
+        }
+    }
+
+    /// A namespaced selection id for a favorite row — distinct from
+    /// `KnownServer.id` (always bare `host:port`) and from
+    /// `Self.customSelectionID`, so `selectedServerID` (one `@State` shared
+    /// by both pickers) can unambiguously highlight exactly one row across
+    /// either list.
+    private static func favoriteSelectionID(_ favorite: FavoriteConnection) -> String {
+        "fav:" + favorite.id.uuidString
+    }
+
+    /// The star button's action: saves the CURRENT server/port/room fields
+    /// as a new favorite (name defaults to the host — dead simple per the
+    /// brief, no naming sheet) and selects it.
+    private func saveCurrentFieldsAsFavorite() {
+        let favorite = FavoriteConnection(
+            name: appState.settings.server,
+            host: appState.settings.server,
+            port: appState.settings.port,
+            room: appState.settings.room)
+        appState.settings.favorites.append(favorite)
+        selectedServerID = Self.favoriteSelectionID(favorite)
+    }
+
+    /// Removes `favorite` from the persisted list (the context menu's
+    /// Remove action). If it was the currently-selected row, the highlight
+    /// falls back to whatever the fields now match (usually "Custom Server",
+    /// since removing a favorite doesn't touch the fields themselves).
+    private func removeFavorite(_ favorite: FavoriteConnection) {
+        appState.settings.favorites.removeAll { $0.id == favorite.id }
+        if selectedServerID == Self.favoriteSelectionID(favorite) {
+            selectedServerID = derivedSelectionID()
+        }
     }
 
     /// The known-servers list (explicit Button rows), plus a trailing "Custom

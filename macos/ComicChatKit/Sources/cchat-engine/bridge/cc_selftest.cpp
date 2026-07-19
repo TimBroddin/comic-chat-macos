@@ -3199,6 +3199,118 @@ extern "C" int32_t cc_run_hit_test_selftest(const char* avatarPath,
     return g_failures;
 }
 
+// --- Batch E: the comic font setting (cc_set_comic_font) ---------------------
+// cc_set_comic_font writes ccContext().session.comicsFontFace/comicsFontPts --
+// the SAME two fields cc_compose.cpp's stripLogFontFromSession() reads to
+// build the LOGFONT cc_strip_create hands to CUnitPanelPage::SetFonts
+// (fonts.cpp). This selftest characterizes the full path: session defaults,
+// the setter's round trip (including its partial-update/sentinel rules), and
+// -- the actually-load-bearing check -- that a strip created AFTER a font
+// change really does draw its balloon text with the NEW face (via
+// CCRecordingCanvas::lastFontFace(), a non-log-format-affecting addition
+// documented on that method).
+static int cc_selftest_comic_font(const char* avatarPath) {
+    int startFailures = g_failures;
+
+    // (a) session defaults -- same values cc_selftest_balloon already pins,
+    // repeated here so this test is self-contained and fails locally if a
+    // PRIOR test in the same process left the session's font fields dirty
+    // (cc_set_comic_font has no "reset" call; this test explicitly restores
+    // the default at the end, see the tail of this function).
+    CC_CHECK(strcmp(ccContext().session.comicsFontFace, "Comic Sans MS") == 0);
+    CC_CHECK(ccContext().session.comicsFontPts == 12);
+
+    // (b) setter round trip: a real face + size updates both session fields.
+    cc_set_comic_font("Chalkboard", 18);
+    CC_CHECK(strcmp(ccContext().session.comicsFontFace, "Chalkboard") == 0);
+    CC_CHECK(ccContext().session.comicsFontPts == 18);
+
+    // (c) partial update: NULL face / 0 size each leave their OWN field
+    // unchanged (the bridge-facing "keep engine default" sentinel, per
+    // comicchat.h's doc comment) while the OTHER field still updates.
+    cc_set_comic_font(nullptr, 24);
+    CC_CHECK(strcmp(ccContext().session.comicsFontFace, "Chalkboard") == 0);  // unchanged
+    CC_CHECK(ccContext().session.comicsFontPts == 24);                       // updated
+
+    cc_set_comic_font("Marker Felt", 0);
+    CC_CHECK(strcmp(ccContext().session.comicsFontFace, "Marker Felt") == 0); // updated
+    CC_CHECK(ccContext().session.comicsFontPts == 24);                       // unchanged
+
+    cc_set_comic_font("", -5);
+    CC_CHECK(strcmp(ccContext().session.comicsFontFace, "Marker Felt") == 0); // unchanged ("" is a no-op like NULL)
+    CC_CHECK(ccContext().session.comicsFontPts == 24);                       // unchanged (negative is a no-op like 0)
+
+    // (d) the actually-load-bearing check: a FRESH strip created after
+    // cc_set_comic_font really draws its balloon text with the new face.
+    // cc_strip_create's stripLogFontFromSession() reads the session fields
+    // set above at CREATE time (fonts are per-strip -- comicchat.h's own doc
+    // comment on cc_set_comic_font), so this strip's balloon font is
+    // "Marker Felt" @ 24pt, not the "Comic Sans MS" default.
+    if (avatarPath != NULL) {
+        static CCRecordingCanvas fontMetrics;
+        cc_set_metrics_canvas(fontMetrics.handle());
+
+        cc_strip* s = cc_strip_create();
+        CC_CHECK(s != NULL);
+        if (s) {
+            int32_t p = cc_strip_add_participant(s, "Anna", avatarPath);
+            CC_CHECK(p == 1);
+            if (p >= 0) {
+                CC_CHECK(cc_strip_add_line(s, p, "Hello there", CC_MODE_SAY, NULL, 0) == 0);
+                CCRecordingCanvas composeCanvas;
+                CC_CHECK(cc_strip_compose(s, composeCanvas.handle()) == 0);
+                // The balloon text draw_text call carried the session's
+                // CURRENT face -- proving the change reached the strip's
+                // actual layout, not just the session struct.
+                CC_CHECK(composeCanvas.lastFontFace() == "Marker Felt");
+            }
+            cc_strip_destroy(s);
+        }
+
+        // (e) reflow proof, same strip/session: switching the font back to
+        // the default and creating ANOTHER fresh strip re-measures with the
+        // NEW (default) face -- i.e. the change is live per-strip, not
+        // baked in once. This is the "reflow after change re-measures"
+        // characterization the Kit-side test also covers at the Swift
+        // level; pinned here too since it is a one-line addition once (d)'s
+        // harness already exists.
+        cc_set_comic_font("Comic Sans MS", 12);
+        cc_strip* s2 = cc_strip_create();
+        CC_CHECK(s2 != NULL);
+        if (s2) {
+            int32_t p2 = cc_strip_add_participant(s2, "Anna", avatarPath);
+            CC_CHECK(p2 == 1);
+            if (p2 >= 0) {
+                CC_CHECK(cc_strip_add_line(s2, p2, "Hello there", CC_MODE_SAY, NULL, 0) == 0);
+                CCRecordingCanvas composeCanvas2;
+                CC_CHECK(cc_strip_compose(s2, composeCanvas2.handle()) == 0);
+                CC_CHECK(composeCanvas2.lastFontFace() == "Comic Sans MS");
+            }
+            cc_strip_destroy(s2);
+        }
+    }
+
+    // Restore the documented default so a LATER selftest in the same process
+    // (e.g. cc_selftest_balloon, if it ever ran after this one) still sees
+    // the pristine session default -- same "leave global state clean"
+    // posture cc_strip_destroy itself follows for comicsTitle/selfParticipant.
+    cc_set_comic_font("Comic Sans MS", 12);
+
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift wrapper. Runs standalone (resets g_failures),
+// same pattern as cc_run_panel_geometry_selftest. avatarPath is required (the
+// same "AddLine needs a registered speaker" constraint that selftest's own
+// doc comment states) -- part (d)/(e) above skip cleanly if somehow NULL, but
+// the Swift call site always passes a real fixture.
+extern "C" int32_t cc_run_comic_font_selftest(const char* avatarPath) {
+    g_failures = 0;
+    if (avatarPath == NULL) return 1;
+    cc_selftest_comic_font(avatarPath);
+    return g_failures;
+}
+
 // --- Plan 4a Task 7: title/starring lift (un-R11 AddTitle/UpdateTitle/
 //     AddStars/AddStarsAux + CStarLabel::Draw) + cc_strip_set_title/set_self.
 // Two participants -> set_self(p1) -> set_title("MY COMIC") -> two lines ->

@@ -253,6 +253,75 @@ public final class AppState {
         UNUserNotificationCenter.current().add(request)
     }
 
+    /// Batch E (event sounds): `mention.wav`/`whisper.wav`, played for the
+    /// SAME two notify-worthy kinds `handleNotificationEvent` above reacts
+    /// to (`NotificationEvent.kind` — mentions + inbound whispers), but with
+    /// its OWN, WIDER gate: "background room OR app inactive" (the brief's
+    /// exact wording), not `handleNotificationEvent`'s narrower "app not
+    /// active" alone. A mention arriving in a BACKGROUND room while the app
+    /// IS frontmost still gets a ding here — the user is looking at some
+    /// OTHER room's strip and would otherwise never notice — whereas
+    /// `handleNotificationEvent`'s system notification stays suppressed in
+    /// that case (the app is active, so no `UNNotificationRequest` fires;
+    /// this sound is the only signal for that specific case). A whisper has
+    /// no "room" concept at all (`NotificationEvent.kind.whisper` carries
+    /// none), so it is always "not the active room" by construction — a
+    /// whisper dings whenever the app is inactive OR always, really, since
+    /// there's no room to be "foregrounded" on for one; the `isActive` half
+    /// of the OR still applies identically to it.
+    ///
+    /// Gated on `settings.soundsEnabled` (the SAME toggle Task 9's inbound
+    /// `.sound` playback already uses) — Batch E does not add a separate
+    /// on/off switch for event sounds, matching the brief's "wire the
+    /// EXISTING SoundLibrary + soundsEnabled" instruction. Silent (no beep)
+    /// if `mention.wav`/`whisper.wav` isn't present in the sounds folder —
+    /// `SoundLibrary.resolve`'s own documented miss behavior.
+    private func playEventSound(for event: NotificationEvent) {
+        guard settings.soundsEnabled else { return }
+        let isBackgroundRoom: Bool
+        if case .mention(let room) = event.kind {
+            isBackgroundRoom = !room.isEmpty && room != activeRoom
+        } else {
+            isBackgroundRoom = false
+        }
+        guard isBackgroundRoom || !NSApp.isActive else { return }
+
+        let name: String
+        switch event.kind {
+        case .mention: name = "mention"
+        case .whisper: name = "whisper"
+        }
+        let folder = URL(fileURLWithPath: settings.soundsFolder)
+        guard let resolved = SoundLibrary(folder: folder).resolve(name) else { return }
+        eventSoundPlayer = try? AVAudioPlayer(contentsOf: resolved)
+        eventSoundPlayer?.play()
+    }
+
+    /// The one live event-sound `AVAudioPlayer` (Batch E) — kept separate
+    /// from `soundPlayer` (Task 9's INBOUND `#SOUND`-event player) so a
+    /// mention/whisper ding never cuts off (or gets cut off by) an
+    /// in-progress `#SOUND` clip; each of the app's two independent sound
+    /// categories owns its own single-slot player, same "one at a time
+    /// WITHIN a category, no cross-category interaction" posture as the
+    /// original's own per-event-type sound slots.
+    private var eventSoundPlayer: AVAudioPlayer?
+
+    /// `ChatSessionModel.onMemberJoinedSound` routes here (wired in
+    /// `connect()`), Batch E item (b) — a peer joined the ACTIVE room
+    /// (`onMemberJoinedSound`'s own doc comment: the Kit already scopes this
+    /// to the active room, so no `activeRoom`/background check is needed
+    /// here, unlike `playEventSound`'s mention case). Gated on
+    /// `settings.soundsEnabled` only — no app-active/background gate per
+    /// the brief (a join sound is a live, in-the-room ambience cue, not a
+    /// "you might have missed this" notify signal like mention/whisper).
+    private func playJoinSound() {
+        guard settings.soundsEnabled else { return }
+        let folder = URL(fileURLWithPath: settings.soundsFolder)
+        guard let resolved = SoundLibrary(folder: folder).resolve("join") else { return }
+        eventSoundPlayer = try? AVAudioPlayer(contentsOf: resolved)
+        eventSoundPlayer?.play()
+    }
+
     /// THE single chokepoint (Batch B) for the dock badge: total unread across
     /// every joined room (`rooms`, mirrored from `onRoomsChanged`) plus every
     /// whisper peer's unread (`whisperUnread`). Called wherever those two
@@ -919,7 +988,20 @@ public final class AppState {
                              // last persisted; a live Settings change after
                              // connect goes through `setPanelsPerRow` instead
                              // (`ComicSettingsView`'s binding), not this seed.
-                             panelsPerRow: settings.panelsPerRow)
+                             panelsPerRow: settings.panelsPerRow,
+                             // Batch E: seeds the session with whatever comic
+                             // font was last persisted; a live Settings
+                             // change after connect goes through
+                             // `setComicFont` instead (`ComicSettingsView`'s
+                             // binding), not this seed. `comicFontFace`
+                             // defaults to "Comic Sans MS" (the engine's own
+                             // compiled-in default) — passing it straight
+                             // through is harmless (`cc_set_comic_font` just
+                             // sets the field to its own current value);
+                             // `comicFontSize` defaults to 0, `cc_set_comic_font`'s
+                             // own "leave unchanged" sentinel.
+                             comicFontFace: settings.comicFontFace,
+                             comicFontSize: settings.comicFontSize)
 
         // Offline demo hook (Task 12): `--replay-fixture <path>` starts a
         // FixtureReplayServer over the given capture-shaped .jsonl and
@@ -992,7 +1074,16 @@ public final class AppState {
         m.onReconnectStateChanged = { [weak self] state in
             Task { @MainActor in self?.reconnectState = state } }
         m.onNotificationEvent = { [weak self] event in
-            Task { @MainActor in self?.handleNotificationEvent(event) } }
+            Task { @MainActor in
+                self?.handleNotificationEvent(event)
+                // Batch E: the event-sound hook fires ALONGSIDE the system
+                // notification, not instead of it — the two have different
+                // gates (`playEventSound`'s own doc comment: background-room
+                // OR inactive, vs. `handleNotificationEvent`'s inactive-only).
+                self?.playEventSound(for: event)
+            } }
+        m.onMemberJoinedSound = { [weak self] in
+            Task { @MainActor in self?.playJoinSound() } }
         model = m
         do { try await m.start(); showConnectSheet = false }
         catch {
@@ -1072,6 +1163,8 @@ public final class AppState {
         pendingWhisperPeer = nil
         soundPlayer?.stop()
         soundPlayer = nil
+        eventSoundPlayer?.stop()
+        eventSoundPlayer = nil
         // Auto-reconnect (spec §7): `model?.shutdown()` above already cancelled
         // any in-flight reconnect loop (`ChatSessionModel.shutdown` ->
         // `cancelReconnect`), so this just clears the mirrored indicator — a

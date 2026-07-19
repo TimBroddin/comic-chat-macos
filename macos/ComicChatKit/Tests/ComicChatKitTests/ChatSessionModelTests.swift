@@ -56,6 +56,25 @@ private final class ImagesBox: @unchecked Sendable {
 /// never `isOp`/`avatarName`, so projecting to nicks here preserves those
 /// assertions' exact strength while keeping `set(_:)` itself typed against
 /// the real `onMembers` payload.
+/// Thread-safe fire-count accumulator (Batch E: `onMemberJoinedSound`'s
+/// no-payload callback) — same lock-guarded-box shape as `ImagesBox`/
+/// `MembersBox` above, minimal because the callback carries nothing to
+/// record beyond "it fired".
+private final class CounterBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock(); defer { lock.unlock() }
+        count += 1
+    }
+
+    func get() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return count
+    }
+}
+
 private final class MembersBox: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [MemberRow] = []
@@ -302,6 +321,78 @@ extension EngineGlobalStateSelfTests {
                 try await Task.sleep(nanoseconds: 5_000_000)
             }
             #expect(members.get().contains("Peer"))
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Batch E: `onMemberJoinedSound` fires when a peer joins the ACTIVE
+        /// room. `AppState` turns this into `SoundLibrary(join.wav)`
+        /// playback; the Kit stays AVFoundation-free (same posture as
+        /// `onSound`'s own doc comment on `onNotificationEvent`'s
+        /// UserNotifications-free stance), so this only asserts the
+        /// callback itself fires.
+        @Test(.timeLimit(.minutes(1)))
+        func peerJoinInActiveRoomFiresJoinedSoundCallback() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            let firedCount = CounterBox()
+            model.onMemberJoinedSound = { firedCount.increment() }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            try await server.send(":Peer!u@h JOIN #p4")
+            while firedCount.get() == 0 {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(firedCount.get() == 1)
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Batch E: a peer joining a BACKGROUND room (not the active one)
+        /// must NOT fire `onMemberJoinedSound` — the hook is scoped to the
+        /// room currently on screen (`onMemberJoinedSound`'s own doc
+        /// comment), unlike the mention/whisper notification pair which
+        /// fire regardless of active room. Joins `#b` as a second room,
+        /// stays active on `#a`, then has a peer join `#b` and confirms the
+        /// callback never fires (settled via a real ambient wait, since
+        /// there's no positive event to poll for — this proves an ABSENCE).
+        @Test(.timeLimit(.minutes(1)))
+        func peerJoinInBackgroundRoomDoesNotFireJoinedSoundCallback() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#a", artDir: art))
+            let firedCount = CounterBox()
+            model.onMemberJoinedSound = { firedCount.increment() }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#a")
+
+            try await model.joinRoom("#b")
+            try await server.waitForClientLine(containing: "JOIN #b")
+            try await server.send(
+                ":Mac!mac@h JOIN :#b",
+                ":srv 353 Mac = #b :Mac",
+                ":srv 366 Mac #b :End of NAMES list")
+            while model.roomInfos.count < 2 {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+
+            // #a stays active throughout -- a peer joins the BACKGROUND #b.
+            #expect(model.currentRoom == "#a")
+            try await server.send(":Peer!u@h JOIN #b")
+
+            // No positive event to poll for (this proves an absence) -- a
+            // generous fixed settle covers the async callback dispatch path
+            // (handleLocked runs on the engine queue, the callback itself
+            // hops to main via DispatchQueue.main.async) before asserting
+            // the count never moved.
+            try await Task.sleep(nanoseconds: 200_000_000)
+            #expect(firedCount.get() == 0,
+                    "expected NO onMemberJoinedSound fire for a peer joining the background room #b while #a is active")
+
             model.shutdown()
             server.stop()
         }
@@ -951,6 +1042,97 @@ extension EngineGlobalStateSelfTests {
             await settle()
             #expect(model.panelGeometry?.perRow == 2,
                     "expected a live setPanelsPerRow(2) call to reflow to 2 columns at the last-known 600pt width (auto-fit had picked \(String(describing: autoFitPerRow)))")
+
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Batch E (the ticketed comic font surface): `setComicFont` reflows
+        /// the ALREADY-CONNECTED session (fonts are per-strip -- a live
+        /// change needs a fresh strip, `ChatSessionModel.setComicFont`'s own
+        /// doc comment). Two characterizations, matching the brief's "reflow
+        /// after change re-measures" requirement:
+        ///   (a) panelGeometry (unitW/unitH/perRow -- viewport-derived box
+        ///       geometry, unrelated to the font) stays STABLE across the
+        ///       font change -- proves the reflow doesn't silently perturb
+        ///       panel-box layout just because the balloon font changed;
+        ///   (b) the composed strip's pixel bytes DIFFER from the pre-change
+        ///       capture at the SAME geometry -- proves the new face
+        ///       actually reached the real CoreText render path (not just
+        ///       the session struct -- the C-level cc_run_comic_font_selftest
+        ///       already pins that at the recording-canvas layer; this is
+        ///       the Kit-level, real-render twin).
+        @Test(.timeLimit(.minutes(1)))
+        func setComicFontReflowsWithStableGeometryAndDifferentPixels() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            model.onStripImage = { image, _ in latestImage.set(image) }
+
+            func settle() async throws {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    model.settleEngineQueue { cont.resume() }
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            model.setViewport(widthPoints: 600, scale: 2.0)
+            try await settle()
+            try await model.send("hello there")
+            _ = try await waitForReceivedLine(server, containing: "hello there")
+            try await settle()
+
+            let geometryBefore = model.panelGeometry
+            guard let imageBefore = latestImage.get() else {
+                Issue.record("no strip image captured before font change")
+                return
+            }
+            let bytesBefore = try pixelBytes(imageBefore)
+
+            // A real, distinctly-shaped installed macOS font -- Courier's
+            // monospace glyphs render nothing like Comic Sans MS's default,
+            // so the composed pixels are guaranteed to differ.
+            model.setComicFont(face: "Courier", sizePoints: 18)
+            try await settle()
+
+            let geometryAfter = model.panelGeometry
+            guard let imageAfter = latestImage.get() else {
+                Issue.record("no strip image captured after font change")
+                return
+            }
+            let bytesAfter = try pixelBytes(imageAfter)
+
+            #expect(geometryAfter?.unitW == geometryBefore?.unitW
+                    && geometryAfter?.unitH == geometryBefore?.unitH
+                    && geometryAfter?.perRow == geometryBefore?.perRow,
+                    "expected panel-box geometry to stay stable across a font-only change: before=\(String(describing: geometryBefore)) after=\(String(describing: geometryAfter))")
+
+            // Precomputed Bool, not a direct #expect(bytesBefore == bytesAfter)
+            // -- same catastrophic-diff-on-large-Data avoidance as
+            // characterSwitchSurvivesReflowAtOriginalGeometry's own identical
+            // comment explains.
+            let identical = bytesBefore == bytesAfter
+            #expect(!identical,
+                    "expected the Courier-18pt reflow to render DIFFERENT pixels than the Comic-Sans-MS default at the same geometry -- byte-identical means the font change never reached the real render path. bytesBefore.count=\(bytesBefore.count) bytesAfter.count=\(bytesAfter.count)")
+
+            // GLOBAL STATE CLEANUP (load-bearing, not just tidiness):
+            // `cc_set_comic_font` writes ccContext().session.comicsFontFace/
+            // comicsFontPts -- process-global state with NO per-strip or
+            // per-model reset (unlike comicsTitle/selfParticipant/backdropID,
+            // which cc_strip_create/destroy DO clear every time — see
+            // cc_compose.cpp's own doc comments). Left at "Courier"/18 here,
+            // this leaks into every LATER test in the same process
+            // (StripTests.stripSnapshot's frozen golden log is measured
+            // against the DEFAULT font's metrics and broke exactly this way
+            // during this task's own development). Restore the default
+            // before shutdown, mirroring cc_run_comic_font_selftest's own
+            // tail-of-function restore for the identical reason.
+            model.setComicFont(face: "Comic Sans MS", sizePoints: 12)
+            try await settle()
 
             model.shutdown()
             server.stop()

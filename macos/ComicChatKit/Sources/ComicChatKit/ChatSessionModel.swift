@@ -48,6 +48,17 @@ public struct ChatConfig: Sendable {
     /// viewport via `PanelFit.unitPanelTwips(viewportWidthTwips:columns:)`,
     /// just fed this forced column count rather than the auto-fit one).
     public var panelsPerRow: Int
+    /// Batch E (the ticketed comic font surface): the balloon font face/size
+    /// defaults `setUpStripLocked` writes via `cc_set_comic_font` BEFORE
+    /// `Strip()`'s `init` triggers `cc_strip_create` (fonts are per-strip —
+    /// `cc_set_comic_font`'s own doc comment). `comicFontFace` empty (default)
+    /// and `comicFontSize == 0` (default) both mean "engine default" —
+    /// `cc_set_comic_font`'s own NULL/""-face and 0/negative-size sentinels —
+    /// so an unconfigured session never touches the session's compiled-in
+    /// "Comic Sans MS" @ 12pt at all, matching every pre-Batch-E session's
+    /// behavior exactly.
+    public var comicFontFace: String
+    public var comicFontSize: Int
     /// Auto-reconnect (spec §7): gates the model's backoff-reconnect loop on an
     /// UNEXPECTED network drop. `true` (default) matches a real live session's
     /// desired resilience; `false` disables it for the replay-fixture dev path
@@ -68,6 +79,7 @@ public struct ChatConfig: Sendable {
                 profileText: String = "",
                 sendComicsData: Bool = true, acceptWhispers: Bool = true,
                 autoDownloadAvatars: Bool = true, panelsPerRow: Int = 0,
+                comicFontFace: String = "", comicFontSize: Int = 0,
                 autoReconnect: Bool = true) {
         self.host = host
         self.port = port
@@ -84,6 +96,8 @@ public struct ChatConfig: Sendable {
         self.acceptWhispers = acceptWhispers
         self.autoDownloadAvatars = autoDownloadAvatars
         self.panelsPerRow = panelsPerRow
+        self.comicFontFace = comicFontFace
+        self.comicFontSize = comicFontSize
         self.autoReconnect = autoReconnect
     }
 }
@@ -405,6 +419,21 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// UserNotifications-free (that framework needs a real app bundle,
     /// unavailable under `swift test`).
     public var onNotificationEvent: (@Sendable (NotificationEvent) -> Void)?
+
+    /// Fired on the MAIN thread (Batch E) when a peer joins the ACTIVE room
+    /// (`.userJoined`, gated on `isActiveRoom` — a join in a BACKGROUND room
+    /// does not fire this; the brief's event-sound hook is scoped to the room
+    /// currently on screen, unlike `onNotificationEvent`'s mention/whisper
+    /// pair, which fire regardless of which room is active). Carries no
+    /// payload — the app layer only needs to know "play the join sound now";
+    /// which nick joined is already visible in the strip panel that just
+    /// composed. Kept separate from `onNotificationEvent` (rather than
+    /// widening `NotificationEvent.Kind` with a third case) because a join is
+    /// not a mention/whisper-shaped "someone is trying to reach you" event —
+    /// it is a plain ambient-room event, and Batch B's whole notification
+    /// machinery (auth request, `UNUserNotificationCenter`, app-inactive
+    /// gating) is deliberately NOT involved for it.
+    public var onMemberJoinedSound: (@Sendable () -> Void)?
 
     /// `var` (Plan 4b Task 5): `changeCharacter` updates the model's OWN
     /// notion of `config.characterName` so a subsequent `reflowLocked()` (or
@@ -1035,6 +1064,18 @@ public final class ChatSessionModel: @unchecked Sendable {
         // (and, per `metricsCanvasBox`'s doc comment, it would be actively
         // harmful to transiently drop the only reference to) rebuild it on
         // every strip recreation.
+        // Batch E: sets the session's comic-font DEFAULTS before `Strip()`
+        // below triggers `cc_strip_create` — fonts are per-strip (measured
+        // and baked into the CFontInfo statics once, at create time), so
+        // this MUST run before that call, every time (fresh start AND every
+        // reflow alike), not just once at session start. `""`/`0` are each
+        // `cc_set_comic_font`'s own "leave this field unchanged" sentinels
+        // (its doc comment), so an unconfigured `config.comicFontFace`/
+        // `comicFontSize` (both empty/zero by default) is a complete no-op
+        // here, leaving the session's compiled-in "Comic Sans MS" @ 12pt
+        // exactly as every pre-Batch-E session left it.
+        cc_set_comic_font(config.comicFontFace, Int32(config.comicFontSize))
+
         if metricsCanvasBox == nil {
             let metrics = CTMetricsCanvas()
             let box = CanvasBox(metrics)
@@ -1534,7 +1575,19 @@ public final class ChatSessionModel: @unchecked Sendable {
             // when that room is active; a background room defers rendering to
             // its next activation (transcript already appended). A join does
             // NOT bump unread (clarification 3).
-            if isActiveRoom { applyToBridgeLocked(ev); recomposeLocked() }
+            if isActiveRoom {
+                applyToBridgeLocked(ev); recomposeLocked()
+                // Batch E: the event-sound hook is scoped to the ACTIVE room
+                // only (this branch already is) — a join in a background
+                // room fires no sound, matching `onMemberJoinedSound`'s own
+                // doc comment. `fromServer` is NOT checked here (unlike the
+                // mention/whisper notification guards): there is no
+                // synthetic self-`.userJoined` anywhere in this model (only
+                // `changeCharacter` synthesizes a self `.appearsAs`), so this
+                // can only ever be a real peer joining.
+                let cb = onMemberJoinedSound
+                DispatchQueue.main.async { cb?() }
+            }
             if let key = scopedKey { emitMembers(for: key) }
 
         case .nickChanged(_, let newNick, let isSelf):
@@ -2893,6 +2946,35 @@ public final class ChatSessionModel: @unchecked Sendable {
             self.config.panelsPerRow = perRow
             guard self.didSetViewport, self.lastViewportWidthPoints > 0 else { return }
             self.applyViewportLocked(widthPoints: self.lastViewportWidthPoints, scale: self.currentScale)
+        }
+    }
+
+    /// Batch E (the ticketed comic font surface): live comic-font change.
+    /// Unlike `setPanelsPerRow`'s geometry (which `applyViewportLocked` can
+    /// re-derive without necessarily reflowing), a font change has NO
+    /// "no-op if unchanged" fast path — `cc_set_comic_font`'s doc comment is
+    /// explicit that fonts are measured ONCE per strip, at `cc_strip_create`
+    /// time (`CUnitPanelPage::SetFonts`, baked into the `CFontInfo` statics),
+    /// so the ONLY way a live change ever reaches an already-laid-out panel
+    /// is to tear down the strip and build a fresh one — a full reflow of
+    /// the active room, exactly like `rebuildStripLocked`'s other callers.
+    /// A no-op before any strip exists yet (`strip == nil` — `config` is
+    /// still updated so the NEXT `setUpStripLocked` picks it up, matching
+    /// `setPanelsPerRow`'s own "config always updates, reflow only if there's
+    /// something live to reflow" shape).
+    ///
+    /// `resetAnnounce: false` (unlike `setViewport`'s `true`): a font swap is
+    /// purely cosmetic to peers — nothing about our own avatar/pose changed
+    /// on the wire, so there is no reason to re-greet already-greeted peers
+    /// (mirrors `setActiveRoom`'s own `resetAnnounce: false` reasoning, which
+    /// is a tab switch, not a resize).
+    public func setComicFont(face: String, sizePoints: Int) {
+        engineQueue.async { [weak self] in
+            guard let self, !self.isShutDown else { return }
+            self.config.comicFontFace = face
+            self.config.comicFontSize = sizePoints
+            guard self.strip != nil else { return }
+            self.rebuildStripLocked(for: self.activeRoom, resetAnnounce: false)
         }
     }
 

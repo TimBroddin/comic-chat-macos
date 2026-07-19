@@ -148,4 +148,17 @@ struct EngineGlobalStateSelfTests {
         let other = fixture("armando.avb")
         #expect(cc_run_hit_test_selftest(avatar, other) == 0)
     }
+
+    // Batch E: the comic font setting (cc_set_comic_font). Pins the session
+    // font defaults, exercises the setter's round trip + partial-update
+    // sentinel rules (NULL/"" face, 0/negative size each leave their OWN
+    // field unchanged), and proves the load-bearing behavior: a strip
+    // created AFTER a font change composes its balloon text with the NEW
+    // face (fonts are per-strip -- a live change needs a fresh strip, i.e. a
+    // reflow), and switching back + creating another fresh strip re-measures
+    // with whatever face is current at THAT later create call.
+    @Test func comicFontSelfTestPasses() {
+        let avatar = fixture("anna.avb")
+        #expect(cc_run_comic_font_selftest(avatar) == 0)
+    }
 }

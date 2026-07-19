@@ -1,5 +1,32 @@
 import Foundation
 
+/// A user-saved server/room bookmark (Batch E) — the Connect sheet's
+/// Favorites section, distinct from `KnownServers` (the app's own curated,
+/// hardcoded list): a favorite is created by the USER, from whatever they
+/// currently have typed into the connect sheet's fields, via that sheet's
+/// star button.
+///
+/// Deliberately dead simple per the brief ("no folders, no ordering UI"): a
+/// flat, append-ordered array is the entire model — no drag-to-reorder, no
+/// grouping. `id` is a fresh `UUID` per favorite (not derived from
+/// host/port, unlike `KnownServer.id`) so two favorites can legitimately
+/// share a host/port with different rooms/names without colliding.
+public struct FavoriteConnection: Codable, Equatable, Identifiable, Sendable {
+    public let id: UUID
+    public var name: String
+    public var host: String
+    public var port: Int
+    public var room: String
+
+    public init(id: UUID = UUID(), name: String, host: String, port: Int, room: String) {
+        self.id = id
+        self.name = name
+        self.host = host
+        self.port = port
+        self.room = room
+    }
+}
+
 /// Typed `UserDefaults` wrapper for the app's persisted connect/persona/comic
 /// settings (Plan 4a Task 9). Every property is a plain computed accessor
 /// over an injected `UserDefaults` instance — no caching, no notifications:
@@ -114,6 +141,34 @@ public struct SettingsStore {
         nonmutating set { defaults.set(newValue, forKey: Keys.panelsPerRow) }
     }
 
+    /// Batch E (the ticketed comic font surface): the balloon font FACE
+    /// consumed by `cc_set_comic_font` (bridge-only, `engine_context.cpp`) —
+    /// see that function's doc comment for the storage this ultimately
+    /// writes (`ccContext().session.comicsFontFace`, read fresh by every
+    /// `cc_strip_create`). Default "Comic Sans MS" matches the session's OWN
+    /// compiled-in default (`engine_context.h`), so an unconfigured install
+    /// behaves exactly as before this setting existed.
+    public var comicFontFace: String {
+        get { defaults.string(forKey: Keys.comicFontFace) ?? "Comic Sans MS" }
+        nonmutating set { defaults.set(newValue, forKey: Keys.comicFontFace) }
+    }
+
+    /// The balloon font SIZE in points (the original's ComicsFont LOGFONT
+    /// height convention — a positive point size, never GDI's negated
+    /// char-height form; see `cc_set_comic_font`'s doc comment for the exact
+    /// twips conversion this feeds). `0` (default) means "engine default" —
+    /// `cc_set_comic_font`'s own `size_points <= 0` sentinel for "leave the
+    /// session's compiled-in 12pt unchanged" — so an unconfigured install
+    /// never calls the setter with a bogus size at all (see `ChatConfig`'s
+    /// plumbing: a `0` here is not forwarded as a live font change).
+    public var comicFontSize: Int {
+        get {
+            guard defaults.object(forKey: Keys.comicFontSize) != nil else { return 0 }
+            return defaults.integer(forKey: Keys.comicFontSize)
+        }
+        nonmutating set { defaults.set(newValue, forKey: Keys.comicFontSize) }
+    }
+
     // MARK: Protocol (Plan 4b Task 5)
 
     /// Gates `ChatSessionModel.send`'s outbound cooked pose annotations: when
@@ -192,6 +247,26 @@ public struct SettingsStore {
         nonmutating set { defaults.set(newValue, forKey: Keys.notificationsEnabled) }
     }
 
+    // MARK: Favorites (Batch E)
+
+    /// User-saved server/room bookmarks (the Connect sheet's Favorites
+    /// section) — persisted as JSON `Data` under one key (rather than one
+    /// `UserDefaults` entry per field per favorite, which `KnownServer`'s
+    /// hardcoded-in-source list has no need to do). A decode failure (should
+    /// never happen outside a corrupted defaults database) degrades to an
+    /// empty list rather than crashing/throwing — the Connect sheet simply
+    /// shows no favorites rather than refusing to open.
+    public var favorites: [FavoriteConnection] {
+        get {
+            guard let data = defaults.data(forKey: Keys.favorites) else { return [] }
+            return (try? JSONDecoder().decode([FavoriteConnection].self, from: data)) ?? []
+        }
+        nonmutating set {
+            guard let data = try? JSONEncoder().encode(newValue) else { return }
+            defaults.set(data, forKey: Keys.favorites)
+        }
+    }
+
     private enum Keys {
         static let server = "connect.server"
         static let port = "connect.port"
@@ -204,11 +279,14 @@ public struct SettingsStore {
         static let backdrop = "comic.backdrop"
         static let comicMode = "view.comicMode"
         static let panelsPerRow = "comic.panelsPerRow"
+        static let comicFontFace = "comic.fontFace"
+        static let comicFontSize = "comic.fontSize"
         static let sendComicsData = "protocol.sendComicsData"
         static let acceptWhispers = "protocol.acceptWhispers"
         static let soundsEnabled = "sounds.enabled"
         static let soundsFolder = "sounds.folder"
         static let autoDownloadAvatars = "art.autoDownloadAvatars"
         static let notificationsEnabled = "notifications.enabled"
+        static let favorites = "favorites.list"
     }
 }
