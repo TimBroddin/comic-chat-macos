@@ -136,6 +136,15 @@ public enum WireCodec {
     /// display text. RECORDED DEVIATION (Plan 4b live-fix 6, Fix 2;
     /// modern-usability, coordinator-sanctioned) -- NOT a fidelity fix.
     ///
+    /// SCOPE AMENDMENT (live-fix batch review, I1): because this runs at
+    /// `ProtocolEvent.from` -- the single event-construction site -- the
+    /// stripped text becomes the CANONICAL `ProtocolEvent`, so the SAVED
+    /// transcript (`ConversationFile.events`) is display-normalized too: raw
+    /// mIRC codes are not preserved on the production save path (the rig's
+    /// wire captures remain the only raw record). Wire bytes, outbound text,
+    /// and annotations are untouched. This is deliberate and recorded, not
+    /// an oversight.
+    ///
     /// FIDELITY CHECK (p4b-bugB-diagnosis.md's mandated first step, verified
     /// against the read-only original at v2.5-beta-1-modern/): the 1998
     /// client does NOT strip mIRC control codes from inbound message text.
