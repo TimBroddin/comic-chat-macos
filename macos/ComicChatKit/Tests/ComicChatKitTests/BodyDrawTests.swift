@@ -100,9 +100,12 @@ struct EngineGlobalStateSelfTests {
     // set_self_emotion + self_annotations producing a cooked block with
     // plausible wire emotion/intensity bytes, preview_self_text changing the
     // resulting pose vs. a neutral baseline, and all four rejecting on a strip
-    // with no self set yet.
+    // with no self set yet. Plan 4b live-fix 4: also switches the self avatar
+    // mid-test (second fixture) and re-checks the self APIs, proving they
+    // follow the CURRENT avatar id rather than the stale participant id.
     @Test func selfEmotionSelfTestPasses() {
         let avatar = fixture("armando.avb")
-        #expect(cc_run_self_emotion_selftest(avatar) == 0)
+        let other = fixture("anna.avb")
+        #expect(cc_run_self_emotion_selftest(avatar, other) == 0)
     }
 }

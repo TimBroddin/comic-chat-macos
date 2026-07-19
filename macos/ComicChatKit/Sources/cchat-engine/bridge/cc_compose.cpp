@@ -692,11 +692,37 @@ extern "C" int32_t cc_strip_set_self(cc_strip* s, int32_t participant) {
 
 // ============================================================================
 // Plan 4b Task 2: emotion-wheel engine surface. All four resolve the SELF
-// avatar the same way: ccContext().session.selfParticipant (R17, set by
-// cc_strip_set_self above) -> GetAvatar(id). A strip with no self set yet
-// (selfParticipant == 0, the CCSessionSettings default) or a self id that no
-// longer resolves to a registered avatar rejects every one of these with -1,
+// avatar the same way, via `selfAvatarID` below: ccContext().session.
+// selfParticipant (R17, set by cc_strip_set_self) is a PARTICIPANT id; the
+// CURRENT avatar it names is `lookupUser(selfParticipant)->GetAvatarID()`, NOT
+// `selfParticipant` itself. A strip with no self set yet (selfParticipant == 0)
+// or a self id that no longer resolves rejects every one of these with -1,
 // matching cc_strip_set_self's own error-code convention.
+//
+// Live-fix (Plan 4b live-fix 4): these four previously used `GetAvatar(
+// selfParticipant)` DIRECTLY, conflating the participant id with the avatar id
+// -- the SAME bug live-fix 3 fixed in the line-ingestion path. After ANY
+// self-avatar change, cc_strip_set_participant_avatar re-points the self
+// CUserInfo at a freshly-loaded avatar under a NEW avatar id while
+// selfParticipant is unchanged, so GetAvatar(selfParticipant) returned the OLD
+// avatar. The wheel's pose preview then read the OLD avatar's poseID and fed it
+// into the NEW character's `.avb` (ChatSessionModel.selfAvatarFile, reopened on
+// the switch) -- a mismatched index space rendering the wrong pose (Tim's live
+// report: the center pose preview showed a garbage/wrong pose after a character
+// change). Every self API now resolves the current avatar id first.
+
+// Resolves the CURRENT self avatar id (the participant's live GetAvatarID()),
+// or 0 if no self is set / the participant no longer resolves. Centralizes the
+// participant-id -> current-avatar-id translation all four Task-2 self APIs
+// need (the original's CBodyCam always operated on the live self avatar, never
+// a stale id).
+static UINT selfAvatarID() {
+    UINT part = ccContext().session.selfParticipant;   // R17
+    if (part == 0) return 0;
+    CUserInfo* pui = ccContext().session.lookupUser(part);
+    if (!pui) return 0;
+    return pui->GetAvatarID();
+}
 
 // cc_strip_set_self_emotion: the wheel drag -- the original CBodyCam::
 // UpdateEmotion chain (bodycam.cpp:436) minus the HWND cursor-drawing/status-
@@ -714,7 +740,7 @@ extern "C" int32_t cc_strip_set_self(cc_strip* s, int32_t participant) {
 // compiler error, since both parameters are `double`.
 extern "C" int32_t cc_strip_set_self_emotion(cc_strip* s, double angle_radians, double intensity01) {
     if (!s) return -1;
-    UINT self = ccContext().session.selfParticipant;   // R17
+    UINT self = selfAvatarID();   // live-fix 4: current avatar id, not participant id
     if (self == 0) return -1;
     CAvatarX* av = GetAvatar((USHORT)self);
     if (!av) return -1;
@@ -737,11 +763,11 @@ extern "C" int32_t cc_strip_set_self_emotion(cc_strip* s, double angle_radians, 
 // failure returns -- only "no self set" is an error here.
 extern "C" int32_t cc_strip_preview_self_text(cc_strip* s, const char* text_bytes) {
     if (!s || !text_bytes) return -1;
-    UINT self = ccContext().session.selfParticipant;   // R17
+    UINT self = selfAvatarID();   // live-fix 4: current avatar id, not participant id
     if (self == 0) return -1;
     if (!GetAvatar((USHORT)self)) return -1;
     CString text(text_bytes);
-    ChatPreSendText(text, (int)self);
+    ChatPreSendText(text, (int)self);   // ChatPreSendText takes an AVATAR id (textpose.cpp:125)
     return 0;
 }
 
@@ -768,7 +794,7 @@ extern "C" int32_t cc_strip_preview_self_text(cc_strip* s, const char* text_byte
 extern "C" int32_t cc_strip_self_pose(cc_strip* s, int32_t* out_pose_index) {
     if (out_pose_index) *out_pose_index = -1;
     if (!s) return -1;
-    UINT self = ccContext().session.selfParticipant;   // R17
+    UINT self = selfAvatarID();   // live-fix 4: current avatar id, not participant id
     if (self == 0) return -1;
     CAvatarX* av = GetAvatar((USHORT)self);
     if (!av || !av->m_body) return -1;
@@ -798,7 +824,7 @@ extern "C" int32_t cc_strip_self_pose(cc_strip* s, int32_t* out_pose_index) {
 // their zeroed defaults -- caller's job (Task 3), per the brief.
 extern "C" int32_t cc_strip_self_annotations(cc_strip* s, cc_annotations* out) {
     if (!s || !out) return -1;
-    UINT self = ccContext().session.selfParticipant;   // R17
+    UINT self = selfAvatarID();   // live-fix 4: current avatar id, not participant id
     if (self == 0) return -1;
     CAvatarX* av = GetAvatar((USHORT)self);
     if (!av || !av->m_body) return -1;

@@ -294,7 +294,95 @@ extension EngineGlobalStateSelfTests {
             #expect(sameSwitchIsNoOp,
                     "a switch to the SAME character must render byte-identically to a never-switched session of that character. switchedSame.count=\(switchedSame.count) plainSusan.count=\(plainSusan.count)")
         }
+
+        // MARK: - Live-fix 4: wheel self-pose preview must track the switch
+
+        /// Plan 4b live-fix 4 (Tim's live report: the emotion-wheel center pose
+        /// preview showed a wrong/garbage pose — a head icon, not a full-body
+        /// pose — after live-fix 2/3 landed). Bisected at the KIT boundary
+        /// (a connected model → `setEmotion` → `onSelfPose`): the Kit fires a
+        /// non-nil image in BOTH cases, so a bare non-nil check is too weak. The
+        /// real defect is that after `changeCharacter`, the Task-2 self APIs
+        /// (`cc_strip_self_pose`/`set_self_emotion`/`preview_self_text`/
+        /// `self_annotations`) resolved the SELF avatar via
+        /// `GetAvatar(selfParticipant)` — the raw PARTICIPANT id — but
+        /// `cc_strip_set_participant_avatar` re-pointed the self CUserInfo at a
+        /// freshly-loaded avatar under a NEW avatar id (the same
+        /// participant-id-vs-avatar-id conflation live-fix 3 fixed for line
+        /// ingestion). So `selfPoseIndex()` read the OLD avatar's poseID, which,
+        /// fed into the NEW character's `.avb` (`selfAvatarFile`, reopened on the
+        /// switch), landed on a mismatched pose (a head icon) instead of the
+        /// intended full-body pose. Fix: every Task-2 self API resolves the
+        /// CURRENT avatar id (`pui->GetAvatarID()`) via `selfAvatarID()`.
+        ///
+        /// OBSERVABLE (differential): a session that switches anna→susan then
+        /// drives the wheel must produce the SAME self-pose image as a control
+        /// that STARTED as susan and drove the wheel identically. Pre-fix the
+        /// switched session produced the stale-avatar pose (different bytes,
+        /// even a different SIZE — a head icon vs a full body); post-fix they
+        /// match byte-for-byte. A guard scenario (fresh anna, no switch) pins
+        /// that the common case still fires a non-nil pose.
+        @Test(.timeLimit(.minutes(1)))
+        func wheelSelfPoseFollowsCharacterSwitch() async throws {
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+
+            // Drives one model to a connected+joined state, optionally switches
+            // character, then fires setEmotion and returns the last self-pose
+            // image's pixel bytes (nil if none fired).
+            func selfPose(start: String, switchTo: String?) async throws -> Data? {
+                let box = SelfPoseBox()
+                let server = try LoopbackIRCServer()
+                let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                           nick: "Mac", room: "#p4",
+                                                           characterName: start, artDir: art))
+                model.onSelfPose = { img in box.set(img) }
+                func settle() async throws {
+                    await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                        model.settleEngineQueue { c.resume() }
+                    }
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
+                try await model.start()
+                try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+                try await settle()
+                if let switchTo { model.changeCharacter(switchTo); try await settle() }
+                model.setEmotion(angle: 0.0, intensity: 1.0)
+                try await settle()
+                defer { model.shutdown(); server.stop() }
+                guard let img = box.lastImage() else { return nil }
+                return try pixelBytesLocal(img)
+            }
+
+            // Guard: the common (fresh, never-switched) case still fires a pose.
+            let fresh = try await selfPose(start: "anna", switchTo: nil)
+            #expect(fresh != nil,
+                    "a fresh connected model's setEmotion must fire onSelfPose with a non-nil pose image")
+
+            // The fix: a switched anna->susan self-pose must equal a control
+            // that started as susan (both drove the wheel identically) — proves
+            // the wheel preview tracks the CURRENT avatar, not the stale one.
+            let switchedToSusan = try await selfPose(start: "anna", switchTo: "susan")
+            let plainSusan = try await selfPose(start: "susan", switchTo: nil)
+            #expect(switchedToSusan != nil && plainSusan != nil,
+                    "both switched and control self-pose images must be non-nil")
+            let poseMatches = switchedToSusan == plainSusan
+            #expect(poseMatches,
+                    "after a switch to susan, the wheel self-pose must match a susan-from-start control; a mismatch means the Task-2 self APIs read the STALE participant avatar (the reported wrong-pose bug). switched.count=\(switchedToSusan?.count ?? -1) control.count=\(plainSusan?.count ?? -1)")
+        }
     }
+}
+
+/// Live-fix 4: thread-safe single-slot box for the last `onSelfPose` image.
+/// `onSelfPose` is a `@Sendable` main-thread callback read from the test's own
+/// task, same lock-guarded shape as `LatestImageBoxLocal`.
+private final class SelfPoseBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: CGImage?
+    func set(_ image: CGImage?) {
+        lock.lock(); defer { lock.unlock() }
+        if let image { last = image }
+    }
+    func lastImage() -> CGImage? { lock.lock(); defer { lock.unlock() }; return last }
 }
 
 /// Live-fix 3: local single-slot image box + full-image pixel readback,

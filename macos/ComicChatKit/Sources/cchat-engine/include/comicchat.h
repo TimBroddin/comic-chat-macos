@@ -72,9 +72,11 @@ int32_t cc_run_strip_title_starring_selftest(const char* avatar_path, const char
  * one participant, calls set_self, and exercises cc_strip_self_pose /
  * cc_strip_set_self_emotion / cc_strip_self_annotations / cc_strip_preview_self_text
  * against it (plus the "no self set" rejection case on a fresh strip with no
- * set_self call). Returns 0 on success (failure count otherwise). Kept out of
- * cc_run_selftests because it needs the fixture path. */
-int32_t cc_run_self_emotion_selftest(const char* avatar_path);
+ * set_self call, and -- Plan 4b live-fix 4 -- a post-cc_strip_set_participant_avatar
+ * switch case using other_avatar_path, proving the self APIs follow the CURRENT
+ * avatar id, not the stale participant id). Returns 0 on success (failure count
+ * otherwise). Kept out of cc_run_selftests because it needs the fixture paths. */
+int32_t cc_run_self_emotion_selftest(const char* avatar_path, const char* other_avatar_path);
 
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var

@@ -2860,7 +2860,7 @@ extern "C" int32_t cc_run_strip_title_starring_selftest(const char* avatarPath,
 //       priority 5 via ID_RULE_WAVE's CheckStart* clause) changes self_pose's
 //       result vs. a neutral baseline captured right after add_participant.
 //   (4) all four reject (nonzero) on a strip with NO self set.
-static int cc_selftest_self_emotion(const char* avatarPath) {
+static int cc_selftest_self_emotion(const char* avatarPath, const char* otherAvatarPath) {
     int startFailures = g_failures;
 
     static CCRecordingCanvas selfEmotionMetrics;
@@ -2928,17 +2928,53 @@ static int cc_selftest_self_emotion(const char* avatarPath) {
     CC_CHECK(cc_strip_self_pose(s, &postPreviewPose) == 0);
     CC_CHECK(postPreviewPose != prePreviewPose);
 
+    // --- (5) Plan 4b live-fix 4: the self APIs must follow a
+    //     cc_strip_set_participant_avatar switch on the SELF participant. Pre-
+    //     fix, cc_strip_self_pose/self_emotion/self_annotations resolved
+    //     GetAvatar(selfParticipant) off the raw participant id, which
+    //     set_participant_avatar leaves unchanged while re-pointing the self
+    //     CUserInfo at a NEW avatar id -- so they operated on the STALE (pre-
+    //     switch) avatar (Tim's live wrong-pose report). A "still returns a
+    //     valid pose" check is too weak (the stale avatar is ALSO valid); the
+    //     distinguishing observable is that the SAME emotion, applied after
+    //     switching to a DIFFERENT avatar (otherAvatarPath != avatarPath), must
+    //     drive a DIFFERENT self_pose than it did on the original avatar --
+    //     because the two avatars have distinct pose-id layouts. With the stale-
+    //     id bug, self_pose keeps reading the OLD avatar, so the pose is
+    //     IDENTICAL to the pre-switch pose for the same emotion (the RED this
+    //     asserts against). Guard: the switch must actually move the self's
+    //     avatar id (so we exercise the divergent path, not a same-id reuse).
+    CC_CHECK(cc_strip_set_self_emotion(s, 0.0, 1.0) == 0);   // fixed emotion on the ORIGINAL avatar
+    int32_t preSwitchPose = -1;
+    CC_CHECK(cc_strip_self_pose(s, &preSwitchPose) == 0);
+    UINT selfAvBefore = ccContext().session.lookupUser(
+        ccContext().session.selfParticipant)->GetAvatarID();
+    CC_CHECK(cc_strip_set_participant_avatar(s, p, otherAvatarPath) == 0);
+    UINT selfAvAfter = ccContext().session.lookupUser(
+        ccContext().session.selfParticipant)->GetAvatarID();
+    CC_CHECK(selfAvAfter != selfAvBefore);           // the switch really moved the id
+    CC_CHECK(cc_strip_set_self_emotion(s, 0.0, 1.0) == 0);   // SAME emotion, now on the NEW avatar
+    int32_t postSwitchPose = -1;
+    CC_CHECK(cc_strip_self_pose(s, &postSwitchPose) == 0);
+    CC_CHECK(postSwitchPose > 0);                    // a valid pose from the CURRENT avatar
+    CC_CHECK(postSwitchPose != preSwitchPose);       // and it FOLLOWED the switch (RED pre-fix: stale == equal)
+    cc_annotations annSwitched;
+    memset(&annSwitched, 0, sizeof(annSwitched));
+    CC_CHECK(cc_strip_self_annotations(s, &annSwitched) == 0);
+    CC_CHECK(annSwitched.cooked == 1);
+
     cc_strip_destroy(s);
     return g_failures - startFailures;
 }
 
-// C entry point for the Swift wrapper, which passes the fixture avatar path.
-// Runs standalone (resets g_failures) -- same pattern as
-// cc_run_avatar_api_selftest.
-extern "C" int32_t cc_run_self_emotion_selftest(const char* avatarPath) {
+// C entry point for the Swift wrapper, which passes two fixture avatar paths
+// (the second drives the post-switch self-API check, case 5). Runs standalone
+// (resets g_failures) -- same pattern as cc_run_avatar_api_selftest.
+extern "C" int32_t cc_run_self_emotion_selftest(const char* avatarPath,
+                                                const char* otherAvatarPath) {
     g_failures = 0;
-    if (avatarPath == NULL) return 1;
-    cc_selftest_self_emotion(avatarPath);
+    if (avatarPath == NULL || otherAvatarPath == NULL) return 1;
+    cc_selftest_self_emotion(avatarPath, otherAvatarPath);
     return g_failures;
 }
 
