@@ -57,6 +57,13 @@ DEVELOPER_ID_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
     | head -1 \
     | sed -E 's/^[[:space:]]*[0-9]+\) [A-F0-9]+ "(.*)"$/\1/' || true)"
 
+# The Team ID embedded in the Developer ID identity (the 10-char code in
+# parentheses). Passed explicitly to both archive and export so a keychain
+# holding identities from more than one team signs with the RIGHT one, rather
+# than letting automatic signing guess. Overridable via DEVELOPMENT_TEAM.
+DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-$(printf '%s' "$DEVELOPER_ID_IDENTITY" \
+    | sed -E 's/.*\(([A-Z0-9]{10})\)$/\1/')}"
+
 if [[ -z "$DEVELOPER_ID_IDENTITY" ]]; then
     warn "No \"Developer ID Application\" signing identity found in your keychain."
     warn "Falling back to ad-hoc signing (CODE_SIGN_IDENTITY=\"-\") so the"
@@ -88,6 +95,8 @@ xcodebuild \
     archive \
     -archivePath "$ARCHIVE_PATH" \
     CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
+    CODE_SIGN_STYLE="Manual" \
+    DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
     OTHER_CODE_SIGN_FLAGS="--timestamp" \
     ENABLE_HARDENED_RUNTIME=YES \
     || fail "Archive failed. See build output above."
@@ -117,7 +126,9 @@ cat > "$EXPORT_PLIST" <<PLIST
     <key>method</key>
     <string>$EXPORT_METHOD</string>
     <key>signingStyle</key>
-    <string>automatic</string>
+    <string>manual</string>
+    <key>teamID</key>
+    <string>$DEVELOPMENT_TEAM</string>
 </dict>
 </plist>
 PLIST
