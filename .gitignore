@@ -442,3 +442,6 @@ FodyWeavers.xsd
 *.msp
 .gstack/
 .superpowers/
+
+# scripts/release.sh output (archive, export, notarization zip, DMG)
+/build/
