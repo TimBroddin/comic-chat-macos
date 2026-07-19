@@ -122,14 +122,14 @@ struct RoomBox {
 }
 
 /// A room's tab-bar summary (Plan 4b Task 7). `Identifiable` by `name` so
-/// SwiftUI's `RoomTabBar` `ForEach` can key on it directly.
+/// the rooms sidebar's `ForEach` can key on it directly.
 public struct RoomInfo: Sendable, Equatable, Identifiable {
     public var id: String { name }
     public let name: String
     public let unread: Int
     public let isActive: Bool
     /// Quick-wins batch item 6: the room's current topic (from `.topicChanged`,
-    /// tracked model-side in `roomTopics` — see that property's doc comment
+    /// tracked model-side in `RoomBox.topic` — see that property's doc comment
     /// for why NOT `session.room(_:).topic` directly), empty until a
     /// `.topicChanged` has actually arrived for this room. Drives the sidebar
     /// row's subtitle.
@@ -1758,7 +1758,7 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// active flag). Reads `roomOrder`/`rooms`/`activeRoom` — all engine-queue
     /// state. Live-fix 1: `roomOrder`'s entries are case-folded KEYS; `name`
     /// resolves each box's `displayName` (the server-cased/user-facing form)
-    /// so `RoomTabBar`/every other UI consumer of `RoomInfo.name` shows the
+    /// so the rooms sidebar/every other UI consumer of `RoomInfo.name` shows the
     /// server's own casing, never the lowercased lookup key.
     private func roomInfosLocked() -> [RoomInfo] {
         roomOrder.compactMap { key in

@@ -365,10 +365,10 @@ extension EngineGlobalStateSelfTests {
 
             // HEAD PRESENCE (live-fix 7): the preview is the DrawBody composite
             // canvas render, whose pixel size is the CGCanvas-scaled portrait box
-            // (2400x3600 twips @ scale 2 -> 240x360 pt -> 480x720 px), NOT a raw
-            // pose record. A bare single-record poseImage(0) on the same complex
-            // avatar (anna) has the record bitmap's own dimensions, which differ
-            // — the pin against the old headless single-record preview path.
+            // (2400x3600 twips @ scale 2 -> 240x360 pt), NOT a raw pose record.
+            // A bare single-record poseImage(0) on the same complex avatar (anna)
+            // has the record bitmap's own dimensions, which differ — the pin
+            // against the old headless single-record preview path.
             if let freshImg {
                 // Expected composite-canvas size: same arithmetic as CGCanvas.init
                 // (widthTwips/20 * scale, rounded), for the 2400x3600 box @ 2.0.

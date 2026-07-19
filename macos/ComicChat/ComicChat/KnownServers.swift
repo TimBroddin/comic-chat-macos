@@ -66,9 +66,9 @@ public enum KnownServers {
             KnownServer(
                 name: "Local rig",
                 host: "127.0.0.1",
-                port: 6669,
+                port: 6668,
                 room: "#comicrig",
-                blurb: "This machine's capture rig (when running).",
+                blurb: "This machine's capture rig proxy (when running).",
                 protocolNote: "dev"
             )
         )
