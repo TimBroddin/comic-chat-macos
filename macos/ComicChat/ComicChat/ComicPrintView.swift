@@ -2,20 +2,25 @@ import AppKit
 
 /// The Print… / Export as PDF… drawing surface (Plan 4b Task 10): draws one
 /// composed strip `CGImage` scaled to fit the page WIDTH, with vertical
-/// pagination coming free from `NSPrintOperation`/`NSPrintInfo` simply
-/// because this view's own `frame` is taller than one page — AppKit's
-/// printing machinery slices a tall view into successive pages on its own
-/// (no manual page-break math needed here, matching the brief's "vertical
-/// pagination free via NSPrintInfo").
+/// pagination handled by AppKit's automatic slicing on tall NSView instances
+/// during `NSPrintOperation` printing — NSView's default behavior slices
+/// successive vertical pages automatically (no manual page-break math needed,
+/// matching the brief's "vertical pagination free via NSPrintInfo").
+///
+/// Two PDF output paths with different behaviors:
+///   - `NSPrintOperation` printing: AppKit auto-paginates the tall view into
+///     successive vertical pages. The print panel's "Save as PDF…" button uses
+///     this flow, which is the brief's PDF export half.
+///   - `dataWithPDF(inside: bounds)` direct export: intentionally produces one
+///     tall single-page PDF (the full strip in one output), a legitimate strip
+///     export mode for Export-as-PDF command-line saves.
 ///
 /// Used two ways:
 ///   - `AppState.printTranscript()`: wrapped in an interactive
 ///     `NSPrintOperation(view:printInfo:)` — the print panel ALSO offers its
-///     own "Save as PDF…" button, which is the brief's "PDF export = the
-///     print panel's PDF button" half of the PDF story.
+///     own "Save as PDF…" button.
 ///   - `AppState.exportPDF()`: `dataWithPDF(inside: bounds)` directly, no
-///     panel — the brief's "plus a direct `dataWithPDF(inside:)` save for
-///     Export as PDF" half.
+///     panel.
 final class ComicPrintView: NSView {
     private let image: CGImage
     private let scaledSize: CGSize
@@ -49,14 +54,5 @@ final class ComicPrintView: NSView {
         // rect it's given in the context's OWN (possibly-flipped) coordinate
         // space, so this single full-bounds draw is correct either way.
         ctx.draw(image, in: NSRect(origin: .zero, size: scaledSize))
-    }
-
-    override func knowsPageRange(_ range: NSRangePointer) -> Bool {
-        range.pointee = NSRange(location: 1, length: 1)
-        return true
-    }
-
-    override func rectForPage(_ page: Int) -> NSRect {
-        bounds
     }
 }
