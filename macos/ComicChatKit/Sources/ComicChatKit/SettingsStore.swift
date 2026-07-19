@@ -163,6 +163,21 @@ public struct SettingsStore {
         nonmutating set { defaults.set(newValue, forKey: Keys.autoDownloadAvatars) }
     }
 
+    // MARK: Notifications (Plan 4b Batch B)
+
+    /// Gates `AppState`'s mention/whisper `UNUserNotificationCenter` posts
+    /// (`ChatSessionModel.onNotificationEvent`'s app-layer consumer). Default
+    /// `true` — notifications are opt-OUT, matching every other Advanced-tab
+    /// toggle's "on by default, disable if unwanted" posture
+    /// (`sendComicsData`/`acceptWhispers`/`autoDownloadAvatars`).
+    public var notificationsEnabled: Bool {
+        get {
+            guard defaults.object(forKey: Keys.notificationsEnabled) != nil else { return true }
+            return defaults.bool(forKey: Keys.notificationsEnabled)
+        }
+        nonmutating set { defaults.set(newValue, forKey: Keys.notificationsEnabled) }
+    }
+
     private enum Keys {
         static let server = "connect.server"
         static let port = "connect.port"
@@ -179,5 +194,6 @@ public struct SettingsStore {
         static let soundsEnabled = "sounds.enabled"
         static let soundsFolder = "sounds.folder"
         static let autoDownloadAvatars = "art.autoDownloadAvatars"
+        static let notificationsEnabled = "notifications.enabled"
     }
 }

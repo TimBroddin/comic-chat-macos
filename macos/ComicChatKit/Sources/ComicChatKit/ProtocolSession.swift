@@ -1155,10 +1155,26 @@ public final class ProtocolSession: @unchecked Sendable {
                 rooms[key]!.members[nick] = member
             }
 
-        case .awayPeer(let nick, _):
+        case .awayPeer(let nick, let message):
+            // Away-return fix (Plan 4b Batch B): the wire-level CTCP grammar
+            // this rides (`protsupp.cpp`'s `awayID` parse, ported faithfully
+            // from the original's `ShowAway`/`ChatSetAway`, protsupp.cpp:1240-
+            // 1266/3744-3770) already carries BOTH directions in one marker —
+            // a peer going away sends `\x01AWAY <msg>\x01`; a peer RETURNING
+            // sends the same marker with an EMPTY message, `\x01AWAY\x01`
+            // (`ChatSetAway(bAway: FALSE, ...)`'s empty-`szMesg` branch). The
+            // C parser (`ccPayloadAwayPeer`) already reproduces this grammar
+            // verbatim (its own doc comment: "an empty message after the AWAY
+            // prefix means 'back'") and hands the empty-or-not message straight
+            // through — this Swift side was the only piece NOT reading it:
+            // it unconditionally set `isAway = true` regardless of `message`,
+            // silently dropping the "back" signal already sitting in the
+            // event payload. Fixed here: non-empty -> away, empty -> back,
+            // mirroring `ShowAway`'s own `BOOL bAway = !strAwayMsg.IsEmpty()`.
+            let isAway = !message.isEmpty
             for key in rooms.keys {
                 guard var member = rooms[key]!.members[nick] else { continue }
-                member.isAway = true
+                member.isAway = isAway
                 rooms[key]!.members[nick] = member
             }
 

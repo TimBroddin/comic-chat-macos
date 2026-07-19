@@ -55,8 +55,11 @@ struct WhisperBox: View {
         .onChange(of: selectedPeer) { _, newValue in
             // Clear the badge for whichever tab just became active (existing
             // history read, not a network round-trip — same instant clear
-            // the original's leaf-focus behavior implies).
-            if let newValue { appState.whisperUnread[newValue] = 0 }
+            // the original's leaf-focus behavior implies). Routed through
+            // `clearWhisperUnread(for:)` (Batch B) rather than writing
+            // `whisperUnread` directly, so the dock badge chokepoint sees
+            // this clear too.
+            if let newValue { appState.clearWhisperUnread(for: newValue) }
         }
         .task {
             // Window-open hand-off: `showWhisperBox(peer:)` stashes the
@@ -67,7 +70,7 @@ struct WhisperBox: View {
             if let pending = appState.pendingWhisperPeer {
                 selectedPeer = pending
                 appState.pendingWhisperPeer = nil
-                appState.whisperUnread[pending] = 0
+                appState.clearWhisperUnread(for: pending)
             } else if selectedPeer == nil {
                 selectedPeer = appState.whisperPeers.first
             }

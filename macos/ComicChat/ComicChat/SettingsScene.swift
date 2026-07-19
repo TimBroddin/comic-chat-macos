@@ -196,6 +196,9 @@ private struct AdvancedSettingsView: View {
             Toggle("Send Comics Data", isOn: settingsBinding(\.sendComicsData))
             Toggle("Accept Whispers", isOn: settingsBinding(\.acceptWhispers))
             Toggle("Auto-Download Avatars", isOn: settingsBinding(\.autoDownloadAvatars))
+            // Batch B: gates AppState's mention/whisper UNUserNotificationCenter
+            // posts (`ChatSessionModel.onNotificationEvent`'s app-layer consumer).
+            Toggle("Notify on Mentions & Whispers", isOn: settingsBinding(\.notificationsEnabled))
             Picker("Default Encoding", selection: settingsBinding(\.encoding)) {
                 Text("Windows-1252").tag(WireEncoding.cp1252)
                 Text("UTF-8").tag(WireEncoding.utf8)

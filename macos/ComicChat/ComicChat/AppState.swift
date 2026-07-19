@@ -4,6 +4,7 @@ import CoreGraphics
 import AVFoundation
 import AppKit
 import SwiftUI
+import UserNotifications
 import ComicChatKit
 
 /// Diagnostic sink for the `--debug-pose-probe` launch hook (live-fix 7 —
@@ -191,6 +192,93 @@ public final class AppState {
     /// mid-clip). A new `.sound` event replaces it outright — matching the
     /// original's one-sound-at-a-time posture, no mixing/queueing.
     private var soundPlayer: AVAudioPlayer?
+
+    // MARK: Notifications + dock badge (Plan 4b Batch B)
+
+    /// Set once `requestNotificationAuthorizationIfNeeded()` has fired the
+    /// (one-time, process-lifetime) authorization request — guards against
+    /// asking the OS again on every single mention/whisper. NOT a proxy for
+    /// "authorized": a user who denies still has this `true` after the first
+    /// ask, and `handleNotificationEvent`'s own `UNUserNotificationCenter
+    /// .add(_:)` call below simply gets silently ignored for a denied app,
+    /// same as any other app.
+    private var notificationAuthRequested = false
+
+    /// Lazily requests `UNUserNotificationCenter` authorization on first use
+    /// (called from `handleNotificationEvent`, i.e. the first time there is
+    /// actually something to notify about — no reason to prompt at launch
+    /// before the user has even connected). `.provisional` is used (per the
+    /// brief: "provisional is fine") — this delivers notifications quietly to
+    /// Notification Center without an upfront permission dialog, matching a
+    /// background chat client's low-stakes notification use case.
+    private func requestNotificationAuthorizationIfNeeded() {
+        guard !notificationAuthRequested else { return }
+        notificationAuthRequested = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .provisional]) { _, _ in }
+    }
+
+    /// `ChatSessionModel.onNotificationEvent` routes here (wired in
+    /// `connect()`), Batch B — a mention or inbound whisper detected
+    /// engine-queue-side. Gated on `settings.notificationsEnabled` (the
+    /// Advanced-tab toggle) and on the app NOT being active: `NSApp.isActive`
+    /// is checked on the MAIN thread (this callback already arrives on main,
+    /// per `NotificationEvent`'s own doc comment) — a foreground app already
+    /// shows the mention/whisper live (the strip panel / whisper-box badge),
+    /// so a system notification on top would be redundant noise while the
+    /// user is already looking at the window.
+    private func handleNotificationEvent(_ event: NotificationEvent) {
+        guard settings.notificationsEnabled else { return }
+        guard !NSApp.isActive else { return }
+        requestNotificationAuthorizationIfNeeded()
+
+        let content = UNMutableNotificationContent()
+        switch event.kind {
+        case .mention(let room):
+            content.title = room.isEmpty ? "Mentioned by \(event.fromNick)" : "Mentioned in \(room)"
+            content.subtitle = event.fromNick
+        case .whisper:
+            content.title = "Whisper from \(event.fromNick)"
+        }
+        content.body = event.text
+        content.sound = .default
+        // userInfo carries enough to deep-link back to the room on click, if
+        // a future `UNUserNotificationCenterDelegate` wants it (bonus, per the
+        // brief — not wired up beyond this payload today; clicking a
+        // notification already activates the app via the system's own
+        // default click-to-foreground behavior with no delegate needed).
+        if case .mention(let room) = event.kind {
+            content.userInfo = ["room": room]
+        }
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    /// THE single chokepoint (Batch B) for the dock badge: total unread across
+    /// every joined room (`rooms`, mirrored from `onRoomsChanged`) plus every
+    /// whisper peer's unread (`whisperUnread`). Called wherever those two
+    /// mirrors change — `handleRoomsChanged` (room unread bumps/clears),
+    /// `recordWhisper` (a fresh inbound whisper), and `showWhisperBox`/
+    /// `WhisperBox`'s own clear-on-select (routed back here via
+    /// `clearWhisperUnread(for:)` below, so the view layer never touches
+    /// `NSApp.dockTile` directly). Empty string clears the badge (`NSApp
+    /// .dockTile.badgeLabel = nil`/`""` both hide it; `nil` is the documented
+    /// "no badge" value).
+    private func updateDockBadge() {
+        let roomsUnread = rooms.reduce(0) { $0 + $1.unread }
+        let whisperTotal = whisperUnread.values.reduce(0, +)
+        let total = roomsUnread + whisperTotal
+        NSApp.dockTile.badgeLabel = total > 0 ? "\(total)" : nil
+    }
+
+    /// Clears `peer`'s whisper-unread count and refreshes the dock badge — the
+    /// chokepoint `WhisperBox`'s tab-select/window-open handlers call instead
+    /// of writing `appState.whisperUnread[peer] = 0` directly, so the badge
+    /// mirror (`updateDockBadge`'s doc comment) stays in sync with every
+    /// mutation site, not just `recordWhisper`'s.
+    public func clearWhisperUnread(for peer: String) {
+        whisperUnread[peer] = 0
+        updateDockBadge()
+    }
 
     /// Creates the user sounds folder on first launch, if it doesn't already
     /// exist (D1 §4.2 / spec §5 amendment: it ships EMPTY — no bundled WAVs
@@ -585,6 +673,7 @@ public final class AppState {
             pendingWhisperPeer = peer
             if !whisperPeers.contains(peer) { whisperPeers.append(peer) }
             whisperUnread[peer] = 0
+            updateDockBadge()
         }
     }
 
@@ -600,6 +689,7 @@ public final class AppState {
         whisperHistories[peer, default: []].append(line)
         if !line.isOwn {
             whisperUnread[peer, default: 0] += 1
+            updateDockBadge()
         }
     }
 
@@ -639,6 +729,7 @@ public final class AppState {
     /// `lastKnownActiveRoom` so a fresh connect starts clean.
     private func handleRoomsChanged(_ infos: [RoomInfo]) {
         rooms = infos
+        updateDockBadge()
         let newActive = infos.first { $0.isActive }?.name
         if newActive != lastKnownActiveRoom {
             selectedMembers = []
@@ -849,6 +940,8 @@ public final class AppState {
             Task { @MainActor in self?.appendServerMessage(text) } }
         m.onReconnectStateChanged = { [weak self] state in
             Task { @MainActor in self?.reconnectState = state } }
+        m.onNotificationEvent = { [weak self] event in
+            Task { @MainActor in self?.handleNotificationEvent(event) } }
         model = m
         do { try await m.start(); showConnectSheet = false }
         catch {
@@ -933,6 +1026,12 @@ public final class AppState {
         // `cancelReconnect`), so this just clears the mirrored indicator — a
         // fresh manual connect starts from a clean "no reconnect state" slate.
         reconnectState = nil
+        // Batch B: `rooms = []`/`whisperUnread = [:]` above don't necessarily
+        // route through `handleRoomsChanged`/`recordWhisper` (no model left to
+        // fire either callback once `shutdown()` has run) — clear the dock
+        // badge explicitly so a disconnected app doesn't keep showing a stale
+        // count.
+        updateDockBadge()
     }
 
     /// Live-fix 3 (crypthome.com, live-reproduced: `432 Anonymous :Reserved

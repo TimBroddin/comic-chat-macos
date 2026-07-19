@@ -327,12 +327,11 @@ private struct MemberGridCell: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                         .frame(width: 40, height: 40)
                 }
-                // Quick-wins batch item 4: away badge (mirrors
-                // `ProtocolSession.RoomMember.isAway`, set from an inbound
-                // `.awayPeer` event — display-only, see `MemberRow.isAway`'s
-                // doc comment for how "live" this actually is: there is no
-                // wire event that ever clears it back to false within this
-                // port's event surface).
+                // Quick-wins batch item 4 (Batch B clear-fix): away badge
+                // (mirrors `ProtocolSession.RoomMember.isAway`, set AND
+                // cleared from an inbound `.awayPeer` event — see
+                // `MemberRow.isAway`'s doc comment for the away-return
+                // finding). Display-only.
                 if row.isAway {
                     Image(systemName: "moon.zzz.fill")
                         .font(.caption2)

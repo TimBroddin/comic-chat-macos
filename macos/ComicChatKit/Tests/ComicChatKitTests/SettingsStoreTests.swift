@@ -81,4 +81,18 @@ struct SettingsStoreTests {
         let reloaded = SettingsStore(defaults: defaults)
         #expect(reloaded.panelsPerRow == 4)
     }
+
+    /// Batch B: `notificationsEnabled` defaults to `true` (opt-out, matching
+    /// every other Advanced-tab protocol/art toggle) and round-trips.
+    @Test func notificationsEnabledDefaultsToTrueAndRoundTrips() {
+        let defaults = freshDefaults()
+        let store = SettingsStore(defaults: defaults)
+        #expect(store.notificationsEnabled == true)
+
+        store.notificationsEnabled = false
+        #expect(store.notificationsEnabled == false)
+
+        let reloaded = SettingsStore(defaults: defaults)
+        #expect(reloaded.notificationsEnabled == false)
+    }
 }

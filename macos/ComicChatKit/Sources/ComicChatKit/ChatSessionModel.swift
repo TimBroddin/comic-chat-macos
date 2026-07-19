@@ -98,6 +98,37 @@ public struct WhisperLine: Sendable, Equatable {
     }
 }
 
+/// Fired from `handleLocked` (engine-queue detection — Plan 4b Batch B) for
+/// two notification-worthy inbound events: a room `.text`/`.action` whose
+/// text contains our own nick (case-folded `contains`, NOT true whole-word
+/// matching — a simple substring test, documented deviation: "Tim" also
+/// matches inside "Timothy") and an inbound whisper (either wire shape —
+/// `.whisper` or a plain-IRC whisper-shaped `.text`, both already detected by
+/// the SAME machinery `whisperBoxRoutingLocked`'s call sites use). Fires ONLY
+/// for `fromServer` events (never our own synthetic self-say/echo) and NEVER
+/// for an ignored nick — mirrors `.text`/`.action`'s own ignore-doctrine guard
+/// (`ignoredNicks`, `handleLocked`'s doc comment) so a silenced nick can't
+/// still buzz a notification. The APP layer (`AppState`) turns this into a
+/// `UNUserNotificationCenter` post — this Kit stays UserNotifications-free
+/// (UN requires a proper app bundle; `swift test` has none — see the type's
+/// own callback-testability doc, tested here via loopback: the callback
+/// itself, not the OS notification).
+public struct NotificationEvent: Sendable {
+    public enum Kind: Sendable, Equatable {
+        case mention(room: String)
+        case whisper
+    }
+    public let kind: Kind
+    public let fromNick: String
+    public let text: String
+
+    public init(kind: Kind, fromNick: String, text: String) {
+        self.kind = kind
+        self.fromNick = fromNick
+        self.text = text
+    }
+}
+
 /// One joined room's state (Plan 4b Task 7: true multi-room). Each room keeps
 /// its OWN canonical event-log transcript (the transcript doctrine, unchanged
 /// — just per-room now); the ONE live strip is rebuilt from whichever room is
@@ -186,12 +217,17 @@ public struct MemberRow: Sendable, Equatable, Identifiable {
     public let nick: String
     public let isOp: Bool
     public let avatarName: String
-    /// Quick-wins batch item 4: mirrors `ProtocolSession.RoomMember.isAway`
-    /// (set from an inbound `.awayPeer` event — see `emitMembers`'s doc
-    /// comment for how live this actually is: there is no corresponding
-    /// "no longer away" wire event this port's `ProtocolEvent` surface
-    /// carries, so a peer's row stays badged away for the rest of the
-    /// session once set, display-only either way).
+    /// Quick-wins batch item 4, clear-fix in Batch B: mirrors
+    /// `ProtocolSession.RoomMember.isAway`, set/cleared from an inbound
+    /// `.awayPeer` event. Batch B finding: the wire-level CTCP marker this
+    /// rides already carries BOTH directions (a peer going away sends
+    /// `\x01AWAY <msg>\x01`; RETURNING sends the same marker with an EMPTY
+    /// message, `\x01AWAY\x01` — `protsupp.cpp`'s ported `ccPayloadAwayPeer`
+    /// parse already reproduces this grammar faithfully) — `ProtocolSession`'s
+    /// `.awayPeer` handler now reads the empty-vs-non-empty message to flip
+    /// this both ways (previously it only ever set `true`, silently dropping
+    /// the "back" signal already sitting in the event payload). Display-only
+    /// here either way — the actual flag lives on `RoomMember`.
     public let isAway: Bool
     /// Quick-wins batch item 5 (original CUserInfo m_bIgnored): whether this
     /// nick is in `ChatSessionModel.ignoredNicks` — drives the member grid's
@@ -332,6 +368,15 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// ALONGSIDE): this is the structured signal the UI keys its indicator off,
     /// so it doesn't have to string-match status text.
     public var onReconnectStateChanged: (@Sendable (ReconnectState) -> Void)?
+    /// Fired on the MAIN thread (Plan 4b Batch B) for a mention (a room
+    /// `.text`/`.action` whose text contains our own nick) or an inbound
+    /// whisper (either wire shape) — see `NotificationEvent`'s own doc comment
+    /// for the exact detection rule and the `fromServer`/ignore guards. The
+    /// app layer (`AppState`) turns this into a `UNUserNotificationCenter`
+    /// post, gated on the app being inactive — this Kit stays
+    /// UserNotifications-free (that framework needs a real app bundle,
+    /// unavailable under `swift test`).
+    public var onNotificationEvent: (@Sendable (NotificationEvent) -> Void)?
 
     /// `var` (Plan 4b Task 5): `changeCharacter` updates the model's OWN
     /// notion of `config.characterName` so a subsequent `reflowLocked()` (or
@@ -1362,7 +1407,14 @@ public final class ChatSessionModel: @unchecked Sendable {
             // `return`ed for a matching echo).
             let isWhisper = ProtocolEvent.isWhisperShapedText(ev, ownNick: currentOwnNick)
             if isWhisper {
-                whisperBoxRoutingLocked(nick: nick, text: text)
+                whisperBoxRoutingLocked(nick: nick, text: text, fromServer: fromServer)
+            } else {
+                // Mention notification (Batch B): only for a genuine channel
+                // message (not a whisper-shaped one — that already fired the
+                // `.whisper` notification kind above), from the server, and
+                // not from an ignored nick.
+                notifyIfMentionLocked(nick: nick, text: text, room: scopedRoom,
+                                      fromServer: fromServer)
             }
             // Strip/unread routing: a plain-IRC whisper is session-scoped
             // (`channel == nil`), so it never bumps a room's unread or strip;
@@ -1383,10 +1435,14 @@ public final class ChatSessionModel: @unchecked Sendable {
                                              isMessage: !isWhisper && fromServer)
             }
 
-        case .action(let nick, _, _):
+        case .action(let nick, let text, _):
             if !ignoredNicks.contains(ignoreKey(nick)) {
                 handleRoomMessageStripEffect(ev, isActiveRoom: isActiveRoom, room: scopedKey,
                                              isMessage: fromServer)
+                // Mention notification (Batch B): an ACTION line ("/me ...")
+                // can carry our nick too — same detection, same guards.
+                notifyIfMentionLocked(nick: nick, text: text, room: scopedRoom,
+                                      fromServer: fromServer)
             }
 
         case .whisper(let nick, _, let text, _):
@@ -1416,7 +1472,7 @@ public final class ChatSessionModel: @unchecked Sendable {
             // when room-scoped and active," dropping the old `|| channel ==
             // nil` fallback entirely. A whisper does NOT bump unread either
             // way.
-            whisperBoxRoutingLocked(nick: nick, text: text)
+            whisperBoxRoutingLocked(nick: nick, text: text, fromServer: fromServer)
             // Quick-wins batch item 5 (ignore): the whisper BOX still shows
             // the line unconditionally (`whisperBoxRoutingLocked` above,
             // unaffected — ignore is a STRIP-rendering filter, not a
@@ -1572,6 +1628,23 @@ public final class ChatSessionModel: @unchecked Sendable {
             let cb = onSound
             DispatchQueue.main.async { cb?(nick, file) }
 
+        // Away-return (Batch B READ-FIRST finding): `ProtocolSession`'s own
+        // `.awayPeer` handler already updates `RoomMember.isAway` for every
+        // room the nick is a member of (both directions, since that fix —
+        // see `ProtocolSession.handleEvent`'s `.awayPeer` case doc comment
+        // for the wire-grammar citation), but NOTHING previously re-derived
+        // the member list afterward — this case was missing entirely
+        // (falling through to `default: break`), so `onMembers` never
+        // re-fired and `MemberRow.isAway` stayed stuck at whatever it was
+        // when the sidebar was last built. `.awayPeer` carries no channel
+        // token of its own (it rides a plain PRIVMSG, room-scoped or not
+        // depending on target) — refresh the ACTIVE room's sidebar, same
+        // "session-wide peer state change -> refresh what's visible" posture
+        // `.nickChanged`/`.userQuit` already use above for other session-wide
+        // peer facts.
+        case .awayPeer:
+            emitMembers(for: activeRoom)
+
         default:
             break
         }
@@ -1698,15 +1771,60 @@ public final class ChatSessionModel: @unchecked Sendable {
     ///     actually produce, and the ONLY reason this method takes the
     ///     already-destructured `nick`/`text` rather than a `ProtocolEvent`
     ///     itself (the two cases carry different case shapes).
-    private func whisperBoxRoutingLocked(nick: String, text: String) {
+    ///
+    /// - Parameter fromServer: Batch B — passed straight through from
+    ///   `handleLocked`'s own parameter (both call sites are reached from
+    ///   `handleLocked`'s `.text`/`.whisper` cases, which run for both real
+    ///   wire events and synthetic ones); gates the `onNotificationEvent`
+    ///   fire below so a hypothetical future synthetic whisper-shaped event
+    ///   never buzzes a notification for something we said ourselves.
+    private func whisperBoxRoutingLocked(nick: String, text: String, fromServer: Bool = true) {
         if _acceptWhispers {
             let line = WhisperLine(nick: nick, text: text, isOwn: false)
             _whisperHistories[nick, default: []].append(line)
             let cb = onWhisper
             DispatchQueue.main.async { cb?(nick, line) }
+            // Notification (Batch B): a whisper is always notification-worthy
+            // (it's addressed to us specifically) — same fromServer/ignore
+            // guards as the mention path (`notifyIfMentionLocked`'s doc
+            // comment), applied inline here since a whisper has no separate
+            // "room" concept to check a mention against.
+            if fromServer, !ignoredNicks.contains(ignoreKey(nick)) {
+                let ncb = onNotificationEvent
+                let event = NotificationEvent(kind: .whisper, fromNick: nick, text: text)
+                DispatchQueue.main.async { ncb?(event) }
+            }
         } else {
             emitStatus("Whisper from \(nick) blocked (whispers disabled)")
         }
+    }
+
+    /// ENGINE QUEUE ONLY (Batch B). Fires `onNotificationEvent` with
+    /// `.mention(room:)` when `text` contains our own current nick,
+    /// case-folded — a simple `contains`, NOT a true whole-word match (a
+    /// documented deviation: a nick like "Tim" also matches inside "Timothy";
+    /// acceptable per the brief's "whole-word-ish... simple case-folded
+    /// contains is acceptable" allowance). Guarded the same way every other
+    /// notification-worthy path on this type is: only for `fromServer` events
+    /// (never our own synthetic self-say/echo) and never for an ignored nick
+    /// (mirrors `.text`/`.action`'s own `ignoredNicks` guard in `handleLocked`,
+    /// though callers already skip calling this for an ignored nick too — the
+    /// check is repeated here so this method is safe to call unconditionally
+    /// from any future call site). Never fires for our OWN nick speaking (a
+    /// self-say containing our own nick is not a "mention" in any useful
+    /// sense, and `fromServer` alone doesn't rule that out for a server that
+    /// echoes PRIVMSGs back — the own-echo dedup upstream already drops the
+    /// echo before this is ever reached, but the nick-equality check is kept
+    /// as a defensive belt-and-suspenders guard).
+    private func notifyIfMentionLocked(nick: String, text: String, room: String?, fromServer: Bool) {
+        guard fromServer, !ignoredNicks.contains(ignoreKey(nick)) else { return }
+        guard nick.caseInsensitiveCompare(currentOwnNick) != .orderedSame else { return }
+        guard !currentOwnNick.isEmpty,
+              text.range(of: currentOwnNick, options: [.caseInsensitive]) != nil else { return }
+        let roomName = room.map { rooms[roomKey($0)]?.displayName ?? $0 } ?? ""
+        let cb = onNotificationEvent
+        let event = NotificationEvent(kind: .mention(room: roomName), fromNick: nick, text: text)
+        DispatchQueue.main.async { cb?(event) }
     }
 
     /// ENGINE QUEUE ONLY. Plan 4b Task 6 (D4 §4): kicks off a peer avatar
