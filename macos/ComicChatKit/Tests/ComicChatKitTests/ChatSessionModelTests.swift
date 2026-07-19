@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import CoreGraphics
+import ImageIO
 import cchat_engine
 @testable import ComicChatKit
 
@@ -177,6 +178,92 @@ extension EngineGlobalStateSelfTests {
             var missIter = missArrived.stream.makeAsyncIterator()
             let miss = await missIter.next()
             #expect(miss == .some(nil))   // completion fired, with nil (no avatar)
+
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Panel export/copy (Plan 4b Batch D): `ChatSessionModel.panelImage`
+        /// over a LIVE model (real CoreText metrics -- unlike the deterministic
+        /// Strip-layer coverage in StripTests.composePanelProducesDistinctLocalOriginImages,
+        /// this exercises the actual engine-queue sync hop + real-avatar
+        /// canvas path the context-menu action drives). Two peer lines from
+        /// two different speakers produce (at least) two panels; asserts
+        /// `panelImage` is non-nil for a real index, sized to the unit-panel
+        /// box (Strip.panelGeometry's unitW/unitH in points-at-scale, matching
+        /// StripTests's own expectedW/H arithmetic), byte-differs between two
+        /// different panel indices (proof it composes the RIGHT panel each
+        /// time, not a cached/stale image), and returns nil for an
+        /// out-of-range index.
+        @Test(.timeLimit(.minutes(1)))
+        func panelImageNonNilCorrectSizeAndDiffersBetweenPanels() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            let images = ImagesBox()
+            let imagesArrived = AsyncStream<Void>.makeStream()
+            model.onStripImage = { _, size in
+                images.append(size)
+                imagesArrived.continuation.yield()
+            }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            var iter = imagesArrived.stream.makeAsyncIterator()
+            // First peer line -> panel 0 (or later, if a title panel precedes
+            // it -- this test doesn't set a title, so panel 0 is the first
+            // speech panel).
+            try await server.send(":Win!u@h PRIVMSG #p4 :(#G295E193M1)hello mac")
+            _ = await iter.next()
+            // A second line from a DIFFERENT speaker (self, via model.send)
+            // forces a new panel (a fresh speaker/addressee pair breaks the
+            // panel, matching the strip snapshot's own alternating-speaker
+            // panel-per-line shape) -- guarantees panelCount >= 2 so indices
+            // 0 and 1 are both real, distinct panels.
+            try await model.send("hi win")
+            _ = await iter.next()
+
+            #expect(model.panelCount >= 2)
+            guard let geo = model.panelGeometry else {
+                Issue.record("panelGeometry was nil after composing")
+                model.shutdown(); server.stop()
+                return
+            }
+
+            let scale: CGFloat = 2.0
+            guard let image0 = model.panelImage(at: 0, scale: scale) else {
+                Issue.record("panelImage(at: 0) returned nil")
+                model.shutdown(); server.stop()
+                return
+            }
+            guard let image1 = model.panelImage(at: 1, scale: scale) else {
+                Issue.record("panelImage(at: 1) returned nil")
+                model.shutdown(); server.stop()
+                return
+            }
+
+            // Right size: the unit panel box in points-at-scale (same
+            // arithmetic StripTests.stripPNG/composePanelProducesDistinctLocalOriginImages
+            // use for the full/per-panel canvas).
+            let expectedW = Int((CGFloat(geo.unitW) / 20.0 * scale).rounded())
+            let expectedH = Int((CGFloat(geo.unitH) / 20.0 * scale).rounded())
+            #expect(image0.width == expectedW)
+            #expect(image0.height == expectedH)
+            #expect(image1.width == expectedW)
+            #expect(image1.height == expectedH)
+
+            // Byte-differs between two different panels (different
+            // speaker/balloon content per panel).
+            let bytes0 = pngBytesForTest(image0)
+            let bytes1 = pngBytesForTest(image1)
+            #expect(bytes0 != nil && !bytes0!.isEmpty)
+            #expect(bytes1 != nil && !bytes1!.isEmpty)
+            #expect(bytes0 != bytes1)
+
+            // Out-of-range index -> nil, no crash.
+            #expect(model.panelImage(at: 9999) == nil)
+            #expect(model.panelImage(at: -1) == nil)
 
             model.shutdown()
             server.stop()
@@ -1203,4 +1290,19 @@ extension LoopbackIRCServer {
             ":srv 353 \(nick) = \(channel) :\(names)",
             ":srv 366 \(nick) \(channel) :End of NAMES list")
     }
+}
+
+/// PNG-encodes a `CGImage` via ImageIO, for byte-comparison assertions
+/// (`panelImageNonNilCorrectSizeAndDiffersBetweenPanels`'s "byte-differs
+/// between two different panels" check) — the same ImageIO path
+/// `CGCanvas.pngData()` uses internally, but for an already-made `CGImage`.
+/// Returns `nil` on encode failure rather than throwing (call-site convenience
+/// for a test helper, not a public API).
+func pngBytesForTest(_ image: CGImage) -> Data? {
+    guard let mutableData = CFDataCreateMutable(nil, 0),
+          let dest = CGImageDestinationCreateWithData(mutableData, "public.png" as CFString, 1, nil)
+    else { return nil }
+    CGImageDestinationAddImage(dest, image, nil)
+    guard CGImageDestinationFinalize(dest) else { return nil }
+    return mutableData as Data
 }

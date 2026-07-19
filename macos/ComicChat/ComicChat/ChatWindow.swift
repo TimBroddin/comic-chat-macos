@@ -57,7 +57,11 @@ struct ChatWindow: View {
                         ComicStripView(image: appState.stripImage,
                                         sizePoints: appState.stripSizePoints,
                                         model: appState.model,
-                                        onAvatarClick: { nick in appState.toggleTalkTo(nick) })
+                                        onAvatarClick: { nick in appState.toggleTalkTo(nick) },
+                                        onCopyPanel: { index in appState.copyPanelAsImage(index) },
+                                        onSavePanel: { index in appState.savePanelAsPNG(index) },
+                                        onCopyStrip: { appState.copyStripAsImage() },
+                                        canCopyStrip: appState.stripImage != nil)
                     } else {
                         TranscriptTextView(attributedText: appState.transcriptText)
                     }

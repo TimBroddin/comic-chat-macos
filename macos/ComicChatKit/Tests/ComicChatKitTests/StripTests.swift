@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import CoreGraphics
+import ImageIO
 import cchat_engine
 @testable import ComicChatKit
 
@@ -200,6 +201,100 @@ extension EngineGlobalStateSelfTests {
             // BALLOON MISS: off the page -> nil.
             #expect(strip.hitTestBalloon(xTwips: 10_000, yTwips: -150) == nil)
         }
+    }
+
+    // Plan 4b Batch D (panel export/copy): the Strip.composePanel Swift
+    // wrapper over cc_strip_compose_panel (the C selftest
+    // cc_run_compose_panel_selftest covers the engine internals in
+    // BodyDrawTests.swift -- local origin + exact translated subset of the
+    // full compose). Composes panel 0 and panel 1 of the fixed 2x4
+    // conversation separately, each onto a canvas sized to the unit panel
+    // (panelGeometry's unitW/unitH), and asserts: both produce a real (non-
+    // empty log) image, both size to the SAME unit box, the two panels'
+    // pixel content differs (different speaker/balloon per panel -- proof
+    // this isn't accidentally composing the same content twice), and an
+    // out-of-range index throws.
+    @Test func composePanelProducesDistinctLocalOriginImages() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            let strip = try Strip()
+            _ = try buildFixedConversation(strip)
+            #expect(strip.panelCount == 4)
+
+            let geo = strip.panelGeometry
+            #expect(geo.unitW > 0 && geo.unitH > 0)
+
+            // RecordingCanvas proof: panel 0 and panel 1 emit non-empty, DIFFERENT
+            // logs (different balloon text -- "HELLO THERE" vs "HI YOURSELF"),
+            // both entirely within the unit box (LOCAL origin).
+            let rec0 = RecordingCanvas()
+            try strip.composePanel(0, onto: rec0)
+            let rec1 = RecordingCanvas()
+            try strip.composePanel(1, onto: rec1)
+            #expect(!rec0.log.isEmpty)
+            #expect(!rec1.log.isEmpty)
+            #expect(rec0.log != rec1.log)
+            #expect(rec0.log.joined(separator: "\n").contains("HELLO THERE"))
+            #expect(rec1.log.joined(separator: "\n").contains("HI YOURSELF"))
+
+            // CGCanvas proof (the real per-panel image the UI hands to the
+            // pasteboard/save panel): both panels render into a canvas sized
+            // exactly to the unit box, and their pixel bytes differ.
+            let scale: CGFloat = 2.0
+            let canvas0 = CGCanvas(widthTwips: geo.unitW, heightTwips: geo.unitH, scale: scale)
+            try strip.composePanel(0, onto: canvas0)
+            guard let image0 = canvas0.makeCGImage() else {
+                Issue.record("panel 0 makeCGImage() returned nil")
+                return
+            }
+
+            let canvas1 = CGCanvas(widthTwips: geo.unitW, heightTwips: geo.unitH, scale: scale)
+            try strip.composePanel(1, onto: canvas1)
+            guard let image1 = canvas1.makeCGImage() else {
+                Issue.record("panel 1 makeCGImage() returned nil")
+                return
+            }
+
+            let expectedW = Int((CGFloat(geo.unitW) / 20.0 * scale).rounded())
+            let expectedH = Int((CGFloat(geo.unitH) / 20.0 * scale).rounded())
+            #expect(image0.width == expectedW)
+            #expect(image0.height == expectedH)
+            #expect(image1.width == expectedW)
+            #expect(image1.height == expectedH)
+
+            let bytes0 = try pngBytes(image0)
+            let bytes1 = try pngBytes(image1)
+            #expect(!bytes0.isEmpty)
+            #expect(!bytes1.isEmpty)
+            #expect(bytes0 != bytes1)   // byte-differs between two different panels
+
+            // Out-of-range index throws (mirrors the C entry's reject -- no
+            // draws happen, the caller shows nothing rather than crashing).
+            let badCanvas = RecordingCanvas()
+            #expect(throws: Strip.StripError.self) {
+                try strip.composePanel(4, onto: badCanvas)
+            }
+            #expect(throws: Strip.StripError.self) {
+                try strip.composePanel(-1, onto: badCanvas)
+            }
+        }
+    }
+
+    // PNG-encodes a CGImage for byte comparison (same ImageIO path as
+    // CGCanvas.pngData(), but for an already-made CGImage).
+    private func pngBytes(_ image: CGImage) throws -> Data {
+        let mutableData = CFDataCreateMutable(nil, 0)!
+        guard let dest = CGImageDestinationCreateWithData(mutableData, "public.png" as CFString, 1, nil) else {
+            throw Strip.StripError(message: "CGImageDestinationCreateWithData failed")
+        }
+        CGImageDestinationAddImage(dest, image, nil)
+        guard CGImageDestinationFinalize(dest) else {
+            throw Strip.StripError(message: "CGImageDestinationFinalize failed")
+        }
+        return mutableData as Data
     }
 
     // (b) THE EXIT MILESTONE: the same conversation composited through CGCanvas

@@ -653,6 +653,55 @@ extern "C" int32_t cc_strip_compose(cc_strip* s, cc_canvas* canvas) {
 }
 
 // ============================================================================
+// Plan 4b Batch D: cc_strip_compose_panel -- the filtered per-panel variant
+// backing panel export/copy (Copy Panel as Image / Save Panel as PNG…). Same
+// walk as cc_strip_compose immediately above (the row/column origin advance
+// is identical, panel.cpp:1338-1342), except every panel OTHER than
+// `panel_index` is skipped entirely (no Draw call, no window-origin touch for
+// it) and the TARGET panel draws with `loc` fixed at (0,0) instead of its
+// page-grid position -- so its dest rects land directly in the panel's own
+// local box, [0,unitWidth] x [-unitHeight,0], matching
+// cc_strip_get_panel_geometry's unit_w/unit_h (panels are uniform unit
+// panels, including the title panel at index 0 when set -- AddTitle,
+// panel.cpp, builds it via the same AddPanel/m_unitWidth/m_unitHeight statics
+// as any other panel; see comicchat.h's doc comment on this function).
+extern "C" int32_t cc_strip_compose_panel(cc_strip* s, int32_t panel_index, cc_canvas* canvas) {
+    if (!s || !s->page || !canvas) return -1;
+    if (panel_index < 0) return -1;
+
+    CUnitPanelPage* page = s->page;
+
+    int panelCount = 0;
+    CPanel* target = NULL;
+    POSITION pos = page->m_panels.GetHeadPosition();
+    while (pos != NULL) {
+        CPanel* panel = (CPanel*)page->m_panels.GetNext(pos);
+        if (panelCount == panel_index) { target = panel; break; }
+        panelCount++;
+    }
+    if (!target) return -1;   // panel_index out of range
+
+    CDC dc(canvas);            // adapter bound to the target canvas
+    RECT panelRect;
+    SetRect(&panelRect, 0, 0,
+            CUnitPanelPage::m_unitWidth, -CUnitPanelPage::m_unitHeight);  // panel.cpp:1321
+
+    // loc fixed at (0,0): the target panel draws at LOCAL origin, not its
+    // page-grid slot -- the entire point of this filtered variant.
+    POINT loc; loc.x = loc.y = 0;
+    dc.SetWindowOrg(-loc.x, -loc.y);   // -(0,0) == (0,0); kept for symmetry with
+                                       // cc_strip_compose's identical call, and
+                                       // because CDC::SetWindowOrg's identity call
+                                       // is still the exact op cc_strip_compose
+                                       // (and this function's own doc comment)
+                                       // describes: "panel-local (0,0) -> loc".
+    RECT dmg = panelRect;              // full per-panel damage (no scroll cull)
+    target->Draw(&dc, &loc, &dmg);     // panel.cpp:1332 (panel draws at local 0,0)
+    dc.SetWindowOrg(0, 0);
+    return 0;
+}
+
+// ============================================================================
 // Comic hit-testing (Plan 4b) -- click-an-avatar-to-set-talk-to + balloon-text
 // tooltips. Both transliterate the original CPageView::FindAvatarUnderPoint /
 // FindLabelUnderPoint inner loops (v2.5-beta-1-modern/pageview.cpp:663-702,

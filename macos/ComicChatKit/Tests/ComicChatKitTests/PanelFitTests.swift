@@ -56,3 +56,48 @@ import Foundation
     let w = PanelFit.unitPanelTwips(viewportWidthTwips: 9400, columns: 3)
     #expect(w == 3037)
 }
+
+// Panel export/copy (Plan 4b Batch D): PanelFit.panelIndex(atTwips:...) is the
+// SAME grid arithmetic cc_compose.cpp's hitTestWalk uses (rowNum = pNum/perRow,
+// colNum = pNum%perRow, ulx = colNum*(unitW+vInterstice), uly =
+// -rowNum*(unitH+hInterstice), panel spans x in [ulx,ulx+unitW], y in
+// [uly-unitH,uly]) — reimplemented in pure Swift so the strip view's
+// right-click handler can compute "which panel did I click" locally, without
+// an engine-queue hop (the view already has panelGeometry from a prior
+// engine-queue read). Uses the SAME fixed geometry as StripTests/
+// cc_selftest_strip's frozen 2x4 conversation: unitW=unitH=2300, perRow=2,
+// interstices=144 -- so panel 0 origin (0,0), panel 1 origin (2444,0), panel 2
+// origin (0,-2444), panel 3 origin (2444,-2444) (cc_compose.cpp's own
+// documented per-panel origins for this exact geometry).
+@Test func panelIndexMatchesEngineGridArithmetic() {
+    let unitW: Int32 = 2300, unitH: Int32 = 2300, perRow: Int32 = 2
+    let hInter: Int32 = 144, vInter: Int32 = 144
+    let panelCount: Int32 = 4
+
+    func idx(_ x: Int32, _ y: Int32) -> Int32? {
+        PanelFit.panelIndex(atTwips: x, y, unitW: unitW, unitH: unitH, perRow: perRow,
+                            hInterstice: hInter, vInterstice: vInter, panelCount: panelCount)
+    }
+
+    // Panel 0: x in [0,2300], y in [-2300,0]. Center hits panel 0.
+    #expect(idx(1150, -1150) == 0)
+    // Panel 1: origin (2444,0) -> x in [2444,4744], y in [-2300,0].
+    #expect(idx(2444 + 1150, -1150) == 1)
+    // Panel 2: origin (0,-2444) -> x in [0,2300], y in [-4744,-2444].
+    #expect(idx(1150, -2444 - 1150) == 2)
+    // Panel 3: origin (2444,-2444) -> x in [2444,4744], y in [-4744,-2444].
+    #expect(idx(2444 + 1150, -2444 - 1150) == 3)
+
+    // A point in the interstice GAP between panel 0 and panel 1 (x in
+    // (2300,2444)) is in NO panel's slot.
+    #expect(idx(2372, -1150) == nil)
+    // A point off the page entirely (below the last row) is in no panel.
+    #expect(idx(1150, -20000) == nil)
+    // A point whose GRID SLOT would exist but panelCount doesn't reach it
+    // (e.g. a 3-panel strip's slot 3, which would be the row/col the grid
+    // arithmetic computes but no CPanel actually occupies) -> nil, not a
+    // stale/out-of-range index.
+    #expect(PanelFit.panelIndex(atTwips: 2444 + 1150, -2444 - 1150, unitW: unitW, unitH: unitH,
+                                perRow: perRow, hInterstice: hInter, vInterstice: vInter,
+                                panelCount: 3) == nil)
+}

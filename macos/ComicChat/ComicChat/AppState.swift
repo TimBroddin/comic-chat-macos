@@ -483,6 +483,51 @@ public final class AppState {
         operation.run()
     }
 
+    // MARK: - Panel export/copy (Plan 4b Batch D)
+
+    /// Copy Panel as Image: the panel at `index` (0-based, the grid arithmetic
+    /// the strip view's right-click hit-test computes), composed alone via
+    /// `ChatSessionModel.panelImage`, placed on the general pasteboard as PNG
+    /// (matching `copyStripAsImage`'s own PNG-only pasteboard convention
+    /// below). No-op if the model has no strip yet or `index` doesn't resolve
+    /// to a real panel (`panelImage` returns `nil` either way).
+    public func copyPanelAsImage(_ index: Int32) {
+        guard let model, let image = model.panelImage(at: index) else { return }
+        guard let png = Self.pngData(for: image) else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setData(png, forType: .png)
+    }
+
+    /// Save Panel as PNG…: the panel at `index`, composed alone, written to a
+    /// user-chosen `.png` path (same `NSSavePanel` shape as `exportPNG`).
+    /// No-op if the model has no strip yet or `index` doesn't resolve.
+    public func savePanelAsPNG(_ index: Int32) {
+        guard let model, let image = model.panelImage(at: index) else { return }
+        guard let png = Self.pngData(for: image) else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "panel.png"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try png.write(to: url, options: .atomic)
+        } catch {
+            statusLine = "Save Panel as PNG failed: \(error)"
+        }
+    }
+
+    /// Copy Strip as Image: the CURRENT live strip's last composed image
+    /// (`stripImage`, the SAME image `exportPNG` writes to disk) placed on the
+    /// general pasteboard as PNG. No-op with nothing composed yet.
+    public func copyStripAsImage() {
+        guard let image = stripImage else { return }
+        guard let png = Self.pngData(for: image) else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setData(png, forType: .png)
+    }
+
     /// PNG-encodes a `CGImage` via ImageIO — the app-side twin of
     /// `CGCanvas.pngData()` (that method encodes from its OWN live
     /// `CGContext`; this one encodes an already-composed `CGImage` handed

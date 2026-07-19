@@ -13,6 +13,16 @@ import ComicChatKit
 /// balloon text as a tooltip (a richer take on the original's screen-name
 /// OnToolHitTest). Both convert the AppKit view point to PAGE TWIPS and hand it
 /// to the model's engine-queue hit-test hop (see `pageTwips(from:)`).
+///
+/// Panel export/copy (Plan 4b Batch D): right-click shows a context menu —
+/// "Copy Panel as Image" / "Save Panel as PNG…" (disabled when the click
+/// misses every panel) and "Copy Strip as Image" (always enabled once
+/// something has composed). WHICH panel was clicked is computed LOCALLY
+/// (`PanelFit.panelIndex`, the same grid arithmetic the engine's own
+/// `cc_strip_hit_test_avatar` walk uses) from `model.panelGeometry` — a
+/// synchronous `engineQueue.sync` read-through, unlike `hitTestNick`'s
+/// async completion-callback hop, because `menu(for:)` must return the built
+/// `NSMenu` immediately (AppKit has no async context-menu API).
 final class StripDocumentView: NSView {
     override var isFlipped: Bool { true }
 
@@ -21,6 +31,14 @@ final class StripDocumentView: NSView {
     /// reconnect/rebuild swaps in the live model. Both weak-captured at use.
     weak var model: ChatSessionModel?
     var onAvatarClick: ((String) -> Void)?
+
+    /// Panel export/copy callbacks (Plan 4b Batch D), set by the coordinator
+    /// alongside `model`/`onAvatarClick`. Each takes the 0-based panel index
+    /// `menu(for:)` resolved from the right-click point.
+    var onCopyPanel: ((Int32) -> Void)?
+    var onSavePanel: ((Int32) -> Void)?
+    var onCopyStrip: (() -> Void)?
+    var canCopyStrip: Bool = false
 
     /// The last balloon-tooltip query point (view coords) — coalesces the
     /// hover query so a settled cursor only fires one engine hop per position.
@@ -114,6 +132,69 @@ final class StripDocumentView: NSView {
         toolTip = nil
         lastTooltipPoint = NSPoint(x: -1, y: -1)
     }
+
+    // MARK: - panel export/copy context menu (Plan 4b Batch D)
+
+    /// The 0-based panel index under `viewPoint` (this view's own coords), or
+    /// `nil` if the point misses every panel / no strip has composed yet.
+    /// Reads `model.panelGeometry`/`panelCount` via their existing
+    /// `engineQueue.sync` read-through accessors (the same synchronous
+    /// posture `ChatSessionModel` already documents for those two properties)
+    /// and hands the page-twips point to `PanelFit.panelIndex` — pure Swift
+    /// math, no engine call.
+    private func panelIndex(at viewPoint: NSPoint) -> Int32? {
+        guard let model, let geo = model.panelGeometry else { return nil }
+        let (xTwips, yTwips) = pageTwips(from: viewPoint)
+        return PanelFit.panelIndex(atTwips: xTwips, yTwips,
+                                   unitW: geo.unitW, unitH: geo.unitH, perRow: geo.perRow,
+                                   hInterstice: geo.hInter, vInterstice: geo.vInter,
+                                   panelCount: model.panelCount)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let p = convert(event.locationInWindow, from: nil)
+        let clickedPanel = bounds.contains(p) ? panelIndex(at: p) : nil
+
+        let menu = NSMenu()
+
+        let copyPanelItem = NSMenuItem(title: "Copy Panel as Image",
+                                       action: #selector(copyPanelAction(_:)), keyEquivalent: "")
+        copyPanelItem.target = self
+        copyPanelItem.isEnabled = clickedPanel != nil
+        copyPanelItem.representedObject = clickedPanel
+        menu.addItem(copyPanelItem)
+
+        let savePanelItem = NSMenuItem(title: "Save Panel as PNG…",
+                                       action: #selector(savePanelAction(_:)), keyEquivalent: "")
+        savePanelItem.target = self
+        savePanelItem.isEnabled = clickedPanel != nil
+        savePanelItem.representedObject = clickedPanel
+        menu.addItem(savePanelItem)
+
+        menu.addItem(.separator())
+
+        let copyStripItem = NSMenuItem(title: "Copy Strip as Image",
+                                       action: #selector(copyStripAction(_:)), keyEquivalent: "")
+        copyStripItem.target = self
+        copyStripItem.isEnabled = onCopyStrip != nil && canCopyStrip
+        menu.addItem(copyStripItem)
+
+        return menu
+    }
+
+    @objc private func copyPanelAction(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int32 else { return }
+        onCopyPanel?(index)
+    }
+
+    @objc private func savePanelAction(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int32 else { return }
+        onSavePanel?(index)
+    }
+
+    @objc private func copyStripAction(_ sender: NSMenuItem) {
+        onCopyStrip?()
+    }
 }
 
 /// Renders the composed strip image inside a scroll view.
@@ -143,6 +224,17 @@ struct ComicStripView: NSViewRepresentable {
     /// `AppState.selectedMembers` (the existing talk-to selection state — the
     /// member grid highlight then updates for free, since both read that set).
     var onAvatarClick: ((String) -> Void)? = nil
+    /// Panel export/copy (Plan 4b Batch D): right-click menu actions. `nil`
+    /// (the default) disables the whole affordance — `TranscriptViewerWindow`'s
+    /// reuse of this view (`model: nil`, a static transcript render) leaves
+    /// these unset, so its context menu shows no items with a live target.
+    var onCopyPanel: ((Int32) -> Void)? = nil
+    var onSavePanel: ((Int32) -> Void)? = nil
+    var onCopyStrip: (() -> Void)? = nil
+    /// Whether "Copy Strip as Image" should show enabled — the caller passes
+    /// `appState.stripImage != nil` (mirrors `AppCommands`'s existing
+    /// `.disabled(appState.stripImage == nil)` gate on Export as PNG/PDF).
+    var canCopyStrip: Bool = false
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -191,6 +283,10 @@ struct ComicStripView: NSViewRepresentable {
         // click callback (a reconnect swaps in a fresh model).
         co.docView.model = model
         co.docView.onAvatarClick = onAvatarClick
+        co.docView.onCopyPanel = onCopyPanel
+        co.docView.onSavePanel = onSavePanel
+        co.docView.onCopyStrip = onCopyStrip
+        co.docView.canCopyStrip = canCopyStrip
         if let img = image {
             let stick = co.wasAtBottom                    // captured BEFORE growth
             co.docView.present(image: img, sizePoints: sizePoints, scale: scale)

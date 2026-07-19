@@ -118,4 +118,55 @@ public enum PanelFit {
         precondition(columns >= 1, "columns must be >= 1")
         return (viewport + interstice * (1 - columns)) / columns
     }
+
+    /// Plan 4b Batch D (panel export/copy): which 0-based panel index (if any)
+    /// contains the PAGE-TWIPS point `(x, y)` (y-up, the same space
+    /// `Strip.size`/`hitTestAvatar` use). A pure-Swift reimplementation of
+    /// `cc_compose.cpp`'s `hitTestWalk` GRID arithmetic (not a lift -- that is
+    /// bridge C++ this port has no FFI reason to call for a value the caller
+    /// can compute locally from `Strip.panelGeometry`'s already-fetched
+    /// unit/interstice values):
+    /// ```cpp
+    /// int rowNum = pNum / perRow, colNum = pNum % perRow;
+    /// int ulx =  colNum * (unitW + vInter);
+    /// int uly = -rowNum * (unitH + hInter);
+    /// // panel spans x in [ulx, ulx+unitW], y in [uly-unitH, uly]
+    /// ```
+    /// Walks GRID SLOTS (not actual `CPanel`s -- this port has no `m_panels`
+    /// list to walk), computing the slot index the point's row/column would
+    /// occupy directly from `x`/`unitW`/`vInterstice` and `y`/`unitH`/
+    /// `hInterstice`, then bounds-checks the result against `panelCount` so a
+    /// point in a grid cell past the last REAL panel (e.g. the last row's
+    /// trailing empty slot) returns `nil` rather than a stale index. Returns
+    /// `nil` for a point in the inter-panel GAP (the interstice margin, which
+    /// belongs to no panel's slot), a point outside every slot, or a slot
+    /// index `>= panelCount`.
+    public static func panelIndex(atTwips x: Int32, _ y: Int32,
+                                  unitW: Int32, unitH: Int32, perRow: Int32,
+                                  hInterstice: Int32, vInterstice: Int32,
+                                  panelCount: Int32) -> Int32? {
+        guard perRow > 0, unitW > 0, unitH > 0, panelCount > 0 else { return nil }
+
+        let colPitch = unitW + vInterstice
+        let rowPitch = unitH + hInterstice
+
+        // Which column/row PITCH cell does x/y fall into (an interstice gap
+        // still belongs to a pitch cell, but NOT to that cell's panel slot --
+        // checked below via the exact [ulx,ulx+unitW]/[uly-unitH,uly] bounds).
+        guard x >= 0 else { return nil }
+        let colNum = x / colPitch
+        guard colNum < perRow else { return nil }   // right of the last column
+
+        guard y <= 0 else { return nil }
+        let rowNum = (-y) / rowPitch
+
+        let ulx = colNum * colPitch
+        let uly = -(rowNum * rowPitch)
+        guard x >= ulx, x <= ulx + unitW else { return nil }        // in the interstice gap
+        guard y <= uly, y >= uly - unitH else { return nil }        // in the interstice gap
+
+        let index = rowNum * perRow + colNum
+        guard index >= 0, index < panelCount else { return nil }
+        return index
+    }
 }

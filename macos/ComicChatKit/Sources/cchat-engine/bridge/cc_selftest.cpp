@@ -2579,6 +2579,253 @@ extern "C" int32_t cc_run_strip_selftest(const char* avatarPath,
     return g_failures;
 }
 
+// ============================================================================
+// Plan 4b Batch D: cc_strip_compose_panel selftest -- the filtered per-panel
+// compositor (panel export/copy). Builds the SAME fixed 2x4 conversation as
+// cc_selftest_strip (four panels; the frozen strip-golden geometry: panel 1
+// ["Hi yourself"] sits at page origin (2444,0), unitWidth==unitHeight==2300),
+// then:
+//   (a) bad-index rejection: panel_index -1 and panel_index==panelCount both
+//       return nonzero with NO lines appended to the canvas log (a fresh
+//       recording canvas per call proves nothing drew).
+//   (b) LOCAL ORIGIN: every dest rect cc_strip_compose_panel(s, 1, ...) logs
+//       falls within [0, unitWidth] x [-unitHeight, 0] -- the panel's own
+//       local box, not its page-space slot.
+//   (c) SUBSET: the panel-1-only log, each entry translated by the panel's
+//       KNOWN page-space origin (+2444, +0 -- i.e. local coords + origin ==
+//       page coords), is an EXACT, order-preserving match for the SAME span
+//       of lines the full cc_strip_compose log emits for panel 2 (the
+//       second "clip+ 2444,0,4744,-2300" run, strip-golden.txt lines 14-29 /
+//       cc_selftest_strip's kExpected[14..29]) -- proving this function draws
+//       exactly what the full compose draws for that panel, just relocated,
+//       not a re-derived (and possibly divergent) subset.
+static int cc_selftest_compose_panel(const char* avatarPath, const char* backdropPath) {
+    int startFailures = g_failures;
+
+    static CCRecordingCanvas composePanelMetrics;
+    cc_set_metrics_canvas(composePanelMetrics.handle());
+
+    cc_strip* s = cc_strip_create();
+    CC_CHECK(s != NULL);
+    if (!s) return g_failures - startFailures;
+
+    int32_t a = cc_strip_add_participant(s, "Anna", avatarPath);
+    int32_t b = cc_strip_add_participant(s, "Boris", avatarPath);
+    CC_CHECK(a == 1);
+    CC_CHECK(b == 2);
+    if (a < 0 || b < 0) { cc_strip_destroy(s); return g_failures - startFailures; }
+
+    CC_CHECK(cc_strip_set_backdrop(s, backdropPath) == 0);
+
+    int32_t aAddr[1] = { b };
+    int32_t bAddr[1] = { a };
+    CC_CHECK(cc_strip_add_line(s, a, "Hello there", CC_MODE_SAY, aAddr, 1) == 0);
+    CC_CHECK(cc_strip_add_line(s, b, "Hi yourself", CC_MODE_SAY, bAddr, 1) == 0);
+    CC_CHECK(cc_strip_add_line(s, a, "How are you", CC_MODE_SAY, aAddr, 1) == 0);
+    CC_CHECK(cc_strip_add_line(s, b, "Doing great", CC_MODE_SAY, bAddr, 1) == 0);
+
+    int32_t panelCount = cc_strip_panel_count(s);
+    CC_CHECK(panelCount == 4);   // frozen strip-golden shape
+
+    int32_t unitW = 0, unitH = 0, perRow = 0, hInter = 0, vInter = 0;
+    cc_strip_get_panel_geometry(s, &unitW, &unitH, &perRow, &hInter, &vInter);
+    CC_CHECK(unitW == 2300 && unitH == 2300);
+
+    // ---- (a) bad-index rejection: no draws on a fresh canvas either way.
+    {
+        CCRecordingCanvas badLow;
+        CC_CHECK(cc_strip_compose_panel(s, -1, badLow.handle()) != 0);
+        CC_CHECK(badLow.log().empty());
+
+        CCRecordingCanvas badHigh;
+        CC_CHECK(cc_strip_compose_panel(s, panelCount, badHigh.handle()) != 0);
+        CC_CHECK(badHigh.log().empty());
+    }
+
+    // ---- panel-1-only compose (0-based index 1 == "Hi yourself", the
+    //      SECOND panel in the frozen strip-golden layout).
+    CCRecordingCanvas panelOnly;
+    CC_CHECK(cc_strip_compose_panel(s, 1, panelOnly.handle()) == 0);
+    const std::vector<std::string>& panelLog = panelOnly.log();
+    CC_CHECK(!panelLog.empty());
+
+    // ---- (b) LOCAL ORIGIN: every logged "clip+" rect's coordinates lie
+    // within the panel's own local box, [0,unitW] x [-unitH,0] -- the panel's
+    // own clip setup (panel.cpp:729-730's IntersectClipRect(&rect)/(dmgRect),
+    // the FIRST clip+ of each pair) is always exactly the unit box, proving
+    // the panel drew at local (0,0) rather than its page-grid slot. "image"
+    // dest rects are DELIBERATELY excluded from this bound: a body blit can
+    // legitimately extend past the unit box before clipping (a large
+    // emotion-pose zoom -- panel.cpp:866, the SAME "bodies can be TALLER than
+    // the 2300-twip unit panel" case cc_selftest_hit_test's own comment
+    // documents; the recording canvas logs the PRE-CLIP draw rect, not the
+    // visually-clipped result). Skips the sentinel
+    // "clip+ -268435456,268435456,268435456,-268435456" reset, which is
+    // INTENTIONALLY outside the unit box (cc_strip_compose's clip-restore
+    // step, panel.cpp:757-758) via a tiny inline scanner (no regex
+    // dependency, matching this file's existing style elsewhere).
+    {
+        auto parseRect = [](const std::string& line, size_t start,
+                            int32_t& l, int32_t& t, int32_t& r, int32_t& b) -> bool {
+            return sscanf(line.c_str() + start, "%d,%d,%d,%d", &l, &t, &r, &b) == 4;
+        };
+        int rectsChecked = 0;
+        for (size_t i = 0; i < panelLog.size(); i++) {
+            const std::string& line = panelLog[i];
+            int32_t l, t, r, b;
+            if (line.compare(0, 5, "clip+") != 0) continue;   // "image" excluded -- see doc above
+            if (!parseRect(line, 6, l, t, r, b)) continue;
+            // Skip the +/-2^28 clip-restore sentinel (deliberately unbounded).
+            if (l <= -268435456 || r >= 268435456) continue;
+            CC_CHECK(l >= 0 && l <= unitW);
+            CC_CHECK(r >= 0 && r <= unitW);
+            CC_CHECK(t <= 0 && t >= -unitH);
+            CC_CHECK(b <= 0 && b >= -unitH);
+            rectsChecked++;
+        }
+        CC_CHECK(rectsChecked > 0);
+    }
+
+    // ---- (c) SUBSET: full compose of the SAME strip, then compare panel 1's
+    // span (page origin (2444,0) per strip-golden.txt) translated back to
+    // local coords against panelLog, entry for entry.
+    CCRecordingCanvas full;
+    CC_CHECK(cc_strip_compose(s, full.handle()) == 0);
+    const std::vector<std::string>& fullLog = full.log();
+
+    // Locate panel 1's span: starts at its first "clip+ 2444,0,4744,-2300"
+    // (the panel's page-space unit rect, twice per cc_strip_compose's clip
+    // setup) and ends just before the NEXT panel's clip+ pair (panel 2's
+    // "clip+ 0,-2444,2300,-4744").
+    const std::string panel1ClipPage = "clip+ 2444,0,4744,-2300";
+    const std::string panel2ClipPage = "clip+ 0,-2444,2300,-4744";
+    size_t spanStart = fullLog.size(), spanEnd = fullLog.size();
+    for (size_t i = 0; i < fullLog.size(); i++) {
+        if (fullLog[i] == panel1ClipPage && spanStart == fullLog.size()) { spanStart = i; continue; }
+        if (spanStart != fullLog.size() && fullLog[i] == panel2ClipPage) { spanEnd = i; break; }
+    }
+    CC_CHECK(spanStart < fullLog.size());
+    CC_CHECK(spanEnd > spanStart);
+
+    if (spanStart < fullLog.size() && spanEnd > spanStart) {
+        size_t spanLen = spanEnd - spanStart;
+        CC_CHECK(panelLog.size() == spanLen);
+        // Translate: local (0,0) == page (2444, 0) -- every X COORDINATE in a
+        // DEST-space "l,t"/"dl,dt" pair (never a Y, never a SOURCE-space
+        // "src=..." pair) shifts by -2444 (Y is unchanged; panel 1 sits in
+        // the SAME row as panel 0). Per cc_recording_canvas.h's stable log
+        // grammar, dest-space x-coordinates appear ONLY as the number
+        // immediately following '(' start-of-line-token / ' ' / ',' -- but
+        // NEVER immediately after '=' (that introduces "src=" or a "fillc="/
+        // "strokec="/"color=" field, never a bare coordinate) and never as
+        // the second number of a "sl,st,sr,sb" src rect (which is always
+        // preceded on the line by "src="). So: walk the line, splitting on
+        // whitespace/'['/']' into tokens; within each COMMA-SEPARATED
+        // numeric token (e.g. "2444,0,4744,-2300" or "src=0,0,315,315"),
+        // shift only the EVEN-indexed (0th, 2nd, ...) sub-numbers -- the x
+        // halves of each "x,y" pair -- UNLESS the token starts with "src=".
+        auto shiftLine = [](const std::string& line) -> std::string {
+            std::string out;
+            out.reserve(line.size());
+            size_t i = 0;
+            while (i < line.size()) {
+                char c = line[i];
+                // A numeric literal preceded by '=' is a SCALAR field
+                // ("n=53", "fill=1", "w=120", "color=000000" -- note
+                // "color=RRGGBB" is hex digits, not decimal, but starts with
+                // a digit too) or the start of "src=..." -- never a bare
+                // coordinate. Copy the '=' and its value verbatim, including
+                // any comma-separated run that immediately follows a "src="
+                // token (the whole source rect is untouched).
+                if (c == '=') {
+                    out += c;
+                    i++;
+                    bool isSrcRect = out.size() >= 4 && out.compare(out.size() - 4, 4, "src=") == 0;
+                    // Copy the value run verbatim: for "src=" this is the
+                    // WHOLE comma-separated rect (4 numbers); for any other
+                    // "field=" (n=, fill=, fillc=, stroke=, strokec=, w=,
+                    // dashed=, color=) it is exactly ONE token up to the next
+                    // space (never comma-separated -- these are single
+                    // scalars per the log grammar).
+                    if (isSrcRect) {
+                        while (i < line.size() && (isdigit((unsigned char)line[i]) ||
+                               line[i] == '-' || line[i] == ',')) { out += line[i]; i++; }
+                    } else {
+                        while (i < line.size() && line[i] != ' ') { out += line[i]; i++; }
+                    }
+                    continue;
+                }
+                bool isNegNumStart = (c == '-') && (i + 1 < line.size()) &&
+                                     isdigit((unsigned char)line[i + 1]);
+                if (!isdigit((unsigned char)c) && !isNegNumStart) {
+                    out += c;
+                    i++;
+                    continue;
+                }
+                // A bare numeric literal NOT preceded by '=' -- the start of
+                // a coordinate pair/quad ("l,t,r,b", "x,y", or a path
+                // vertex). Shift every EVEN field index (the x half of each
+                // "x,y" pair) by -2444; odd indices (y halves) are unchanged.
+                int fieldIndex = 0;
+                while (i < line.size() &&
+                       (isdigit((unsigned char)line[i]) ||
+                        (line[i] == '-' && i + 1 < line.size() && isdigit((unsigned char)line[i + 1])))) {
+                    size_t start = i;
+                    if (line[i] == '-') i++;
+                    while (i < line.size() && isdigit((unsigned char)line[i])) i++;
+                    long value = strtol(line.c_str() + start, NULL, 10);
+                    if ((fieldIndex % 2) == 0) value -= 2444;
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%ld", value);
+                    out += buf;
+                    fieldIndex++;
+                    if (i < line.size() && line[i] == ',') { out += ','; i++; }
+                    else break;
+                }
+            }
+            return out;
+        };
+
+        // The clip-restore SENTINEL ("clip+ -268435456,268435456,268435456,
+        // -268435456", panel.cpp:728's GetClipBox/panel.cpp:761's
+        // IntersectClipRect(&oldClip)) is a DEVICE-SPACE clip box read back
+        // BEFORE this panel's own window-origin shift is meaningful to it --
+        // GetClipBox (mfc_compat.h) reports a fixed device-space sentinel
+        // regardless of the current window origin, so it is IDENTICAL in
+        // both the full compose and the panel-only compose, never shifted.
+        const std::string clipRestoreSentinel =
+            "clip+ -268435456,268435456,268435456,-268435456";
+
+        size_t matched = 0;
+        for (size_t i = 0; i < spanLen && i < panelLog.size(); i++) {
+            const std::string& original = fullLog[spanStart + i];
+            std::string translated = (original == clipRestoreSentinel)
+                ? original : shiftLine(original);
+            if (translated == panelLog[i]) {
+                matched++;
+            } else {
+                g_failures++;
+                ccLog("COMPOSE PANEL SUBSET MISMATCH at line %zu:\n  original:   %s\n  translated: %s\n  panelOnly:  %s",
+                      i, original.c_str(), translated.c_str(), panelLog[i].c_str());
+            }
+        }
+        CC_CHECK(matched == spanLen);
+    }
+
+    cc_strip_destroy(s);
+    return g_failures - startFailures;
+}
+
+// C entry point for the Swift wrapper (StripTests.swift), which passes the
+// anna.avb + field.bgb fixture paths. Runs standalone (resets g_failures).
+extern "C" int32_t cc_run_compose_panel_selftest(const char* avatarPath,
+                                                 const char* backdropPath) {
+    g_failures = 0;
+    if (avatarPath == NULL || backdropPath == NULL) return 1;
+    cc_selftest_compose_panel(avatarPath, backdropPath);
+    return g_failures;
+}
+
 // --- Plan 4a Task 5: panel geometry API --------------------------------------
 // cc_strip_set_panel_geometry/get_panel_geometry are thin wrappers over
 // CUnitPanelPage::SetUnitPanelWidth/SetUnitPanelHeight/SetUnitPanelsPerRow

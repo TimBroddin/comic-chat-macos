@@ -2268,6 +2268,32 @@ public final class ChatSessionModel: @unchecked Sendable {
         }
     }
 
+    /// Plan 4b Batch D (panel export/copy): the single panel at `index`
+    /// (0-based), composed alone onto a fresh `CGCanvas` sized to the unit
+    /// panel box (`Strip.panelGeometry`'s `unitW`/`unitH` — panels are
+    /// uniform unit panels; see `Strip.composePanel`'s doc comment). `scale`
+    /// mirrors `recomposeLocked`'s CGCanvas supersampling factor. `nil` when
+    /// no strip exists yet, `index` is out of range, or the compose fails —
+    /// the caller (the strip view's context menu) then shows/exports
+    /// nothing rather than crashing.
+    ///
+    /// ENGINE-QUEUE SYNC HOP: unlike `hitTestNick`/`hitTestBalloonText`
+    /// (async + a completion callback), this is a synchronous
+    /// `engineQueue.sync` read-through — the same posture `panelCount`/
+    /// `panelGeometry` already use — because the call site (a right-click
+    /// context-menu action) needs the image immediately to build the
+    /// pasteboard/save-panel payload, not via a later callback.
+    public func panelImage(at index: Int32, scale: CGFloat = 2.0) -> CGImage? {
+        engineQueue.sync {
+            guard let strip, !isShutDown else { return nil }
+            let geo = strip.panelGeometry
+            guard geo.unitW > 0, geo.unitH > 0 else { return nil }
+            let canvas = CGCanvas(widthTwips: geo.unitW, heightTwips: geo.unitH, scale: scale)
+            guard (try? strip.composePanel(index, onto: canvas)) != nil else { return nil }
+            return canvas.makeCGImage()
+        }
+    }
+
     // MARK: - character / backdrop switching (Plan 4b Task 5)
 
     /// Switches the SELF participant's avatar to `name` (a bare comicart name,

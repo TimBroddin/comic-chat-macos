@@ -354,6 +354,26 @@ public final class Strip {
         }
     }
 
+    /// Plan 4b Batch D (panel export/copy): composite ONLY panel `index`
+    /// (0-based) onto `canvas`, drawn at LOCAL origin -- the panel's own
+    /// top-left maps to the canvas's (0,0), not its page-space grid slot
+    /// (`cc_strip_compose_panel`, the filtered sibling of `compose`). Panels
+    /// are uniform unit panels (`panelGeometry.unitW`/`unitH`, INCLUDING the
+    /// title panel at index 0 when one has been set via `setTitle` -- see
+    /// that C entry's doc comment), so a canvas sized to the unit box fits
+    /// any panel. Throws for a NULL/closed strip or an out-of-range `index`
+    /// (`< 0` or `>= panelCount`) -- no canvas draws happen on a bad index.
+    public func composePanel(_ index: Int32, onto canvas: Canvas) throws {
+        let h = try requireHandle()
+        let box = CanvasBox(canvas)
+        let rc = withExtendedLifetime(box) { () -> Int32 in
+            cc_strip_compose_panel(h, index, box.handle)
+        }
+        guard rc == 0 else {
+            throw StripError(message: "composePanel(\(index)) failed")
+        }
+    }
+
     // MARK: - Comic hit-testing (Plan 4b)
 
     /// The PARTICIPANT id of the avatar whose body contains the page-twips point

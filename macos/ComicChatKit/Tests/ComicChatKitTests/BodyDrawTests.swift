@@ -58,6 +58,18 @@ struct EngineGlobalStateSelfTests {
         #expect(cc_run_strip_selftest(avatar, backdrop) == 0)
     }
 
+    // Plan 4b Batch D: cc_strip_compose_panel -- the filtered per-panel
+    // compositor backing panel export/copy. Builds the same fixed 2x4
+    // conversation, composes panel index 1 ("Hi yourself") alone, and asserts
+    // bad-index rejection, LOCAL origin (every dest rect within the panel's
+    // own unit box), and that the panel-1-only log is an exact translated
+    // subset of the full cc_strip_compose log for that panel.
+    @Test func composePanelSelfTestPasses() {
+        let avatar = fixture("anna.avb")
+        let backdrop = fixture("field.bgb")
+        #expect(cc_run_compose_panel_selftest(avatar, backdrop) == 0)
+    }
+
     // Plan 4a Task 5: the panel geometry API (cc_strip_set_panel_geometry /
     // cc_strip_get_panel_geometry) -- thin wrappers over
     // CUnitPanelPage::SetUnitPanelWidth/SetUnitPanelHeight/SetUnitPanelsPerRow +

@@ -101,6 +101,21 @@ int32_t cc_run_selfpose_preview_selftest(const char* avatar_path);
  * otherwise). Kept out of cc_run_selftests because it needs two fixture paths. */
 int32_t cc_run_hit_test_selftest(const char* avatar_path, const char* other_avatar_path);
 
+/* Panel export selftest (Plan 4b Batch D): opens avatar_path TWICE (two
+ * participants), builds the fixed 2x4 conversation (same script as
+ * cc_run_strip_selftest -> four panels), composes panel index 1 ("Hi
+ * yourself") alone via cc_strip_compose_panel, and asserts (a) a bad index
+ * (-1, and panel_count) is rejected with no canvas draws, (b) every dest rect
+ * in the panel-1-only log falls within [0,unitWidth] x [-unitHeight,0] (LOCAL
+ * origin proven), and (c) the panel-1-only log is a strict, order-preserving
+ * subset of the full cc_strip_compose log for the SAME strip, each entry
+ * translated by the panel's page-space origin (-2444,0 per the frozen
+ * strip-golden geometry) back to local coordinates -- proving
+ * cc_strip_compose_panel draws EXACTLY what the full compose draws for that
+ * panel, just relocated. Returns 0 on success (failure count otherwise). Kept
+ * out of cc_run_selftests because it needs the fixture path. */
+int32_t cc_run_compose_panel_selftest(const char* avatar_path, const char* backdrop_path);
+
 /* Plan 2 Task 1: engine log level. 0=silent, 1=errors (ASSERT/VERIFY
  * failures), 2=trace. Default 2; also readable once via env var
  * CC_LOG_LEVEL (read lazily on first log call). Also resets the lazy env
@@ -398,6 +413,27 @@ void      cc_strip_get_panel_geometry(const cc_strip* s, int32_t* unit_w,
 /* Composite the finished page onto `canvas` (the R16 headless replacement for
  * CUnitPanelPage::Draw). Returns 0 on success. */
 int32_t   cc_strip_compose(cc_strip* s, cc_canvas* canvas); /* 0 ok */
+
+/* Plan 4b Batch D: composite ONLY panel `panel_index` (0-based) onto `canvas`,
+ * drawn at LOCAL origin -- the panel's own top-left maps to the canvas's
+ * (0,0), not its page-space slot. Same per-panel draw as cc_strip_compose's
+ * origin walk (cc_compose.cpp, CUnitPanel::Draw's borrowed arithmetic), minus
+ * the row/column advance: every OTHER panel is skipped entirely (no draws, no
+ * window-origin shift for them), and the target panel draws through the exact
+ * same dc.SetWindowOrg(-loc)/panel->Draw(&dc,&loc,&dmg) pair cc_strip_compose
+ * uses, but with `loc` fixed at (0,0) instead of its page-grid position -- so
+ * every dest rect the panel emits lands directly in [0,unitWidth] x
+ * [-unitHeight,0], the panel's own local box, matching
+ * cc_strip_get_panel_geometry's unit_w/unit_h for sizing the caller's canvas
+ * (panels are uniform unit panels, INCLUDING the title panel at index 0 when
+ * one has been set via cc_strip_set_title -- CUnitPanelPage::AddTitle builds
+ * it via the same AddPanel/m_unitWidth/m_unitHeight statics as any other
+ * panel, no distinct size).
+ *
+ * Returns 0 on success; nonzero for a NULL strip/canvas or an out-of-range
+ * panel_index (< 0 or >= cc_strip_panel_count(s)) -- no canvas draws happen on
+ * a bad index. */
+int32_t   cc_strip_compose_panel(cc_strip* s, int32_t panel_index, cc_canvas* canvas); /* 0 ok */
 
 /* ---- Comic hit-testing (Plan 4b) -------------------------------------------
  * Click-an-avatar-in-the-strip to set your talk-to target, plus balloon-text
