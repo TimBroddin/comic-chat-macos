@@ -103,6 +103,15 @@ public final class AppState {
     /// icon is decoded once per session rather than once per row-redraw.
     /// Unresolvable names simply never gain an entry (no icon shown).
     public var memberIconCache: [String: CGImage] = [:]
+    /// Names `resolveMemberIcon` tried and failed to resolve to any art
+    /// (Plan 4b live-fix: gray-placeholder bug) — keeps `memberIconCache`
+    /// itself a clean "name -> successfully decoded icon" map while still
+    /// letting a failed name be recognized as "already tried" so a SwiftUI
+    /// `List` re-firing the same row's `.onAppear` (scroll bounce,
+    /// membership-churn redraw) doesn't re-attempt the same doomed file
+    /// read + decode forever. `MemberRowView` renders no icon either way
+    /// (cache miss or known-unresolvable) — this only stops the retry loop.
+    public var unresolvableMemberIcons: Set<String> = []
     /// The last `getInfo(_:)` popover result (Plan 4b Task 8) — `(nick,
     /// formatted)`, mirrored from `ChatSessionModel.onUserInfo`. `nil` clears
     /// any shown popover.
@@ -417,11 +426,14 @@ public final class AppState {
     /// avatar that shadows a bundled name showed the WRONG icon here even
     /// though the strip rendered the right one). Silently no-ops for an
     /// empty name, an already-cached name, an already-in-flight name, or a
-    /// name that fails to resolve anywhere (unresolvable names get no icon,
-    /// per the brief).
+    /// name already known unresolvable (per `unresolvableMemberIcons`).
+    /// Unresolvable names get no icon, per the brief — and get RECORDED as
+    /// unresolvable (live-fix) so a re-fired `.onAppear` for the same name
+    /// doesn't re-attempt the same doomed file read + decode forever.
     public func resolveMemberIcon(_ avatarName: String) {
         guard !avatarName.isEmpty, let model,
               memberIconCache[avatarName] == nil,
+              !unresolvableMemberIcons.contains(avatarName),
               !inFlightMemberIconResolves.contains(avatarName) else { return }
         inFlightMemberIconResolves.insert(avatarName)
         Task.detached { [weak self] in
@@ -429,7 +441,10 @@ public final class AppState {
             guard let path = model.resolveAvatarPath(avatarName),
                   let av = try? AvatarFile(path: path),
                   let art = try? av.iconImage(),
-                  let cg = art.cgImage() else { return }
+                  let cg = art.cgImage() else {
+                await MainActor.run { self?.unresolvableMemberIcons.insert(avatarName) }
+                return
+            }
             await MainActor.run { self?.memberIconCache[avatarName] = cg }
         }
     }
@@ -784,6 +799,7 @@ public final class AppState {
         selectedMembers = []
         lastKnownActiveRoom = nil
         memberIconCache = [:]
+        unresolvableMemberIcons = []
         inFlightMemberIconResolves = []
         userInfoResult = nil
         replayServer?.stop()

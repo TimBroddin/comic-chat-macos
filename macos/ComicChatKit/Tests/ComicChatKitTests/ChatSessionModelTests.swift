@@ -76,6 +76,13 @@ private final class MembersBox: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return deliveryHistory.map { $0.map(\.nick) }
     }
+
+    /// The latest snapshot's full rows (Plan 4b live-fix: member-icon
+    /// fallback regression test needs `avatarName`, not just nicks).
+    func rows() -> [MemberRow] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
 }
 
 extension EngineGlobalStateSelfTests {
@@ -151,6 +158,65 @@ extension EngineGlobalStateSelfTests {
                 try await Task.sleep(nanoseconds: 5_000_000)
             }
             #expect(members.get().contains("Peer"))
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Live-fix regression test (Tim's screenshot report): gray
+        /// placeholder rows in the member sidebar. This drives the scenario
+        /// from the screenshot — self joined plus a peer ("Win") who sends a
+        /// PRIVATE (token 0) `.appearsAs` reply-announce — and asserts both
+        /// rows end up with a non-empty `avatarName`:
+        ///   - self's `RoomMember.avatarName` is NEVER populated (our own
+        ///     announce is outbound-only, never echoed back into
+        ///     `RoomState`) — this is the case that's RED without
+        ///     `emitMembers`'s fallback (verified: reverting that fix times
+        ///     this test out, self's row never gains "anna"). The fallback
+        ///     fills it from `config.characterName`.
+        ///   - the peer's `RoomMember.avatarName` — `ProtocolSession`'s own
+        ///     `.appearsAs` handler updates `rooms[key].members[nick]` for
+        ///     every room the nick is ALREADY a member of, regardless of
+        ///     scope, so it's usually populated here too; this assertion
+        ///     guards the fallback's OTHER source (`bridge.
+        ///     announcedAvatarNames`) for the ordering races where it isn't
+        ///     (a `.appearsAs` arriving before the nick's own membership
+        ///     entry exists) — see `emitMembers`'s doc comment.
+        @Test(.timeLimit(.minutes(1)))
+        func emittedMembersFallBackToAnnouncedAvatarNamesWhenRoomStateIsEmpty() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4",
+                                                       characterName: "anna", artDir: art))
+            let members = MembersBox()
+            model.onMembers = { rows in members.set(rows) }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4", otherMembers: "Win")
+
+            // The private reply-announce -- token 0, no channel prefix (same
+            // wire form MultiRoomTests's
+            // `privateAppearsAsReplyAnnounceFansOutToAllRoomsAndSurvivesRebuild`
+            // drives), naming Win's avatar "Armando".
+            try await server.send(":Win!u@h PRIVMSG Mac :# Appears as Armando")
+
+            // Poll until the emitted rows carry the fallback for BOTH self and
+            // the peer -- membership snapshots can arrive before the private
+            // announce lands, so wait for the settled state rather than the
+            // first callback.
+            func settled() -> Bool {
+                let rows = members.rows()
+                guard let selfRow = rows.first(where: { $0.nick == "Mac" }),
+                      let peerRow = rows.first(where: { $0.nick == "Win" }) else { return false }
+                return selfRow.avatarName == "anna" && peerRow.avatarName == "Armando"
+            }
+            while !settled() {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            let rows = members.rows()
+            #expect(rows.first(where: { $0.nick == "Mac" })?.avatarName == "anna",
+                    "self row must fall back to config.characterName, got \(rows)")
+            #expect(rows.first(where: { $0.nick == "Win" })?.avatarName == "Armando",
+                    "peer row must fall back to the private announce's avatar name, got \(rows)")
             model.shutdown()
             server.stop()
         }

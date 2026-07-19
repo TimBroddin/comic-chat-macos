@@ -1333,6 +1333,30 @@ public final class ChatSessionModel: @unchecked Sendable {
         let seq = membersSeq
         let activeAtEmit = activeRoom
         let ownNick = currentOwnNick
+        // Live-fix (Tim's screenshot report): gray placeholder rows because
+        // `member.avatarName` (`RoomMember`, `ProtocolSession`'s room-scoped
+        // state) reads empty in two known cases: (1) OUR OWN row, always —
+        // our announce is outbound-only (`session.announceAvatar`), and
+        // nothing server-side ever echoes it back into `RoomState`, so
+        // `ProtocolSession`'s `.appearsAs` case (which only fires from an
+        // INBOUND event) never sees our own nick to update; (2) a PEER whose
+        // `.appearsAs` reply-announce arrives before their room membership is
+        // otherwise established (`ProtocolSession`'s `.appearsAs` handler
+        // updates `rooms[key].members[nick].avatarName` for every room where
+        // `nick` is ALREADY a member — it does not itself gate on channel vs.
+        // private scope — but a member entry has to exist first; ordering
+        // races or a not-yet-membered nick leave it empty). Snapshotting
+        // `bridge?.announcedAvatarNames` (peers, nick-keyed — the SAME map
+        // `.appearsAs` writes into via `ProtocolStripBridge.apply`,
+        // regardless of scope, so it's populated even when `RoomState` isn't
+        // yet) and `config.characterName` (self) HERE, ON THE ENGINE QUEUE,
+        // lets the row-building below fill an empty `avatarName` without the
+        // detached `Task` ever touching engine-queue state itself (the same
+        // hazard this method's own doc comment already documents for
+        // `session`). RoomState's own value wins when non-empty — it's the
+        // room-scoped, authoritative source whenever it IS populated.
+        let announcedAvatarNames = bridge?.announcedAvatarNames ?? [:]
+        let ownCharacterName = config.characterName
         Task { [session, onMembers, onSelfOp] in
             // Only the ACTIVE room's membership drives the one sidebar — a
             // background room's churn updates `session.room(room)` (read on
@@ -1340,7 +1364,17 @@ public final class ChatSessionModel: @unchecked Sendable {
             guard room == activeAtEmit else { return }
             let members = session.room(room)?.members ?? [:]
             let present = members.values.filter { !$0.departed }.sorted { $0.nick < $1.nick }
-            let rows = present.map { MemberRow(nick: $0.nick, isOp: $0.isOp, avatarName: $0.avatarName) }
+            let rows = present.map { member -> MemberRow in
+                var avatarName = member.avatarName
+                if avatarName.isEmpty {
+                    if member.nick.caseInsensitiveCompare(ownNick) == .orderedSame {
+                        avatarName = ownCharacterName
+                    } else {
+                        avatarName = announcedAvatarNames[member.nick] ?? ""
+                    }
+                }
+                return MemberRow(nick: member.nick, isOp: member.isOp, avatarName: avatarName)
+            }
             let selfIsOp = members[ownNick]?.isOp == true
             DispatchQueue.main.async {
                 guard seq > self.appliedMembersSeq else { return }   // stale snapshot — drop

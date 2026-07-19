@@ -173,6 +173,16 @@ private struct UserInfoItem: Identifiable {
 /// One member-list row (Plan 4b Task 8): an icon thumbnail (resolved via
 /// `AppState.resolveMemberIcon`/`memberIconCache`; unresolved names show no
 /// icon), the nick, and an op badge for room owners/ops.
+///
+/// Live-fix (Tim's screenshot report): a name that still doesn't resolve to
+/// real art (empty `avatarName`, or a name `resolveMemberIcon` tried and
+/// failed to decode into anything) used to render a gray rounded-rect
+/// placeholder here — ugly, and with `emitMembers`'s fallback fill (self/
+/// peer-announce snapshot) now covering the two known "empty avatarName"
+/// causes, that placeholder would otherwise ALSO show for any genuinely
+/// unresolvable name (art missing on disk, decode failure). Per the brief,
+/// unresolvable now renders NOTHING — just the nick, indented to the same
+/// leading edge the icon would have occupied so rows stay aligned.
 private struct MemberRowView: View {
     @Environment(AppState.self) private var appState
     let row: MemberRow
@@ -185,9 +195,7 @@ private struct MemberRowView: View {
                     .frame(width: 20, height: 20)
                     .clipShape(RoundedRectangle(cornerRadius: 3))
             } else {
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(Color.secondary.opacity(0.15))
-                    .frame(width: 20, height: 20)
+                Color.clear.frame(width: 20, height: 20)
             }
             Text(row.nick)
             if row.isOp {

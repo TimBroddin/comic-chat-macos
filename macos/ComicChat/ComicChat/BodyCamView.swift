@@ -24,8 +24,21 @@ struct BodyCamView: View {
             let iconOffset = bullRadius + side * 0.14
             ZStack {
                 if let poseImage {
+                    // Live-fix (Tim's screenshot report): a width-only `.frame`
+                    // let a tall pose image (full-body poses run ~1:2.5 w:h)
+                    // fit WIDTH and blow out vertically well past the wheel
+                    // pane. Constraining BOTH dimensions makes `.fit` letterbox
+                    // the pose inside a square that matches the wheel's own
+                    // sizing (`side*0.55`, comparable to the bull's `side*0.28`
+                    // radius = `side*0.56` diameter) so the pose sits INSIDE
+                    // the bulls-eye like the original CBodyCam pane
+                    // (bodycam.cpp draws the posed avatar within the pane
+                    // bounds). `.clipped()` on the ZStack below is belt-and-
+                    // braces in case some future pose art still overflows.
                     Image(decorative: poseImage, scale: 2).resizable()
-                        .aspectRatio(contentMode: .fit).frame(width: side*0.5).opacity(0.9)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: side*0.55, height: side*0.55)
+                        .opacity(0.9)
                 }
                 Circle().stroke(.secondary).frame(width: bullRadius*2, height: bullRadius*2)
                 Circle().stroke(.secondary.opacity(0.5)).frame(width: bullRadius*0.4, height: bullRadius*0.4)
@@ -38,6 +51,7 @@ struct BodyCamView: View {
                     }
                 }
             }
+            .clipped()
             .contentShape(Rectangle())
             .gesture(DragGesture(minimumDistance: 0).onChanged { g in
                 let vx = g.location.x - center.x
