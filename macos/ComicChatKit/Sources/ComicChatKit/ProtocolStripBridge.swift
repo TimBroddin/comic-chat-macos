@@ -204,6 +204,23 @@ public final class ProtocolStripBridge {
     /// order they were first added — exposed for tests/observability and for
     /// CLI callers (`cc-dumpart --replay`) to report what was rendered.
     public private(set) var participantOrder: [String] = []
+    /// nick -> the avatar basename (e.g. "anna.avb", the last path component
+    /// of whatever `.avb` the resolver actually returned) currently loaded
+    /// for that participant, whether that came from a real `.appearsAs`
+    /// announcement or a cycled default the resolver picked for a nick that
+    /// was never announced (Plan 4b live-fix: "eager member avatars at
+    /// join"). Set at the same two sites that hand a resolved path to the
+    /// engine -- `ensureParticipant`'s initial `addParticipant` and
+    /// `.appearsAs`'s `setParticipantAvatar` switch -- so it always reflects
+    /// the CURRENTLY assigned avatar, same posture as `announcedAvatarNames`.
+    /// This is the middle icon-fallback tier `ChatSessionModel.emitMembers`
+    /// needs for a member who has never spoken or announced: the ORIGINAL
+    /// (`AssignArbitraryAvatar`, protsupp.cpp:470-477, called from
+    /// `CIUserJoin`, protsupp.cpp:574-575) assigns every member SOME avatar
+    /// at join/NAMES time, not lazily on first speech -- so its member list
+    /// always has an icon to show. `resolvedAvatarName` -> `assignedAvatarNames`
+    /// is this bridge's equivalent record.
+    public private(set) var assignedAvatarNames: [String: String] = [:]
 
     /// `strip` is driven from `nil` (creates a fresh `Strip`) or an existing
     /// one (e.g. so a caller can set a backdrop first). `resolver` maps
@@ -263,6 +280,7 @@ public final class ProtocolStripBridge {
             if let id = participantIDs[nick] {
                 let avatarPath = resolver.resolve(avatarName: avatarName)
                 try strip.setParticipantAvatar(id, avbPath: avatarPath)
+                assignedAvatarNames[nick] = (avatarPath as NSString).lastPathComponent
             }
 
         case .text(let nick, _, _, let text, let kind, let annotations):
@@ -272,6 +290,37 @@ public final class ProtocolStripBridge {
             try strip.addLineCooked(speaker: speaker, text: text, modes: modes,
                                     addressees: addressees, annotations: annotations,
                                     encoding: encoding)
+
+        case .names(_, let nicks):
+            // Plan 4b live-fix (Tim's screenshot report): the ORIGINAL
+            // assigns every member an avatar at JOIN/NAMES time
+            // (`CIUserJoin` -> `AssignArbitraryAvatar`, protsupp.cpp:574-575,
+            // driven per-NAMES-nick via `bSingleJoin`/`JoinEntry::Execute`,
+            // ircsock.cpp:2508-2539 / histent.cpp:259-265), not lazily on
+            // first speech -- so its member list always shows an icon for
+            // silent members too. Mirror that here: eagerly ensureParticipant
+            // every listed nick. NAMES prefixes op/voice with '@'/'+' (same
+            // grammar `ProtocolSession`'s own `.names` handling strips,
+            // ProtocolSession.swift:1149-1157) -- strip it so the bare nick
+            // matches what `.userJoined`/`.text` events for the same person
+            // use as their dictionary key. Handling this HERE (rather than
+            // only in `ChatSessionModel`) means a room's `.names` entry in
+            // its transcript replays through this SAME path on reflow/
+            // room-switch (`rebuildStripLocked`'s replay loop), so a
+            // background room's eventual activation reproduces the identical
+            // assignment deterministically -- no separate replay logic
+            // needed. Self is not special-cased: `preRegisterSelfParticipant`
+            // has already claimed self's nick by the time any `.names` event
+            // can arrive (`ChatSessionModel.setUpStripLocked` registers self
+            // before the bridge ever sees an event), so `ensureParticipant`
+            // for self's own nick here is the same safe no-op it already is
+            // for a self-authored `.userJoined` echo.
+            let bareNicks = nicks.map { nick -> String in
+                var bare = nick
+                if bare.hasPrefix("@") || bare.hasPrefix("+") { bare.removeFirst() }
+                return bare
+            }.filter { !$0.isEmpty }
+            ensureParticipants(bareNicks)
 
         case .whisper(let nick, _, let text, let annotations):
             let speaker = try ensureParticipant(nick)
@@ -340,7 +389,31 @@ public final class ProtocolStripBridge {
         let id = try strip.addParticipant(nick: nick, avbPath: avatarPath)
         participantIDs[nick] = id
         participantOrder.append(nick)
+        assignedAvatarNames[nick] = (avatarPath as NSString).lastPathComponent
         return id
+    }
+
+    /// Public seam for eagerly creating a participant for every nick in
+    /// `nicks` (Plan 4b live-fix) -- the bridge's own `ensureParticipant` is
+    /// `private` (an implementation detail of `apply`'s event routing), so a
+    /// caller that needs to force eager creation from a nick list that isn't
+    /// itself a `.names`/`.userJoined` `ProtocolEvent` (or wants to do so
+    /// without going through `apply`) uses this instead. `.names`'s own
+    /// handling in `apply` above calls this internally, so most callers never
+    /// need to call it directly -- it's exposed primarily for
+    /// `ChatSessionModel`/tests that want the eager-creation behavior as a
+    /// standalone step. Nicks already participants are silently skipped
+    /// (idempotent, same as any individual `ensureParticipant` call); a
+    /// resolver failure for one nick does not abort the rest -- unlike
+    /// `apply`, which propagates a throw for its OWN triggering event, this
+    /// is a best-effort bulk operation over a list the caller doesn't want a
+    /// single bad entry to abort (mirrors the original's behavior: a NAMES
+    /// list is processed nick-by-nick, `bSingleJoin`, ircsock.cpp:270-276,
+    /// with no single point where one bad entry could stop the rest).
+    public func ensureParticipants(_ nicks: [String]) {
+        for nick in nicks {
+            _ = try? ensureParticipant(nick)
+        }
     }
 
     private func resolveAddressees(_ nicks: [String]) throws -> [Int32] {

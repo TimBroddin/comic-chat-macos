@@ -205,6 +205,83 @@ extension EngineGlobalStateSelfTests {
             server.stop()
         }
 
+        /// Live-fix (Tim's screenshot report) determinism companion: eager
+        /// NAMES-driven avatar assignment (`ProtocolStripBridge.apply`'s
+        /// `.names` case, live-fix in `ChatSessionModel.handleLocked`) must
+        /// produce the SAME result whether a room's strip is built live
+        /// (the active room at join time) or replayed later from its
+        /// transcript (`rebuildStripLocked`, a background room's `.names`
+        /// event sits in its transcript unapplied until that room is
+        /// activated). Joins #a (active, peers Peer-A1/Peer-A2 silent) and
+        /// #b (background, peer Peer-B1 silent) on one connection, then
+        /// switches to #b (forcing its FIRST-EVER strip build, i.e. a
+        /// transcript replay of its `.names` event via
+        /// `rebuildStripLocked`) and back to #a (forcing #a's replay too,
+        /// same machinery `privateAppearsAsReplyAnnounceFansOutToAllRoomsAndSurvivesRebuild`
+        /// exercises). Asserts every silent peer in both rooms has a
+        /// non-empty `avatarName` both before and after the round-trip
+        /// switch -- proving the resolver's first-seen cycling order is
+        /// reproduced identically by replay, not just present once live.
+        @Test(.timeLimit(.minutes(1)))
+        func namesEagerAvatarsAreDeterministicAcrossRoomSwitchAndReplay() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#a", artDir: art))
+            let members = MRMembersBox()
+            model.onMembers = { rows in members.set(rows) }
+
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(
+                nick: "Mac", channel: "#a", otherMembers: "Peer-A1 Peer-A2")
+
+            try await model.joinRoom("#b")
+            try await server.waitForClientLine(containing: "JOIN #b")
+            try await server.send(
+                ":Mac!mac@h JOIN :#b",
+                ":srv 353 Mac = #b :Mac Peer-B1",
+                ":srv 366 Mac #b :End of NAMES list")
+            try await pollUntil { model.roomInfos.count == 2 }
+
+            // #a (active, live-built): both silent peers get an icon.
+            func rowsHaveIcons(_ rows: [MemberRow], nicks: [String]) -> Bool {
+                nicks.allSatisfy { nick in rows.first(where: { $0.nick == nick })?.avatarName.isEmpty == false }
+            }
+            try await pollUntil { rowsHaveIcons(members.rows(), nicks: ["Peer-A1", "Peer-A2"]) }
+            let aRowsBeforeSwitch = members.rows()
+            #expect(rowsHaveIcons(aRowsBeforeSwitch, nicks: ["Peer-A1", "Peer-A2"]),
+                    "#a's silent peers must have icons while #a is the live-built active room, got \(aRowsBeforeSwitch)")
+
+            // Switch to #b: its FIRST strip build is a transcript replay
+            // (rebuildStripLocked), which must re-apply #b's `.names` event
+            // through the identical `ProtocolStripBridge.apply` path.
+            model.setActiveRoom("#b")
+            try await pollUntil { model.currentRoom == "#b" }
+            try await pollUntil { rowsHaveIcons(members.rows(), nicks: ["Peer-B1"]) }
+            let bRows = members.rows()
+            #expect(rowsHaveIcons(bRows, nicks: ["Peer-B1"]),
+                    "#b's silent peer must have an icon after #b's transcript replay assigns it, got \(bRows)")
+
+            // Switch back to #a: its SECOND strip build is ALSO a replay
+            // (rebuildStripLocked again) -- must reproduce the SAME
+            // assignment #a had live (same resolver first-seen order).
+            model.setActiveRoom("#a")
+            try await pollUntil { model.currentRoom == "#a" }
+            try await pollUntil { rowsHaveIcons(members.rows(), nicks: ["Peer-A1", "Peer-A2"]) }
+            let aRowsAfterReplay = members.rows()
+            #expect(rowsHaveIcons(aRowsAfterReplay, nicks: ["Peer-A1", "Peer-A2"]),
+                    "#a's silent peers must STILL have icons after a replay rebuild, got \(aRowsAfterReplay)")
+            #expect(aRowsAfterReplay.first(where: { $0.nick == "Peer-A1" })?.avatarName
+                    == aRowsBeforeSwitch.first(where: { $0.nick == "Peer-A1" })?.avatarName,
+                    "Peer-A1's assigned avatar must be IDENTICAL live vs. replayed (deterministic first-seen resolver cycling)")
+            #expect(aRowsAfterReplay.first(where: { $0.nick == "Peer-A2" })?.avatarName
+                    == aRowsBeforeSwitch.first(where: { $0.nick == "Peer-A2" })?.avatarName,
+                    "Peer-A2's assigned avatar must be IDENTICAL live vs. replayed (deterministic first-seen resolver cycling)")
+
+            model.shutdown()
+            server.stop()
+        }
+
         /// Final-review Important #1 (RED before the fix): a peer's PRIVATE
         /// `.appearsAs` reply-announce -- the 1998 client's standard response
         /// to our own channel-wide avatar announce -- arrives as a bare
@@ -410,6 +487,17 @@ private final class MRRoomsBox: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return storage.first { $0.name == name }
     }
+}
+
+/// Thread-safe latest-`[MemberRow]` box (`onMembers` fires on the main
+/// thread; the test body reads from its own task) -- same shape as
+/// `ChatSessionModelTests`' own `MembersBox`, duplicated here since that one
+/// is `private` to its own file.
+private final class MRMembersBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [MemberRow] = []
+    func set(_ rows: [MemberRow]) { lock.lock(); defer { lock.unlock() }; storage = rows }
+    func rows() -> [MemberRow] { lock.lock(); defer { lock.unlock() }; return storage }
 }
 
 // Test-only helpers on the loopback rig + session used across the multi-room

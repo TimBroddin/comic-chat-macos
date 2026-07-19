@@ -288,6 +288,146 @@ extension EngineGlobalStateSelfTests {
         }
     }
 
+    // (c5) Live-fix (Tim's screenshot report): a `.names` reply lists every
+    // room member up front, most of whom never speak or announce. The
+    // ORIGINAL (protsupp.cpp's `CIUserJoin`, driven per-nick off RPL_NAMEREPLY
+    // via `bSingleJoin` -> `JoinEntry::Execute`, ircsock.cpp:2508-2539 /
+    // histent.cpp:259-265) assigns every non-self member an avatar
+    // (`AssignArbitraryAvatar`, protsupp.cpp:470-477) at JOIN/NAMES time, not
+    // lazily on first speech — so the member grid shows an icon for everyone
+    // immediately. `ensureParticipants` is the bridge's public seam for that:
+    // feeding a NAMES-shaped nick list must create a participant (with a
+    // cycled-default avatar, since none of these three ever announced or
+    // spoke) for EVERY listed nick, silent or not.
+    @Test func ensureParticipantsCreatesEveryListedNickEagerly() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            let resolver = ProtocolStripBridge.AvatarResolver(
+                defaultOrder: [fixture("anna.avb")])
+            let bridge = try ProtocolStripBridge(resolver: resolver)
+
+            bridge.ensureParticipants(["Peer1", "Peer2", "Peer3"])
+
+            #expect(bridge.participantOrder == ["Peer1", "Peer2", "Peer3"])
+            #expect(bridge.participantIDs["Peer1"] != nil)
+            #expect(bridge.participantIDs["Peer2"] != nil)
+            #expect(bridge.participantIDs["Peer3"] != nil)
+
+            // Idempotent: a nick already a participant (e.g. one who has
+            // since spoken, or appears in a later NAMES/JOIN echo) is not
+            // re-added or reassigned a new id.
+            let peer1ID = bridge.participantIDs["Peer1"]
+            bridge.ensureParticipants(["Peer1"])
+            #expect(bridge.participantIDs["Peer1"] == peer1ID)
+            #expect(bridge.participantOrder == ["Peer1", "Peer2", "Peer3"])
+        }
+    }
+
+    // (c6) `assignedAvatarNames` (Plan 4b live-fix) is the bridge's record of
+    // the avatar basename it ACTUALLY resolved/loaded for each participant —
+    // whether that came from a real `.appearsAs` announcement or (as here) a
+    // cycled default the resolver picked for a never-announced nick. This is
+    // the middle icon-fallback tier `ChatSessionModel.emitMembers` needs:
+    // announced name (authoritative) -> ASSIGNED name (this) -> nothing.
+    @Test func assignedAvatarNamesRecordsTheResolvedBasenameForEveryParticipant() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            let resolver = ProtocolStripBridge.AvatarResolver(
+                defaultOrder: [fixture("anna.avb"), fixture("anna.avb")])
+            let bridge = try ProtocolStripBridge(resolver: resolver)
+
+            bridge.ensureParticipants(["Peer1", "Peer2"])
+
+            // Never announced -> resolver cycled a default -> the basename of
+            // whatever path got loaded ("anna.avb" for both fixture slots
+            // here), NOT empty.
+            #expect(bridge.assignedAvatarNames["Peer1"] == "anna.avb")
+            #expect(bridge.assignedAvatarNames["Peer2"] == "anna.avb")
+
+            // A later real announcement updates the record to the announced
+            // (resolved) basename too -- `assignedAvatarNames` always
+            // reflects the CURRENT avatar, same posture as `announcedAvatarNames`.
+            let fixturesDir = (fixture("anna.avb") as NSString).deletingLastPathComponent
+            let resolver2 = ProtocolStripBridge.AvatarResolver(
+                comicartDir: fixturesDir, defaultOrder: [fixture("anna.avb")])
+            let bridge2 = try ProtocolStripBridge(resolver: resolver2)
+            try bridge2.apply(.userJoined(nick: "Win", ident: "win@host"))
+            #expect(bridge2.assignedAvatarNames["Win"] == "anna.avb")
+            try bridge2.apply(.appearsAs(nick: "Win", avatarName: "armando", url: ""))
+            #expect(bridge2.assignedAvatarNames["Win"] == "armando.avb")
+        }
+    }
+
+    // (c7) The live bug itself, at the protocol-event boundary: a `.names`
+    // event (not just a direct `ensureParticipants` call) must eagerly create
+    // a participant for every listed nick, INCLUDING the NAMES-standard
+    // '@'/'+' op/voice prefixes (which must be stripped, not treated as part
+    // of the nick -- mirrors `ProtocolSession`'s own `.names` handling,
+    // ProtocolSession.swift:1149-1165). This is what makes background-room
+    // replay deterministic for free: `.names` sits in the room's transcript,
+    // and `rebuildStripLocked`'s replay re-applies it through this SAME
+    // `apply` case.
+    @Test func namesEventEagerlyCreatesParticipantsAndStripsPrefixes() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            let resolver = ProtocolStripBridge.AvatarResolver(
+                defaultOrder: [fixture("anna.avb")])
+            let bridge = try ProtocolStripBridge(resolver: resolver)
+
+            try bridge.apply(.names(channel: "#comicrig", nicks: ["@Op", "+Voice", "Plain"]))
+
+            #expect(bridge.participantOrder == ["Op", "Voice", "Plain"])
+            #expect(bridge.participantIDs["Op"] != nil)
+            #expect(bridge.participantIDs["Voice"] != nil)
+            #expect(bridge.participantIDs["Plain"] != nil)
+        }
+    }
+
+    // (c8) Live-fix companion: a member who was eagerly created by `.names`
+    // (never spoke or announced -- got a cycled-default avatar) can still be
+    // switched by a LATER real `.appearsAs` announcement, exactly like any
+    // other existing participant (`appearsAsSwitchesExistingParticipantAvatar`
+    // above). The eager default must not "lock in" and block a genuine
+    // announce from taking effect -- `.appearsAs`'s handling in `apply`
+    // switches ANY existing participant id regardless of how it was created.
+    @Test func namesEagerlyAssignedMemberStillHonorsALaterAppearsAs() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            let fixturesDir = (fixture("anna.avb") as NSString).deletingLastPathComponent
+            let resolver = ProtocolStripBridge.AvatarResolver(
+                comicartDir: fixturesDir, defaultOrder: [fixture("anna.avb")])
+            let bridge = try ProtocolStripBridge(resolver: resolver)
+
+            // Silent member, eagerly created via `.names` -- gets the cycled
+            // default (never announced, never spoke).
+            try bridge.apply(.names(channel: "#comicrig", nicks: ["Win"]))
+            let winID = bridge.participantIDs["Win"]
+            #expect(winID != nil)
+            #expect(bridge.assignedAvatarNames["Win"] == "anna.avb")
+
+            // A later real announcement must still switch the SAME
+            // participant id (no duplicate/second participant created) and
+            // update BOTH announcedAvatarNames and assignedAvatarNames.
+            try bridge.apply(.appearsAs(nick: "Win", avatarName: "armando", url: ""))
+            #expect(bridge.participantIDs["Win"] == winID, "the announce must switch the EXISTING eager participant, not create a new one")
+            #expect(bridge.announcedAvatarNames["Win"] == "armando")
+            #expect(bridge.assignedAvatarNames["Win"] == "armando.avb")
+            #expect(bridge.participantOrder == ["Win"], "still exactly one participant for Win")
+        }
+    }
+
     // (d) THE EXIT-MILESTONE PNG: the same annotated event stream composited
     // through CGCanvas into real pixels -- the wire-fed equivalent of Plan 2's
     // stripPNG exit proof (StripTests.swift). Written to

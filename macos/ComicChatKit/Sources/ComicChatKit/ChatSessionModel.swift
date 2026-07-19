@@ -1590,6 +1590,39 @@ public final class ChatSessionModel: @unchecked Sendable {
             }
             if let key = scopedKey { emitMembers(for: key) }
 
+        case .names:
+            // Live-fix (Tim's screenshot report): a `.names` reply lists
+            // EVERY member of the room up front, most of whom haven't spoken
+            // or announced yet — the ORIGINAL (`CIUserJoin` ->
+            // `AssignArbitraryAvatar`, protsupp.cpp:550-586/470-477, driven
+            // per-NAMES-nick via `bSingleJoin`, ircsock.cpp:270-276) assigns
+            // every one of them an avatar right here, at JOIN/NAMES time —
+            // not lazily on first speech — so its member list always shows
+            // an icon for everyone immediately. Pre-fix, `.names` only ever
+            // called `emitMembers` below: the bridge never saw it, so
+            // `ProtocolStripBridge` (which creates participants LAZILY,
+            // `ensureParticipant`'s own doc comment) never assigned these
+            // silent members an avatar, leaving their member-grid rows
+            // blank. `applyToBridgeLocked` now routes `.names` into
+            // `ProtocolStripBridge.apply`'s own `.names` case (eagerly
+            // `ensureParticipants` for every listed nick, self included —
+            // self is already pre-registered by `setUpStripLocked`, so that
+            // half is a harmless no-op), same `isActiveRoom` gate as
+            // `.userJoined` above (a background room's `.names` sits in its
+            // transcript and gets the identical treatment automatically on
+            // `rebuildStripLocked`'s replay when it's next activated — no
+            // separate background-room logic needed here). `recomposeLocked`
+            // follows so the newly eager participants' effect on the title/
+            // STARRING panel (`addParticipant`'s own title-refresh,
+            // Strip.swift:111-136) is actually rendered, matching
+            // `.userJoined`'s own recompose. A NAMES reply does NOT bump
+            // unread (same posture as a join — it's membership, not a
+            // message).
+            if isActiveRoom {
+                applyToBridgeLocked(ev); recomposeLocked()
+            }
+            emitMembers(for: scopedKey ?? activeRoom)
+
         case .nickChanged(_, let newNick, let isSelf):
             if isSelf {
                 currentOwnNick = newNick   // echo-only rule confirmation, mirrors ProtocolSession's own _ownNick update
@@ -1598,7 +1631,7 @@ public final class ChatSessionModel: @unchecked Sendable {
             // active room's member list (the sidebar shows the active room).
             emitMembers(for: activeRoom)
 
-        case .userParted, .kicked, .names, .endOfNames:
+        case .userParted, .kicked, .endOfNames:
             emitMembers(for: scopedKey ?? activeRoom)
 
         case .userQuit:
@@ -2145,6 +2178,22 @@ public final class ChatSessionModel: @unchecked Sendable {
         // `session`). RoomState's own value wins when non-empty — it's the
         // room-scoped, authoritative source whenever it IS populated.
         let announcedAvatarNames = bridge?.announcedAvatarNames ?? [:]
+        // Live-fix (Tim's screenshot report): the eager NAMES-driven
+        // participant creation (`.names`'s handling in `handleLocked` above,
+        // routed into `ProtocolStripBridge.apply`'s own `.names` case) gives
+        // every member SOME avatar the moment they're listed, even if they
+        // never speak or announce — `assignedAvatarNames` (nick -> the
+        // basename actually resolved/loaded, cycled-default or announced
+        // alike) is the bridge's record of that. This is the MIDDLE
+        // icon-fallback tier: announced (`announcedAvatarNames` above,
+        // authoritative whenever a real `.appearsAs` exists) -> ASSIGNED
+        // (this — covers a silent member who was only ever eagerly
+        // ensureParticipant'd) -> self `ownCharacterName` / nothing. Without
+        // this tier, a silent member's row falls all the way through to ""
+        // below (neither `RoomState` nor `announcedAvatarNames` has anything
+        // for a nick that never spoke, announced, or updated `RoomState`),
+        // reproducing the exact blank-icon bug this fix addresses.
+        let assignedAvatarNames = bridge?.assignedAvatarNames ?? [:]
         let ownCharacterName = config.characterName
         // Quick-wins batch item 5: snapshotted here, on the engine queue
         // (same posture as `announcedAvatarNames`/`ownCharacterName` above —
@@ -2166,7 +2215,15 @@ public final class ChatSessionModel: @unchecked Sendable {
                     if member.nick.caseInsensitiveCompare(ownNick) == .orderedSame {
                         avatarName = ownCharacterName
                     } else {
-                        avatarName = announcedAvatarNames[member.nick] ?? ""
+                        // announced (authoritative real `.appearsAs`) ->
+                        // ASSIGNED (the bridge's cycled-default-or-announced
+                        // record for a member who was eagerly
+                        // ensureParticipant'd but never spoke/announced) ->
+                        // empty (never became a strip participant at all —
+                        // shouldn't happen post-fix for any listed member,
+                        // but stays a safe fallback rather than a crash).
+                        avatarName = announcedAvatarNames[member.nick]
+                            ?? assignedAvatarNames[member.nick] ?? ""
                     }
                 }
                 return MemberRow(nick: member.nick, isOp: member.isOp, avatarName: avatarName,

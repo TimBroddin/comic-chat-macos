@@ -162,14 +162,27 @@ extension EngineGlobalStateSelfTests {
             let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
             let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
                                                        nick: "Mac", room: "#p4", artDir: art))
-            let imagesArrived = AsyncStream<Void>.makeStream()
-            model.onStripImage = { _, _ in imagesArrived.continuation.yield() }
             try await model.start()
             try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
             // A peer speaks -> a peer participant is created + a strip composes.
             try await server.send(":Win!u@h PRIVMSG #p4 :(#G295E193M1)hello mac")
-            var iter = imagesArrived.stream.makeAsyncIterator()
-            _ = await iter.next()
+            // Poll for the reverse-map itself (rather than waiting for a
+            // single `onStripImage` signal): live-fix (Tim's screenshot
+            // report) now recomposes on `.names` too (so the eagerly
+            // NAMES-listed cast's title panel actually renders) — an
+            // `AsyncStream` buffers that EARLIER yield (unbounded by
+            // default), so a bare "wait for next `onStripImage`" here could
+            // consume the `.names` recompose instead of the one this test
+            // actually wants (the one after Win's message), observing "Win"
+            // before its participant id is registered. Polling the actual
+            // condition sidesteps the race, same shape as this file's other
+            // polling helpers (`peerJoinRefreshesMemberSidebar`).
+            func winRegistered() -> Bool {
+                (Int32(1)...Int32(8)).contains { model.participantNick(for: $0) == "Win" }
+            }
+            while !winRegistered() {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
 
             // (1) reverse-map: SOME participant id (1...8, the strip caps well
             // under this) reverses to "Win", and the self nick "Mac" is also
@@ -321,6 +334,69 @@ extension EngineGlobalStateSelfTests {
                 try await Task.sleep(nanoseconds: 5_000_000)
             }
             #expect(members.get().contains("Peer"))
+            model.shutdown()
+            server.stop()
+        }
+
+        /// Live-fix (Tim's screenshot report): right after joining a room,
+        /// the member grid showed icons ONLY for members who had spoken or
+        /// announced — everyone else was blank. The ORIGINAL
+        /// (`CIUserJoin`/`AssignArbitraryAvatar`, protsupp.cpp:550-586/
+        /// 470-477, driven per-NAMES-nick via `bSingleJoin`,
+        /// ircsock.cpp:270-276) assigns every member an avatar at JOIN/NAMES
+        /// time, not lazily on first speech, so its member list/cast always
+        /// shows an icon for everyone immediately.
+        ///
+        /// Drives a join where the NAMES reply lists 3 peers who never speak
+        /// or announce, and asserts all 3 end up with a non-empty
+        /// `avatarName` in the emitted member rows (the eager
+        /// `ProtocolStripBridge.ensureParticipants` call from `.names`
+        /// populates `assignedAvatarNames`, the new middle icon-fallback
+        /// tier `emitMembers` reads). Also asserts the strip's panel count
+        /// reflects a title panel that lists the full cast (`Strip.setTitle`
+        /// / `addParticipant`'s own title-panel-refresh machinery,
+        /// Strip.swift:111-136) — i.e. more than 0 panels exist after join
+        /// with no message sent yet, since the title/STARRING panel is
+        /// panel 0 and updates as each of the 3 silent members is eagerly
+        /// added as a participant.
+        @Test(.timeLimit(.minutes(1)))
+        func namesListsSilentPeersAndAllGetAssignedAvatarIcons() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4",
+                                                       characterName: "anna", artDir: art))
+            let members = MembersBox()
+            model.onMembers = { rows in members.set(rows) }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(
+                nick: "Mac", channel: "#p4", otherMembers: "Peer1 Peer2 Peer3")
+
+            func settled() -> Bool {
+                let rows = members.rows()
+                return rows.count == 4 && ["Peer1", "Peer2", "Peer3"].allSatisfy { nick in
+                    rows.first(where: { $0.nick == nick })?.avatarName.isEmpty == false
+                }
+            }
+            while !settled() {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            let rows = members.rows()
+            #expect(rows.count == 4, "expected self + 3 peers, got \(rows)")
+            for nick in ["Peer1", "Peer2", "Peer3"] {
+                let row = rows.first(where: { $0.nick == nick })
+                #expect(row?.avatarName.isEmpty == false,
+                        "\(nick) (never spoke/announced) must still have an assigned avatar icon, got \(String(describing: row))")
+            }
+
+            // The title/STARRING panel (panel 0) reflects the eagerly-added
+            // cast -- a nonzero panel count with no message sent yet proves
+            // `addParticipant`'s own title-panel-refresh fired for each of
+            // the 3 silent members' eager `ensureParticipant` call, exactly
+            // as `Strip.setTitle`'s doc comment describes.
+            #expect(model.panelCount > 0,
+                    "expected the title/STARRING panel to exist after eager participant creation")
+
             model.shutdown()
             server.stop()
         }
