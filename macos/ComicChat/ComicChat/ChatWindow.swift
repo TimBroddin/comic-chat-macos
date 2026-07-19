@@ -406,6 +406,15 @@ struct RoomSidebar: View {
             }
         }
         .navigationSplitViewColumnWidth(min: 160, ideal: 200)
+        // Auto-reconnect (spec §7): a non-modal indicator pinned above the room
+        // list while a reconnect backoff loop is running or after it gave up.
+        // The per-attempt human-readable countdown line lives in the status
+        // line (`onStatus`); this is just the persistent at-a-glance badge.
+        .safeAreaInset(edge: .top) {
+            if appState.isReconnecting || appState.reconnectGaveUp {
+                ReconnectBanner()
+            }
+        }
         .toolbar {
             ToolbarItem {
                 Button {
@@ -437,6 +446,38 @@ struct RoomSidebar: View {
                 appState.setActiveRoom(newValue)
             }
         )
+    }
+}
+
+/// Auto-reconnect (spec §7): the non-modal sidebar indicator. A spinner +
+/// "Reconnecting…" while a backoff loop runs; a warning glyph + "Couldn't
+/// reconnect" (with a Reconnect button that reopens the connect sheet) once it
+/// gives up. Shown only when `isReconnecting`/`reconnectGaveUp` (the caller
+/// gates it), so the `.connected` steady state renders nothing.
+struct ReconnectBanner: View {
+    @Environment(AppState.self) private var appState
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if appState.reconnectGaveUp {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("Couldn't reconnect")
+                    .font(.caption)
+                Spacer(minLength: 0)
+                Button("Reconnect") { appState.showConnectSheet = true }
+                    .controlSize(.small)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Reconnecting…")
+                    .font(.caption)
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.thinMaterial)
     }
 }
 

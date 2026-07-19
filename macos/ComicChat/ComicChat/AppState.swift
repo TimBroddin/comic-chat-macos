@@ -37,6 +37,23 @@ public final class AppState {
     public var settings = SettingsStore()
     public var showConnectSheet = true
     public var statusLine = ""
+    /// Auto-reconnect (spec §7): the model's reconnect state, mirrored from
+    /// `ChatSessionModel.onReconnectStateChanged` on the main thread. Drives a
+    /// non-modal indicator — the sidebar header shows "Reconnecting…" while a
+    /// backoff loop runs and "Couldn't reconnect" after it gives up; `.connected`
+    /// (the steady state) shows nothing. The human-readable per-attempt lines
+    /// arrive separately via `onStatus`/`statusLine`. `nil` before the first
+    /// connect. Reset to `nil` in `disconnect()`.
+    public var reconnectState: ReconnectState?
+    /// Convenience for the sidebar header: `true` while a reconnect backoff loop
+    /// is running (derived from `reconnectState`).
+    public var isReconnecting: Bool {
+        if case .reconnecting = reconnectState { return true }
+        return false
+    }
+    /// Convenience for the sidebar header: `true` once the reconnect loop gave
+    /// up (terminal until a manual reconnect).
+    public var reconnectGaveUp: Bool { reconnectState == .gaveUp }
     /// Live-fix 4 (Tim's request: "show the MOTD like the original client";
     /// also fixes error-notes being clobbered by the next status line) — the
     /// accumulating server-messages console (`ServerConsoleWindow`), mirrored
@@ -783,6 +800,12 @@ public final class AppState {
                 cfg.port = server.port
                 cfg.nick = "Anon"
                 cfg.room = "#comicrig"
+                // Auto-reconnect (spec §7) is meaningless for the replay-fixture
+                // dev path: `FixtureReplayServer` serves exactly ONE connection
+                // and closes it when the fixture ends — reconnecting would just
+                // dial a dead port forever. Opt out so a fixture's natural
+                // end-of-stream close doesn't kick off a doomed backoff loop.
+                cfg.autoReconnect = false
             } catch {
                 statusLine = "Replay fixture failed to start: \(error)"
                 showConnectSheet = true
@@ -824,6 +847,8 @@ public final class AppState {
             Task { @MainActor in self?.handleNickRejected(badNick: badNick, text: text) } }
         m.onServerMessage = { [weak self] text in
             Task { @MainActor in self?.appendServerMessage(text) } }
+        m.onReconnectStateChanged = { [weak self] state in
+            Task { @MainActor in self?.reconnectState = state } }
         model = m
         do { try await m.start(); showConnectSheet = false }
         catch {
@@ -903,6 +928,11 @@ public final class AppState {
         pendingWhisperPeer = nil
         soundPlayer?.stop()
         soundPlayer = nil
+        // Auto-reconnect (spec §7): `model?.shutdown()` above already cancelled
+        // any in-flight reconnect loop (`ChatSessionModel.shutdown` ->
+        // `cancelReconnect`), so this just clears the mirrored indicator — a
+        // fresh manual connect starts from a clean "no reconnect state" slate.
+        reconnectState = nil
     }
 
     /// Live-fix 3 (crypthome.com, live-reproduced: `432 Anonymous :Reserved

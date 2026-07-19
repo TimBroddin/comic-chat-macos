@@ -130,6 +130,20 @@ public final class ProtocolSession: @unchecked Sendable {
     private var roomTokenToChannel: [UInt32: String] = [:]
     private var connectionStatus: ConnectionStatus = .disconnected
 
+    /// Set (on `sessionQueue`) by `disconnect()` to mark a USER-INITIATED
+    /// teardown, so the receive-loop EOF/error paths and the connection's
+    /// `.failed`/`.cancelled` state handler can distinguish it from an
+    /// UNEXPECTED drop (spec §7's auto-reconnect trigger). A user disconnect is
+    /// EXPECTED — those paths therefore suppress the `.disconnectedHint` emit
+    /// (the model uses that event as its reconnect trigger; emitting it for a
+    /// deliberate disconnect would wrongly schedule a reconnect against a
+    /// session the user just closed). An unexpected drop leaves this `false`,
+    /// so the hint is emitted and the model can react. Reset to `false` at the
+    /// top of `connect()` so a session object reused for a fresh connect (not
+    /// the current pattern — the model creates a new `ProtocolSession` per
+    /// reconnect — but defensively correct) starts clean.
+    private var userInitiatedDisconnect = false
+
     // MARK: Login sequencing (Plan 4a Task 2 -- probe -> 451/800-pivot/timeout -> NICK/USER)
 
     /// `true` from `onSocketReady()` (the probe was sent) until the plain
@@ -233,6 +247,7 @@ public final class ProtocolSession: @unchecked Sendable {
                     continuation.resume(throwing: ProtocolSessionError.alreadyConnected)
                     return
                 }
+                userInitiatedDisconnect = false
                 connectionStatus = .connecting
                 let params = NWParameters.tcp
                 let conn = NWConnection(host: NWEndpoint.Host(host), port: port, using: params)
@@ -259,7 +274,12 @@ public final class ProtocolSession: @unchecked Sendable {
                         self.connectionStatus = .disconnected
                         if resumeGuard.markResumed() {
                             continuation.resume(throwing: error)
-                        } else {
+                        } else if !self.userInitiatedDisconnect {
+                            // Unexpected mid-session failure (not the initial
+                            // connect, which the `markResumed()` branch owns,
+                            // and not a user-driven `disconnect()`, which sets
+                            // the flag): surface the hint so the model's
+                            // auto-reconnect can react (spec §7).
                             self.emit(.disconnectedHint(text: "\(error)"), roomToken: CC_ROOM_TOKEN_NONE)
                         }
                     case .cancelled:
@@ -363,11 +383,26 @@ public final class ProtocolSession: @unchecked Sendable {
                 }
                 if let error {
                     self.connectionStatus = .disconnected
-                    self.emit(.disconnectedHint(text: "\(error)"), roomToken: CC_ROOM_TOKEN_NONE)
+                    // Only alarm the model on an UNEXPECTED drop — a
+                    // user-initiated `disconnect()` cancels the connection,
+                    // which surfaces here as an error, but is expected and must
+                    // NOT trigger auto-reconnect (spec §7 / the model's
+                    // `.disconnectedHint` reconnect trigger).
+                    if !self.userInitiatedDisconnect {
+                        self.emit(.disconnectedHint(text: "\(error)"), roomToken: CC_ROOM_TOKEN_NONE)
+                    }
                     return
                 }
                 if isComplete {
                     self.connectionStatus = .disconnected
+                    // Clean server-side close (EOF). Pre-auto-reconnect this
+                    // was silently absorbed (no hint emitted); the model now
+                    // needs to know the socket died so it can reconnect —
+                    // unless the user closed it deliberately (flag set).
+                    if !self.userInitiatedDisconnect {
+                        self.emit(.disconnectedHint(text: "Connection closed by server"),
+                                  roomToken: CC_ROOM_TOKEN_NONE)
+                    }
                     return
                 }
                 self.receiveLoop()
@@ -380,6 +415,12 @@ public final class ProtocolSession: @unchecked Sendable {
     /// more than once.
     public func disconnect() {
         sessionQueue.async { [self] in
+            // Mark this teardown user-initiated BEFORE cancelling the
+            // connection: `connection?.cancel()` below drives the receive loop
+            // to an error/cancelled state, whose handlers check this flag to
+            // suppress the `.disconnectedHint` reconnect trigger (spec §7). Set
+            // it first so no drop-path emit races ahead of it.
+            userInitiatedDisconnect = true
             timerSource?.cancel()
             timerSource = nil
             connection?.cancel()

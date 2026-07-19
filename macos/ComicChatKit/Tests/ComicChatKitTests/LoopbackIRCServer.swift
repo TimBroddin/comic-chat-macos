@@ -29,10 +29,28 @@ final class LoopbackIRCServer: @unchecked Sendable {
 
     /// Starts listening immediately; throws if the listener can't be created
     /// or fails to come up within a short timeout.
-    init() throws {
+    ///
+    /// - Parameter port: bind to a SPECIFIC port instead of an OS-assigned
+    ///   ephemeral one (`nil`, the default). The auto-reconnect test
+    ///   (`ReconnectTests`) needs this: a drop-then-reconnect targets
+    ///   `config.host`/`config.port`, so after the first server closes the
+    ///   socket the test must resurrect a SECOND server on the SAME port the
+    ///   `ProtocolSession` will dial back into. `allowLocalEndpointReuse`
+    ///   (already set below) lets the fresh listener rebind that port even
+    ///   though the just-closed one may linger in TIME_WAIT briefly.
+    convenience init() throws {
+        try self.init(port: nil)
+    }
+
+    init(port: UInt16?) throws {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        let l = try NWListener(using: params, on: .any)
+        let l: NWListener
+        if let port, let nwPort = NWEndpoint.Port(rawValue: port) {
+            l = try NWListener(using: params, on: nwPort)
+        } else {
+            l = try NWListener(using: params, on: .any)
+        }
         self.listener = l
 
         let portBox = PortBox()
@@ -57,8 +75,17 @@ final class LoopbackIRCServer: @unchecked Sendable {
         }
         l.newConnectionHandler = { conn in
             sharedQueue.async {
-                // Only one peer expected for this loopback test's scope.
+                // One peer at a time. A SECOND accepted connection (the
+                // auto-reconnect test's fresh `ProtocolSession` re-dialing this
+                // same still-listening server after `dropPeer()`) REPLACES the
+                // old one: reset the ready flag + re-arm the receive loop so the
+                // new peer's bytes are collected too. `receivedBytes` is NOT
+                // cleared here (the reconnect test wants a running record across
+                // both peers — call `resetReceivedBytes()` explicitly to zero
+                // it before observing the reconnect's own re-login bytes).
+                state.peer?.cancel()
                 state.peer = conn
+                state.peerIsReady = false
                 conn.stateUpdateHandler = { connState in
                     if case .ready = connState {
                         sharedQueue.async {
@@ -66,6 +93,12 @@ final class LoopbackIRCServer: @unchecked Sendable {
                             let waiters = state.peerReadyContinuations
                             state.peerReadyContinuations.removeAll()
                             for cont in waiters { cont.resume() }
+                            // Re-arm the receive loop for the NEW peer if the
+                            // server was already collecting (the old peer's loop
+                            // ended when its connection was cancelled).
+                            if state.isCollectingReceives {
+                                state.rearmReceive?()
+                            }
                         }
                     }
                 }
@@ -83,6 +116,10 @@ final class LoopbackIRCServer: @unchecked Sendable {
         }
         self.port = portBox.port
         self.peerState = state
+        // Now that `self` is fully formed, give `PeerState` a way to re-arm the
+        // receive loop for a replacement peer (the auto-reconnect case). Always
+        // called on `queue` from `newConnectionHandler`.
+        state.rearmReceive = { [weak self] in self?.receiveLoop() }
     }
 
     enum LoopbackError: Error, CustomStringConvertible {
@@ -197,6 +234,32 @@ final class LoopbackIRCServer: @unchecked Sendable {
         queue.sync { peerState.receivedBytes }
     }
 
+    /// Cancels the accepted peer connection WITHOUT tearing down the listener
+    /// (`ReconnectTests`' drop trigger): the `ProtocolSession` under test sees
+    /// its receive loop hit EOF/error, surfaces `.disconnectedHint`, and the
+    /// model schedules a reconnect. This server STAYS listening, so the model's
+    /// reconnect re-dials the same port and `newConnectionHandler` accepts the
+    /// fresh `ProtocolSession` as a replacement peer (see that handler). Resets
+    /// `peerIsReady` so `waitForPeer` (and every `send`) blocks until the NEW
+    /// peer actually connects rather than firing against the just-dropped one.
+    func dropPeer() {
+        queue.sync { [peerState] in
+            peerState.peer?.cancel()
+            peerState.peer = nil
+            peerState.peerIsReady = false
+        }
+    }
+
+    /// Zeroes the accumulated `receivedBytes` (`ReconnectTests`): after a drop,
+    /// the reconnect test wants to observe ONLY the reconnect's own re-login
+    /// bytes, not the pre-drop session's, so it clears the record between the
+    /// two peers.
+    func resetReceivedBytes() {
+        queue.sync { [peerState] in
+            peerState.receivedBytes = Data()
+        }
+    }
+
     func stop() {
         queue.sync { [peerState] in
             peerState.peer?.cancel()
@@ -231,4 +294,9 @@ private final class PeerState: @unchecked Sendable {
     /// See `LoopbackIRCServer.startCollectingReceivedBytes`/`receivedBytes`.
     var isCollectingReceives = false
     var receivedBytes = Data()
+    /// Re-arms the receive loop for a freshly-accepted REPLACEMENT peer
+    /// (`newConnectionHandler`, the auto-reconnect case). Set once `self` is
+    /// fully initialized (the handler is installed before that, so it can only
+    /// reach this box, not `self.receiveLoop()` directly). Called on `queue`.
+    var rearmReceive: (() -> Void)?
 }

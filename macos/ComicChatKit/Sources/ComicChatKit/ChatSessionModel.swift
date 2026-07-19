@@ -43,13 +43,26 @@ public struct ChatConfig: Sendable {
     /// viewport via `PanelFit.unitPanelTwips(viewportWidthTwips:columns:)`,
     /// just fed this forced column count rather than the auto-fit one).
     public var panelsPerRow: Int
+    /// Auto-reconnect (spec §7): gates the model's backoff-reconnect loop on an
+    /// UNEXPECTED network drop. `true` (default) matches a real live session's
+    /// desired resilience; `false` disables it for the replay-fixture dev path
+    /// (a `FixtureReplayServer` serves exactly one connection and closes it —
+    /// reconnecting there would just re-run the fixture or dial a dead port,
+    /// neither of which is meaningful, so `AppState` sets this `false` when it
+    /// launches with `--replay-fixture`). Does NOT affect user-initiated
+    /// disconnect, nick-rejected teardown, or a failed FIRST connect (those are
+    /// never reconnected regardless — see `ChatSessionModel`'s reconnect
+    /// trigger, which fires only from a `.disconnectedHint` on a
+    /// previously-established session).
+    public var autoReconnect: Bool
 
     public init(host: String, port: UInt16, nick: String, room: String,
                 encoding: WireEncoding = .cp1252, characterName: String = "anna",
                 backdropName: String = "field", artDir: String,
                 userName: String? = nil, realName: String? = nil,
                 sendComicsData: Bool = true, acceptWhispers: Bool = true,
-                autoDownloadAvatars: Bool = true, panelsPerRow: Int = 0) {
+                autoDownloadAvatars: Bool = true, panelsPerRow: Int = 0,
+                autoReconnect: Bool = true) {
         self.host = host
         self.port = port
         self.nick = nick
@@ -64,6 +77,7 @@ public struct ChatConfig: Sendable {
         self.acceptWhispers = acceptWhispers
         self.autoDownloadAvatars = autoDownloadAvatars
         self.panelsPerRow = panelsPerRow
+        self.autoReconnect = autoReconnect
     }
 }
 
@@ -194,6 +208,23 @@ public struct MemberRow: Sendable, Equatable, Identifiable {
     }
 }
 
+/// The auto-reconnect state machine's public state (spec §7), delivered via
+/// `ChatSessionModel.onReconnectStateChanged`. `Equatable` so the app layer can
+/// cheaply ignore no-op redeliveries.
+public enum ReconnectState: Sendable, Equatable {
+    /// A live connection is up (the initial connect succeeded, or a reconnect
+    /// landed). The steady state — the UI shows no reconnect indicator.
+    case connected
+    /// A backoff-reconnect loop is in progress after an unexpected drop.
+    /// `attempt` is 1-based (the Nth attempt), `of` the cap — the UI shows
+    /// "reconnecting… (attempt N of M)".
+    case reconnecting(attempt: Int, of: Int)
+    /// Every reconnect attempt failed (the cap was hit). Terminal until a
+    /// manual reconnect (`AppState.connect()`) supersedes it — the UI shows a
+    /// "couldn't reconnect" line and lets the user retry.
+    case gaveUp
+}
+
 /// The app's headless, testable core (D1 §3.2's binding recommendation: all
 /// logic lives in ComicChatKit, only chrome lives in the app). Composes every
 /// prior Plan 4a task into one live loop:
@@ -291,6 +322,16 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// — this is an additional accumulating view onto the same information,
     /// not a replacement.
     public var onServerMessage: (@Sendable (String) -> Void)?
+    /// Auto-reconnect (spec §7): fired on the MAIN thread whenever the reconnect
+    /// state machine changes — `.reconnecting(attempt:of:)` while a backoff
+    /// loop is running, `.connected` once a reconnect (or the initial connect)
+    /// succeeds, `.gaveUp` after the attempt cap is hit. The app layer
+    /// (`AppState`) uses this to drive a non-modal indicator (a status line +
+    /// a "reconnecting…" sidebar header). Distinct from `onStatus`/
+    /// `onServerMessage` (which carry the human-readable text lines this fires
+    /// ALONGSIDE): this is the structured signal the UI keys its indicator off,
+    /// so it doesn't have to string-match status text.
+    public var onReconnectStateChanged: (@Sendable (ReconnectState) -> Void)?
 
     /// `var` (Plan 4b Task 5): `changeCharacter` updates the model's OWN
     /// notion of `config.characterName` so a subsequent `reflowLocked()` (or
@@ -317,7 +358,20 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// before this fix.
     private let initialCharacterName: String
     private let engineQueue = DispatchQueue(label: "com.comicchat.engine")
-    private let session: ProtocolSession
+    /// `var` (auto-reconnect, spec §7): a dropped `ProtocolSession`'s
+    /// `cc_session` C state is stale and cannot be revived in place, so a
+    /// reconnect creates a FRESH `ProtocolSession` (same config) and rebinds
+    /// this reference to it. Every `session.` reference on this type reads this
+    /// `var` at call time, and every `Task { [session] in … }` closure captures
+    /// whichever session was current when it was created — a stale-session
+    /// capture's outbound call simply fails harmlessly (`.notConnected`), never
+    /// touching the live one. All rebinds happen on `engineQueue` (via
+    /// `reconnectAttemptLocked`), the same queue every other `session`-touching
+    /// path funnels through, so no reader ever observes a half-swapped
+    /// reference. Restructured from `let` carefully: the event-consumer `Task`
+    /// (`startEventConsumer`) and the `currentOwnNick` mirror are both re-bound
+    /// as part of each rebuild (see `reconnectAttemptLocked`).
+    private var session: ProtocolSession
 
     // MARK: Engine-queue-owned state (touched ONLY on `engineQueue`)
 
@@ -511,6 +565,38 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// whose stray post-`shutdown()` engine work was still in flight).
     private var isShutDown = false
     private var consumerTask: Task<Void, Never>?
+
+    // MARK: Auto-reconnect (spec §7) — engine-queue-owned
+
+    /// The in-flight backoff-reconnect `Task`, or `nil` when no reconnect loop
+    /// is running. Spawned by `handleLocked`'s `.disconnectedHint` case on an
+    /// UNEXPECTED drop; cancelled by `shutdown()` and by `beginManualSupersede()`
+    /// (a manual reconnect/disconnect always wins). Engine-queue-owned like
+    /// every other piece of this section's state.
+    private var reconnectTask: Task<Void, Never>?
+    /// `true` while a reconnect loop is active — guards `.disconnectedHint`
+    /// against spawning a SECOND overlapping loop (a fresh session that fails
+    /// to even connect emits its own `.disconnectedHint`, which must feed the
+    /// existing loop's next attempt rather than starting a rival one).
+    private var isReconnecting = false
+    /// Max backoff-reconnect attempts before giving up (spec §7's "after N
+    /// failed attempts"). 8 attempts across the capped-exponential schedule
+    /// (2,4,8,16,32,60,60,60s) spans ~4.5 minutes of retrying — enough to ride
+    /// out a transient drop without hammering a genuinely-dead server forever.
+    private let maxReconnectAttempts = 8
+
+    /// ENGINE QUEUE ONLY. `true` when this model should auto-reconnect on an
+    /// unexpected drop: the config opted in AND we're not shutting down AND a
+    /// live session was previously established (a fresh session that never
+    /// logged in has `currentColumns`-style seed state but no rooms confirmed —
+    /// however the reconnect trigger is `.disconnectedHint`, which the initial
+    /// `connect()` failure surfaces via a THROW from `start()`, not an event,
+    /// so this predicate needn't special-case first-connect: `.disconnectedHint`
+    /// only ever reaches `handleLocked` from a session that got past
+    /// `connect()`). Replay-fixture sessions opt out via `config.autoReconnect`.
+    private var shouldAutoReconnect: Bool {
+        config.autoReconnect && !isShutDown
+    }
 
     /// Engine-queue-owned in-flight guard (Plan 4b Task 6 fix round 1):
     /// avatar NAMEs (not nicks — the download destination is name-keyed,
@@ -923,10 +1009,20 @@ public final class ChatSessionModel: @unchecked Sendable {
 
     // MARK: - Event consumer
 
+    /// Starts (or, on a reconnect rebind, RE-starts) the event-consumer `Task`
+    /// bound to the CURRENT `session`. Auto-reconnect (spec §7): each reconnect
+    /// creates a fresh `ProtocolSession` with its own `events` stream, so the
+    /// consumer must be re-pointed at the new stream. The `session` reference is
+    /// re-read here (not captured) so a rebind takes effect; the OLD session's
+    /// stream finishes when its `ProtocolSession` is torn down in
+    /// `reconnectAttemptLocked`, ending the old `for await` loop naturally.
+    /// Cancels any prior consumer first so two loops never run at once.
     private func startEventConsumer() {
+        consumerTask?.cancel()
+        let currentSession = session
         consumerTask = Task { [weak self] in
             guard let self else { return }
-            for await scoped in self.session.events {
+            for await scoped in currentSession.events {
                 self.enqueueHandle(scoped.event, channel: scoped.channel)
             }
         }
@@ -1096,8 +1192,35 @@ public final class ChatSessionModel: @unchecked Sendable {
         switch ev {
         case .loggedIn(let nick):
             currentOwnNick = nick   // echo-only rule confirmation, mirrors ProtocolSession's own _ownNick update
-            Task { [session, config] in
-                try? await session.join(config.room)
+            // Auto-reconnect (spec §7): a login on a session we were
+            // RECONNECTING through means the reconnect succeeded — clear the
+            // loop and notify. `finishReconnectLocked` is a no-op when no
+            // reconnect was in flight (the ordinary first login), so this is
+            // safe to call unconditionally here.
+            let wasReconnecting = isReconnecting
+            finishReconnectLocked()
+            if wasReconnecting {
+                // RECONNECT login: re-join EVERY room the user had open, in the
+                // original join order (`roomOrder`), against the FRESH session.
+                // The strips/transcripts persist (the boxes live on this model,
+                // untouched by the reconnect — see `reconnectAttemptLocked`),
+                // so each room's `.selfJoined` re-confirm appends seamlessly to
+                // its existing transcript, and the room-token re-registration
+                // on the fresh session (via `session.join`) re-maps back to the
+                // same case-folded `roomKey`. Snapshot the display names on the
+                // engine queue (here) and fire the joins fire-and-forget, same
+                // shape as the single initial join below.
+                let displayRooms = roomOrder.compactMap { rooms[$0]?.displayName }
+                Task { [session] in
+                    for room in displayRooms {
+                        try? await session.join(room)
+                    }
+                }
+            } else {
+                // INITIAL login: join the one configured room.
+                Task { [session, config] in
+                    try? await session.join(config.room)
+                }
             }
 
         case .selfJoined(let joinedChannel):
@@ -1368,6 +1491,14 @@ public final class ChatSessionModel: @unchecked Sendable {
         case .disconnectedHint(let text):
             emitStatus(text)
             emitServerMessage(text)
+            // Auto-reconnect (spec §7): an UNEXPECTED drop (user-initiated
+            // disconnect never reaches here — `ProtocolSession.disconnect()`
+            // sets a flag that suppresses this event) kicks off (or feeds) the
+            // backoff-reconnect loop. `maybeStartReconnectLocked` no-ops when
+            // reconnect is disabled/shutting down, and coalesces a second
+            // `.disconnectedHint` from a failed reconnect attempt into the
+            // already-running loop rather than starting a rival one.
+            maybeStartReconnectLocked()
 
         // Live-fix 4: the original client showed MOTD/LUSER text in its
         // status window — this port never surfaced `.motd` anywhere
@@ -2711,6 +2842,216 @@ public final class ChatSessionModel: @unchecked Sendable {
         }
     }
 
+    // MARK: - Auto-reconnect (spec §7)
+
+    /// ENGINE QUEUE ONLY. Called from `handleLocked`'s `.disconnectedHint` case
+    /// on an unexpected drop. Kicks off the backoff-reconnect loop, or — if a
+    /// loop is ALREADY running (a failed reconnect attempt's own
+    /// `.disconnectedHint` re-entering here) — is a no-op so the existing loop
+    /// owns the retry cadence. Gated on `shouldAutoReconnect` (config opt-in +
+    /// not shutting down); a replay-fixture / user-disconnected / shut-down
+    /// session never reconnects.
+    private func maybeStartReconnectLocked() {
+        guard shouldAutoReconnect, !isReconnecting else { return }
+        isReconnecting = true
+        // Tear down the strip/bridge NOW so the dead session's stale strip
+        // isn't left composing — the transcripts (which live in `rooms`) are
+        // deliberately untouched, so a successful reconnect rebuilds each
+        // room's strip from its retained transcript. `activeRoom`/`rooms`/
+        // `roomOrder` all persist.
+        strip?.close()
+        strip = nil
+        bridge = nil
+        selfParticipantID = nil
+        reconnectTask = Task { [weak self] in
+            await self?.runReconnectLoop()
+        }
+    }
+
+    /// The backoff-reconnect driver (spec §7): per attempt it waits out a
+    /// capped-exponential backoff (2,4,8,…,60s), tears down the dead
+    /// `ProtocolSession` and creates a FRESH one (`reconnectAttemptLocked`),
+    /// calls `connect()` (whose internal IRCX-probe/login handshake runs
+    /// async), then waits a bounded grace window for `.loggedIn` to land. A
+    /// successful login flips `isReconnecting` to `false` (via
+    /// `finishReconnectLocked`, driven from `handleLocked`'s `.loggedIn` case)
+    /// AND cancels this task — so the loop observes `!isReconnecting` (or
+    /// `Task.isCancelled`) and exits cleanly. If login doesn't land within the
+    /// grace window (or `connect()` throws outright — port still dead), the
+    /// loop advances to the next attempt. Cooperatively cancellable at every
+    /// suspension point by `shutdown()`/`cancelReconnect()`.
+    private func runReconnectLoop() async {
+        for attempt in 1...maxReconnectAttempts {
+            // Backoff BEFORE each attempt: 2,4,8,16,32,60,60,60 seconds.
+            let delaySeconds = min(60, 1 << attempt)   // 1<<1==2 … capped at 60
+            emitReconnectState(.reconnecting(attempt: attempt, of: maxReconnectAttempts))
+            emitStatus("Connection lost — reconnecting in \(delaySeconds)s… (attempt \(attempt) of \(maxReconnectAttempts))")
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
+            } catch {
+                return   // cancelled (shutdown / manual supersede / success)
+            }
+            if Task.isCancelled { return }
+
+            // Rebuild + rebind the session on the engine queue, then await the
+            // connect OFF it. `reconnectAttemptLocked` swaps `session` + restarts
+            // the consumer synchronously on the queue and hands back the fresh
+            // session to connect.
+            let fresh: ProtocolSession? = await withCheckedContinuation { cont in
+                engineQueue.async { [weak self] in
+                    guard let self, !self.isShutDown, self.isReconnecting else {
+                        cont.resume(returning: nil); return
+                    }
+                    cont.resume(returning: self.reconnectAttemptLocked())
+                }
+            }
+            guard let fresh else { return }   // shut down / superseded mid-rebuild
+            do {
+                try await fresh.connect()
+            } catch {
+                // TCP connect failed (port still dead) — next attempt's backoff.
+                continue
+            }
+            if Task.isCancelled { return }
+
+            // TCP up; the login handshake is now running inside `fresh`.
+            // `.loggedIn` (through the consumer) will call
+            // `finishReconnectLocked`, cancelling this task. Poll for that
+            // cancellation across a bounded login grace window rather than
+            // blindly scheduling the next attempt (which would tear down a
+            // session that's mid-login). If the window elapses with no login
+            // (dead-air server: accepts TCP, never completes IRC), fall through
+            // to the next attempt.
+            let loggedIn = await waitForReconnectLoginOrCancel()
+            if loggedIn || Task.isCancelled { return }
+            // else: no login in the grace window — advance to next attempt.
+        }
+        // Cap reached with no successful login: give up.
+        await withCheckedContinuation { cont in
+            engineQueue.async { [weak self] in
+                self?.giveUpReconnectLocked()
+                cont.resume()
+            }
+        }
+    }
+
+    /// Awaits either a successful reconnect-login (returns `true`) or the login
+    /// grace window elapsing (`false`), whichever comes first. Login success is
+    /// observed as `isReconnecting` flipping to `false` (set by
+    /// `finishReconnectLocked`), polled on the engine queue. Cancellation
+    /// (`shutdown`/`cancelReconnect`) makes the inner `sleep` throw, which we
+    /// surface as `true` so the caller returns immediately without launching a
+    /// redundant attempt (the loop's own `Task.isCancelled` check handles the
+    /// exit).
+    private func waitForReconnectLoginOrCancel() async -> Bool {
+        // ~10s grace, polled every 100ms — comfortably covers a probe→login→001
+        // round-trip on a healthy server while staying responsive to give-up.
+        for _ in 0..<100 {
+            do {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            } catch {
+                return true   // cancelled — treat as "done, stop looping"
+            }
+            let stillReconnecting = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                engineQueue.async { [weak self] in
+                    cont.resume(returning: self?.isReconnecting ?? false)
+                }
+            }
+            if !stillReconnecting { return true }   // login landed (or gave up elsewhere)
+        }
+        return false
+    }
+
+    /// ENGINE QUEUE ONLY. Tears down the dead `ProtocolSession` and builds a
+    /// FRESH one with the SAME config (incl. userName/realName/encoding),
+    /// rebinds `self.session`, re-seeds `currentOwnNick`, and restarts the
+    /// event consumer against the new session's `events` stream. Returns the
+    /// fresh session for the caller to `connect()`. Does NOT touch
+    /// `rooms`/`roomOrder`/`activeRoom`/transcripts — those persist across the
+    /// reconnect so each room's strip rebuilds from its retained log on
+    /// re-login. The room-token maps live inside `ProtocolSession` and are
+    /// re-established by the `.loggedIn`-driven re-joins (`handleLocked`), which
+    /// call `session.join` per room and re-`cc_session_register_room` on the
+    /// fresh handle.
+    private func reconnectAttemptLocked() -> ProtocolSession {
+        // Old session down first (`disconnect()` is idempotent + marks the
+        // teardown user-initiated so the dying session's own drop paths stay
+        // quiet). Its `events` stream finishes on `deinit`, ending the old
+        // consumer loop.
+        session.disconnect()
+        let fresh = ProtocolSession(host: config.host, port: config.port, nick: config.nick,
+                                    encoding: config.encoding, engineQueue: engineQueue,
+                                    userName: config.userName, realName: config.realName)
+        session = fresh
+        // Reset own-nick mirror to the requested nick — the fresh session
+        // re-derives the confirmed nick from its own `.loggedIn` (which also
+        // re-updates `currentOwnNick` in `handleLocked`).
+        currentOwnNick = config.nick
+        // Login-flow one-shots that gate outbound calls per room are cleared by
+        // the fresh session; here we only need to re-arm the consumer.
+        startEventConsumer()
+        return fresh
+    }
+
+    /// ENGINE QUEUE ONLY. A reconnect (or the initial connect) reached
+    /// `.loggedIn`: clear the loop state and notify `.connected`. No-op when no
+    /// reconnect was in flight (an ordinary first login), so `handleLocked`'s
+    /// `.loggedIn` case can call it unconditionally.
+    private func finishReconnectLocked() {
+        guard isReconnecting else { return }
+        isReconnecting = false
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        // Rebuild the live strip for the active room from its RETAINED
+        // transcript (the reconnect tore the strip down in
+        // `maybeStartReconnectLocked` but left every room's transcript intact).
+        // Without this, the strip would stay nil until a fresh geometry change
+        // or tab switch — the `.selfJoined` re-confirm's `recomposeLocked()`
+        // is a no-op while `strip`/`bridge` are nil. `resetAnnounce: false`
+        // keeps `announcedBackTo` (peers greeted pre-drop stay greeted). Guarded
+        // to a non-empty active room (a session dropped before ever joining has
+        // none — nothing to rebuild).
+        if !activeRoom.isEmpty, rooms[activeRoom] != nil {
+            rebuildStripLocked(for: activeRoom, resetAnnounce: false)
+        }
+        emitStatus("Reconnected.")
+        emitReconnectState(.connected)
+    }
+
+    /// ENGINE QUEUE ONLY. The reconnect loop exhausted its attempt cap.
+    private func giveUpReconnectLocked() {
+        guard isReconnecting else { return }
+        isReconnecting = false
+        reconnectTask = nil
+        // Tear the last (never-logged-in) session down so it doesn't linger
+        // half-open — a give-up means every attempt failed, so `session` is a
+        // dead-or-stuck fresh session with no live login. The app layer's
+        // "Reconnect" affordance (`onReconnectStateChanged(.gaveUp)`) drives a
+        // clean manual reconnect, which builds its own new model anyway.
+        session.disconnect()
+        emitStatus("Couldn't reconnect after \(maxReconnectAttempts) attempts.")
+        emitReconnectState(.gaveUp)
+    }
+
+    /// Cancels any in-flight reconnect loop (spec §7: "manual Connect always
+    /// cancels/supersedes the loop"). Called by `shutdown()` and — via the app
+    /// layer's disconnect-before-connect — before a fresh manual connect. Sync
+    /// on the engine queue so the caller can rely on no reconnect attempt
+    /// launching after it returns.
+    public func cancelReconnect() {
+        engineQueue.sync {
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            isReconnecting = false
+        }
+    }
+
+    private func emitReconnectState(_ state: ReconnectState) {
+        DispatchQueue.main.async { [onReconnectStateChanged] in
+            onReconnectStateChanged?(state)
+        }
+    }
+
     // MARK: - shutdown
 
     /// Cancels the event consumer, disconnects the session, and tears down
@@ -2726,6 +3067,14 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// called `shutdown()` can safely assume this model will not touch that
     /// shared state again.
     public func shutdown() {
+        // Auto-reconnect (spec §7): stop the backoff loop FIRST — set
+        // `isReconnecting = false` and cancel the task on the engine queue
+        // BEFORE `isShutDown` so any in-flight `runReconnectLoop` iteration
+        // (already past its cancellation checks) that reaches
+        // `reconnectAttemptLocked` sees `!isReconnecting`/`isShutDown` and
+        // bails without creating a fresh session. `cancelReconnect()` is its
+        // own `engineQueue.sync`, so it fully drains before the teardown below.
+        cancelReconnect()
         consumerTask?.cancel()
         consumerTask = nil
         session.disconnect()
