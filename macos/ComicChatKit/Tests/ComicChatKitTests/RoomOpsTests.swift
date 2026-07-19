@@ -128,6 +128,53 @@ extension EngineGlobalStateSelfTests {
             server.stop()
         }
 
+        /// Self-review fix regression: a second `requestRoomList()` call
+        /// while a LIST is already in flight (no `.roomListEnd` seen yet)
+        /// must NOT send a second wire LIST — two overlapping round-trips
+        /// sharing the same accumulator could otherwise interleave and
+        /// splice/corrupt the result (`.roomListBegin` resetting mid-way
+        /// through the first round-trip). Only ONE "LIST" line should reach
+        /// the wire even though `requestRoomList()` is called twice.
+        @Test(.timeLimit(.minutes(1)))
+        func secondRequestWhileInFlightDoesNotDoubleSendWireList() async throws {
+            let server = try LoopbackIRCServer()
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+            let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                       nick: "Mac", room: "#p4", artDir: art))
+            let box = RoomListBox()
+            model.onRoomList = { items in box.append(items) }
+            try await model.start()
+            try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+
+            try await model.requestRoomList()
+            try await server.waitForClientLine(containing: "LIST")
+            // A second call BEFORE the first round-trip's .roomListEnd — must
+            // be a silent no-op (no second wire LIST).
+            try await model.requestRoomList()
+            // Give a wrongly-sent second LIST a window to reach the wire
+            // before asserting it didn't.
+            try await Task.sleep(nanoseconds: 100_000_000)
+            let sentText = String(data: server.receivedBytes, encoding: .isoLatin1) ?? ""
+            let listCount = sentText.components(separatedBy: "\r\n").filter { $0 == "LIST" || $0.hasPrefix("LIST ") }.count
+            #expect(listCount == 1, "expected exactly one wire LIST despite two requestRoomList() calls, got \(listCount) in: \(sentText)")
+
+            try await server.send(
+                ":srv 321 Mac Channel :Users Name",
+                ":srv 322 Mac #alpha 3 :Alpha topic",
+                ":srv 323 Mac :End of LIST")
+            try await pollUntil { box.count >= 1 }
+            try await Task.sleep(nanoseconds: 100_000_000)
+            #expect(box.count == 1, "onRoomList must still fire exactly once, got \(box.count)")
+
+            // A THIRD call, now that the first round-trip has completed
+            // (.roomListEnd cleared the in-flight guard), must reach the wire.
+            try await model.requestRoomList()
+            try await server.waitForClientLine(containing: "LIST")
+
+            model.shutdown()
+            server.stop()
+        }
+
         private func pollUntil(_ condition: @escaping () -> Bool) async throws {
             while !condition() {
                 try await Task.sleep(nanoseconds: 5_000_000)

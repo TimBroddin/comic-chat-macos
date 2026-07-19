@@ -390,6 +390,16 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// `[]`; each `.roomListItem` appends; `.roomListEnd` fires `onRoomList`
     /// once with the full array and resets to `nil`.
     private var roomListAccum: [RoomListItem]?
+    /// Set the moment `requestRoomList()` puts the wire LIST out (BEFORE any
+    /// server reply — unlike `roomListAccum`, which only becomes non-nil once
+    /// `.roomListBegin` actually arrives), cleared on `.roomListEnd`. Guards
+    /// `requestRoomList()` itself against issuing a SECOND wire LIST while an
+    /// earlier one is still in flight (self-review fix): gating on
+    /// `roomListAccum != nil` alone has a window between "LIST sent" and
+    /// "`.roomListBegin` received" where a second call would see `nil` and
+    /// send its own LIST too — two overlapping round-trips sharing the one
+    /// accumulator could then interleave and splice/corrupt the result.
+    private var roomListRequestInFlight = false
 
     // MARK: Whisper (Plan 4b Task 4)
 
@@ -429,12 +439,38 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// `computed` property (not cached) since it's cheap path arithmetic and
     /// callers (the resolver's `extraDirs`, `downloadAvatarIfNeededLocked`)
     /// each want the directory to exist by the time they use it.
-    static var userCharactersDir: String {
+    public static var userCharactersDir: String {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
         let dir = base.appendingPathComponent("Comic Chat").appendingPathComponent("Characters")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.path
+    }
+
+    /// Resolves `avatarName` (a bare comicart name, as carried by
+    /// `MemberRow.avatarName`) to a concrete `.avb` path, using the SAME
+    /// search order `setUpStripLocked`'s `AvatarResolver` uses for the live
+    /// strip: `userCharactersDir` (downloaded/custom avatars) BEFORE
+    /// `config.artDir` (the bundled set) — D1 §4.3, so a member wearing a
+    /// custom avatar that shadows a bundled name of the same nick resolves
+    /// to the SAME file here as it does on the strip. Plan 4b Task 8
+    /// (self-review fix): `AppState.resolveMemberIcon`'s member-row icon
+    /// lookup previously hardcoded `artDir` only, silently diverging from the
+    /// strip's own resolution for exactly this case. Returns `nil` for an
+    /// empty name or a name that resolves to no file on disk anywhere
+    /// (mirrors `AvatarResolver.resolvesName`'s "no cycled-default fallback"
+    /// contract — an unresolved icon should show NO icon, not a random one).
+    /// Thread-safe / does not require the engine queue: pure filesystem
+    /// lookups against immutable `config.artDir` and the fixed
+    /// `userCharactersDir` path, no strip/engine state touched.
+    public func resolveAvatarPath(_ avatarName: String) -> String? {
+        guard !avatarName.isEmpty else { return nil }
+        let bare = avatarName.lowercased().hasSuffix(".avb") ? avatarName : "\(avatarName.lowercased()).avb"
+        for dir in [Self.userCharactersDir, config.artDir] {
+            let candidate = (dir as NSString).appendingPathComponent(bare)
+            if FileManager.default.fileExists(atPath: candidate) { return candidate }
+        }
+        return nil
     }
 
     /// Thread-safe snapshot of the ACTIVE room's event log so far (Plan 4b
@@ -878,6 +914,7 @@ public final class ChatSessionModel: @unchecked Sendable {
         case .roomListEnd:
             let items = roomListAccum ?? []
             roomListAccum = nil
+            roomListRequestInFlight = false
             let cb = onRoomList
             DispatchQueue.main.async { cb?(items) }
 
@@ -1423,7 +1460,28 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// case) — this method only fires the wire LIST, it does not itself
     /// return the items (mirroring every other fire-the-query/consume-the-
     /// event-later shape on this type, e.g. `who`/`.whoResult` below).
+    ///
+    /// Plan 4b Task 8 self-review fix: a second call while a LIST is already
+    /// in flight (`roomListRequestInFlight` — set here BEFORE the wire send,
+    /// cleared by `.roomListEnd`) is a silent no-op rather than sending a
+    /// second wire LIST. Without this, `RoomListWindow`'s Refresh button (or
+    /// its `.task`+Refresh racing on window (re)open) could issue two
+    /// back-to-back LIST queries whose `.roomListBegin`/`.roomListItem`/
+    /// `.roomListEnd` replies interleave against the SAME shared
+    /// `roomListAccum` (no per-request identity) — the second `.roomListBegin`
+    /// would reset the accumulator mid-way through the first round-trip,
+    /// producing a spliced/corrupted item list on whichever `.roomListEnd`
+    /// arrives next. Gating on a flag set BEFORE the send (not merely on
+    /// `roomListAccum != nil`, which only becomes true once `.roomListBegin`
+    /// is actually RECEIVED) closes the window where two rapid calls could
+    /// both race past an accumulator-only check before either reply lands.
     public func requestRoomList() async throws {
+        let alreadyInFlight = engineQueue.sync { () -> Bool in
+            if roomListRequestInFlight { return true }
+            roomListRequestInFlight = true
+            return false
+        }
+        guard !alreadyInFlight else { return }
         try await session.list()
     }
 

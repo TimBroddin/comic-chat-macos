@@ -56,7 +56,19 @@ struct ComposeBar: View {
         guard !text.isEmpty, let model else { return }
         composeText = ""
         let sendMode = mode.stripMode
-        let addressees = Array(selectedMembers)
+        // Plan 4b Task 8 self-review fix: `selectedMembers` is a `Set`
+        // (SwiftUI `List`'s multi-selection binding type — no ordering to
+        // preserve), so `Array(selectedMembers)` alone has NON-DETERMINISTIC
+        // order (Set enumeration order can vary run-to-run/build-to-build).
+        // `Annotations.toCAnnotations`'s wire encoder clips to the first 5
+        // (D1 §2.1) — an unsorted array would clip an arbitrary, unstable
+        // subset when more than 5 members are selected, silently addressing
+        // different recipients on rebuilds/relaunches for the identical UI
+        // selection. Sorting alphabetically makes the clip deterministic and
+        // matches the member list's own display order (`emitMembers` sorts
+        // by nick) — not true "selection order" (Set can't represent that),
+        // but stable and predictable.
+        let addressees = selectedMembers.sorted()
         Task { try? await model.send(text, mode: sendMode, addressees: addressees) }
     }
 }

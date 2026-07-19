@@ -78,9 +78,8 @@ public final class AppState {
     /// (opens a NEW tab — no part-first, `ChatSessionModel.goToRoom`'s own doc
     /// comment). Normalizes a bare name the same way `joinRoom(_:)` does.
     public func goToRoom(_ raw: String) {
-        let trimmed = raw.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, let model else { return }
-        let channel = trimmed.hasPrefix("#") || trimmed.hasPrefix("&") ? trimmed : "#" + trimmed
+        guard let channel = normalizedChannel(raw), let model else { return }
+        selectedMembers = []   // per-room addressee state — see setActiveRoom's doc comment
         Task { try? await model.goToRoom(channel) }
     }
 
@@ -88,9 +87,8 @@ public final class AppState {
     /// `createRoom` (the wire CREATE, which server-side joins us) then
     /// `goToRoom` opens the tab locally the same way any other join does.
     public func createRoom(_ raw: String) {
-        let trimmed = raw.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, let model else { return }
-        let channel = trimmed.hasPrefix("#") || trimmed.hasPrefix("&") ? trimmed : "#" + trimmed
+        guard let channel = normalizedChannel(raw), let model else { return }
+        selectedMembers = []   // per-room addressee state — see setActiveRoom's doc comment
         Task {
             try? await model.createRoom(channel)
             try? await model.goToRoom(channel)
@@ -127,19 +125,36 @@ public final class AppState {
         Task { try? await model.getInfo(nick) }
     }
 
-    /// Resolves (and caches) `avatarName`'s member-row icon thumbnail via the
-    /// model's art dir (Plan 4b Task 8) — `AvatarFile(path:).iconImage()`,
-    /// same lookup shape `ChatSessionModel.setUpStripLocked`'s
-    /// `AvatarResolver` uses, but standalone (no strip participant needed for
-    /// a plain icon lookup). Silently no-ops for an empty name, an
-    /// already-cached name, or a name that fails to resolve (unresolvable
-    /// names get no icon, per the brief).
+    /// In-flight guard for `resolveMemberIcon` (Plan 4b Task 8 self-review
+    /// fix) — mirrors `ChatSessionModel`'s own `inFlightAvatarDownloads`
+    /// pattern for the identical redundant-fetch problem: SwiftUI `List` can
+    /// re-fire a row's `.onAppear` (scroll bounce, membership-churn redraw)
+    /// before an earlier decode for the SAME name has completed and
+    /// populated `memberIconCache`; without this, each such re-fire would
+    /// pass the cache-miss guard and spawn its own redundant file-read +
+    /// decode of the same `.avb` icon pose.
+    private var inFlightMemberIconResolves: Set<String> = []
+
+    /// Resolves (and caches) `avatarName`'s member-row icon thumbnail —
+    /// `AvatarFile(path:).iconImage()` over the path `ChatSessionModel.
+    /// resolveAvatarPath(_:)` returns, which searches the SAME
+    /// downloaded-avatars-shadow-bundled order the live strip's own
+    /// `AvatarResolver` uses (Plan 4b Task 8 self-review fix: this used to
+    /// hardcode `artDir` only, so a member wearing a custom/downloaded
+    /// avatar that shadows a bundled name showed the WRONG icon here even
+    /// though the strip rendered the right one). Silently no-ops for an
+    /// empty name, an already-cached name, an already-in-flight name, or a
+    /// name that fails to resolve anywhere (unresolvable names get no icon,
+    /// per the brief).
     public func resolveMemberIcon(_ avatarName: String) {
-        guard !avatarName.isEmpty, memberIconCache[avatarName] == nil else { return }
-        let dir = artDir
+        guard !avatarName.isEmpty, let model,
+              memberIconCache[avatarName] == nil,
+              !inFlightMemberIconResolves.contains(avatarName) else { return }
+        inFlightMemberIconResolves.insert(avatarName)
         Task.detached { [weak self] in
-            let path = dir + "/" + avatarName.lowercased() + ".avb"
-            guard let av = try? AvatarFile(path: path),
+            defer { Task { @MainActor in self?.inFlightMemberIconResolves.remove(avatarName) } }
+            guard let path = model.resolveAvatarPath(avatarName),
+                  let av = try? AvatarFile(path: path),
                   let art = try? av.iconImage(),
                   let cg = art.cgImage() else { return }
             await MainActor.run { self?.memberIconCache[avatarName] = cg }
@@ -204,7 +219,14 @@ public final class AppState {
 
     /// Switches the one live strip to `room` (Plan 4b Task 7) — the tab bar's
     /// tap handler. Fire-and-forget on the model (engine-queue-hopped there).
+    ///
+    /// Plan 4b Task 8 self-review fix: clears `selectedMembers` — the
+    /// member-list selection is per-room addressee state (D1 §1.5); carrying
+    /// a stale selection across a tab switch would silently address whoever
+    /// happened to share those nicks (or no one) in the NEW room's member
+    /// list on the next send.
     public func setActiveRoom(_ room: String) {
+        selectedMembers = []
         model?.setActiveRoom(room)
     }
 
@@ -212,10 +234,20 @@ public final class AppState {
     /// Enter Room sheet / ⌘J / RoomTabBar "+". Normalizes a bare name to a
     /// channel (`#`-prefixed) the way the connect sheet's room field does.
     public func joinRoom(_ raw: String) {
-        let trimmed = raw.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, let model else { return }
-        let channel = trimmed.hasPrefix("#") || trimmed.hasPrefix("&") ? trimmed : "#" + trimmed
+        guard let channel = normalizedChannel(raw), let model else { return }
         Task { try? await model.joinRoom(channel) }
+    }
+
+    /// Trims `raw` and prefixes it with `#` unless it already carries a valid
+    /// channel prefix (`#`/`&`) — `nil` for an empty/whitespace-only input.
+    /// Shared by `joinRoom`/`goToRoom`/`createRoom` (Plan 4b Task 8
+    /// self-review fix: these three previously repeated this ternary
+    /// verbatim — factored here so the channel-prefix rule lives in ONE
+    /// place).
+    private func normalizedChannel(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.hasPrefix("#") || trimmed.hasPrefix("&") ? trimmed : "#" + trimmed
     }
 
     /// Leaves `room` (Plan 4b Task 7) — the tab's close button. If it was
@@ -350,6 +382,7 @@ public final class AppState {
         isAway = false
         selectedMembers = []
         memberIconCache = [:]
+        inFlightMemberIconResolves = []
         userInfoResult = nil
         replayServer?.stop()
         replayServer = nil
