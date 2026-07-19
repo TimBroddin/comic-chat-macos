@@ -204,5 +204,121 @@ extension EngineGlobalStateSelfTests {
             model.shutdown()
             server.stop()
         }
+
+        // MARK: - Live-fix 3: a character switch must change what renders
+
+        /// Plan 4b live-fix 3 (Tim's live report: "selecting a character from
+        /// Preferences still keeps rendering Anna"). The EXISTING
+        /// `changeCharacterMidSessionSwitchesAvatarAndAnnounces` proves only
+        /// that a new panel RENDERED and the announce reached the wire — NOT
+        /// that the new panel wears the NEW avatar. And
+        /// `characterSwitchSurvivesReflowAtOriginalGeometry` compares a strip
+        /// to ITSELF across a reflow, so it stays green even when BOTH the live
+        /// and reflow renders share the same wrong avatar. Neither catches what
+        /// Tim hit: `changeCharacter` had ZERO effect on the composed strip —
+        /// post-switch panels (and the starring icon) kept rendering the
+        /// STARTING character, because the strip's line ingestion
+        /// (`cc_strip_add_line{,_cooked}`) keyed the avatar off the raw
+        /// participant id instead of the participant's CURRENT avatar id
+        /// (`pui->GetAvatarID()`, the original's `histent.cpp:108` contract) —
+        /// so after `cc_strip_set_participant_avatar` moved the CUserInfo to a
+        /// new avatar id, every subsequent line still cloned the OLD avatar.
+        ///
+        /// OBSERVABLE (differential, no cross-run/panel-merge confound): switch
+        /// BEFORE any chat line, then send one line, and compare the composed
+        /// strip to a baseline that NEVER switched (same start character, same
+        /// one line). A switch to a DIFFERENT character MUST change the pixels
+        /// (the panel now wears the new avatar); a switch to the SAME character
+        /// MUST be a byte-identical no-op. Pre-fix, the different-character
+        /// switch produced a BYTE-IDENTICAL strip to the never-switched
+        /// baseline (the switch was ignored) — the exact RED this closes.
+        /// Switching before any line keeps the whole strip attributable to the
+        /// switch (no legitimately-differing pre-switch panel to muddy the
+        /// compare, and no post-switch same-participant panel-merge nuance).
+        @Test(.timeLimit(.minutes(1)))
+        func characterSwitchChangesTheComposedStrip() async throws {
+            let art = repoRoot5Up().appendingPathComponent("v2.5-beta-1-modern/comicart").path
+
+            // Runs one session: login/join at geometry G (600pt), optionally
+            // `changeCharacter(switchTo)` BEFORE any line, send one line, return
+            // the composed strip bytes.
+            func run(start: String, switchTo: String?) async throws -> Data {
+                let box = LatestImageBoxLocal()
+                let server = try LoopbackIRCServer()
+                let model = ChatSessionModel(config: .init(host: "127.0.0.1", port: server.port,
+                                                           nick: "Mac", room: "#p4",
+                                                           characterName: start, artDir: art))
+                model.onStripImage = { image, _ in box.set(image) }
+                func settle() async throws {
+                    await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                        model.settleEngineQueue { c.resume() }
+                    }
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
+                try await model.start()
+                try await server.replyToProbeWith451ThenWelcomeAndJoin(nick: "Mac", channel: "#p4")
+                model.setViewport(widthPoints: 600, scale: 2.0)
+                try await settle()
+                if let switchTo {
+                    model.changeCharacter(switchTo)
+                    try await settle()
+                }
+                try await model.send("only line")
+                _ = try await waitForReceivedLine(server, containing: "only line")
+                try await settle()
+                defer { model.shutdown(); server.stop() }
+                guard let img = box.get() else {
+                    Issue.record("no composed strip image captured")
+                    return Data()
+                }
+                return try pixelBytesLocal(img)
+            }
+
+            let baseline = try await run(start: "anna", switchTo: nil)      // never switched
+            let switchedDifferent = try await run(start: "anna", switchTo: "susan")
+            let switchedSame = try await run(start: "susan", switchTo: "susan")
+            let plainSusan = try await run(start: "susan", switchTo: nil)
+
+            // Precomputed Bools (NOT `#expect(a == b)` on the raw Data) — a
+            // failing large-`Data` comparison triggers Swift Testing's
+            // catastrophically slow Myers-diff, as documented on
+            // `characterSwitchSurvivesReflowAtOriginalGeometry`.
+            let switchTookEffect = baseline != switchedDifferent
+            #expect(switchTookEffect,
+                    "a switch to a DIFFERENT character must change the composed strip; a byte-identical result means changeCharacter was IGNORED (the reported bug: still renders the starting character). baseline.count=\(baseline.count) switched.count=\(switchedDifferent.count)")
+
+            // A same-character switch is a no-op: its render must match a plain
+            // never-switched susan session byte-for-byte (proves the switch
+            // path itself doesn't perturb rendering — it only re-avatars).
+            let sameSwitchIsNoOp = switchedSame == plainSusan
+            #expect(sameSwitchIsNoOp,
+                    "a switch to the SAME character must render byte-identically to a never-switched session of that character. switchedSame.count=\(switchedSame.count) plainSusan.count=\(plainSusan.count)")
+        }
     }
+}
+
+/// Live-fix 3: local single-slot image box + full-image pixel readback,
+/// duplicated from `ChatSessionModelTests`' private `LatestImageBox`/
+/// `pixelBytes` (both `private` to that file) so this suite's LIVE-vs-reflow
+/// byte compare has the same thread-safe capture + full-image readback without
+/// widening those helpers' access across files.
+private final class LatestImageBoxLocal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var image: CGImage?
+    func set(_ image: CGImage) { lock.lock(); defer { lock.unlock() }; self.image = image }
+    func get() -> CGImage? { lock.lock(); defer { lock.unlock() }; return image }
+}
+
+private func pixelBytesLocal(_ image: CGImage) throws -> Data {
+    let width = image.width, height = image.height
+    var buffer = [UInt8](repeating: 0, count: width * height * 4)
+    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    guard let ctx = CGContext(
+        data: &buffer, width: width, height: height,
+        bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+        throw Strip.StripError(message: "pixelBytesLocal readback context failed")
+    }
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return Data(buffer)
 }

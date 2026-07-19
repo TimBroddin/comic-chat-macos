@@ -316,6 +316,18 @@ extern "C" int32_t cc_strip_set_participant_avatar(cc_strip* s, int32_t particip
         av->m_userInfo = pui;              // SetUserAvatarID's second line
 
         s->avatars.push_back(av);
+
+        // Live-fix (Plan 4b live-fix 3): refresh the title/starring credits so
+        // the starring row's avatar icon follows the switch -- the original's
+        // ChangeAvatarEntry::Execute does exactly this on its HM_LIVE path
+        // (histent.cpp:402, `UpdateTitle()`), and AddStars reads
+        // `pui->GetAvatarID()` (panel.cpp:538) so it picks up the new avatar.
+        // Gated on a title having been set (title-opt-in), matching
+        // cc_strip_add_participant's own member-join UpdateTitle guard just
+        // above -- without a title there is no starring panel to refresh.
+        if (s->page && ccContext().session.comicsTitle[0] != '\0')
+            s->page->UpdateTitle();
+
         return 0;
     } catch (...) {
         return -1;
@@ -387,6 +399,24 @@ extern "C" int32_t cc_strip_add_line(cc_strip* s, int32_t speaker,
     CUserInfo* spk = ccContext().session.lookupUser((UINT)speaker);
     if (!spk) return -1;   // unknown speaker id
 
+    // Live-fix (Plan 4b live-fix 3): resolve the participant's CURRENT avatar
+    // id and drive every avatar-keyed step from it, NOT from the raw `speaker`
+    // participant id -- this is the EXACT original contract. The original's
+    // SayEntry::Execute passes `m_pui->GetAvatarID()` (not a user id) to
+    // ProcessLine -> AddLine (histent.cpp:108), and poses via
+    // `GetAvatar(m_pui->GetAvatarID())` (histent.cpp:90). The two are equal at
+    // add-participant time (`addUser(id)` seeds them so), but
+    // `cc_strip_set_participant_avatar` (SetUserAvatarID) re-points
+    // `pui->SetAvatarID(newID)` at a freshly-loaded avatar under a NEW id while
+    // the caller's participant id is unchanged -- so a post-switch `speaker`
+    // still names the OLD avatar. The pre-fix bridge passed `speaker` straight
+    // into GetAvatar/AddLine, so post-switch lines posed + cloned the OLD
+    // avatar's body -- rendering the pre-switch character forever (Tim's live
+    // "still renders Anna" report). `CPanel::FetchSpeaker`/`AvatarInPanel` key
+    // on `m_avatarID`, so the current avatar id is exactly the value the panel
+    // machinery expects.
+    UINT avId = spk->GetAvatarID();
+
     // (1) rebuild the speaker's talk-to graph from the addressees.
     spk->m_udi.m_talkTos.RemoveAll();
     for (int32_t i = 0; i < n_addr; i++) {
@@ -395,8 +425,9 @@ extern "C" int32_t cc_strip_add_line(cc_strip* s, int32_t speaker,
     }
 
     // (2) emotion inference (mutates the speaker avatar's neutral body).
+    // ChatPreSendText takes an AVATAR id (GetAvatar(avID), textpose.cpp:125).
     CString text(text_bytes);
-    ChatPreSendText(text, speaker);
+    ChatPreSendText(text, (int)avId);
 
     // Plan 4a Task 7 (R17): the original's CChatDoc::ProcessLine tallies every
     // real utterance onto the speaker's avatar (chatdoc.cpp:463-471 --
@@ -407,12 +438,13 @@ extern "C" int32_t cc_strip_add_line(cc_strip* s, int32_t speaker,
     // credits by who spoke most; nothing populated it before this task since
     // the title/starring path was entirely R11-deferred.
     if (strcmp(text_bytes, "<Brk>") != 0) {
-        CAvatarX* spkAv = GetAvatar((USHORT)speaker);
+        CAvatarX* spkAv = GetAvatar((USHORT)avId);
         if (spkAv) spkAv->m_nSends++;
     }
 
-    // (3) orchestrator ingestion. AddLine returns BOOL (TRUE == success).
-    BOOL ok = s->page->AddLine((UINT)speaker, (const char*)text, (USHORT)modes, NULL, NULL);
+    // (3) orchestrator ingestion. AddLine's uID is the AVATAR id every CPanel
+    // step keys on -- pass the current avatar id (matches histent.cpp:108).
+    BOOL ok = s->page->AddLine((UINT)avId, (const char*)text, (USHORT)modes, NULL, NULL);
     return ok ? 0 : -1;
 }
 
@@ -440,6 +472,15 @@ extern "C" int32_t cc_strip_add_line_cooked(cc_strip* s, int32_t speaker,
     CUserInfo* spk = ccContext().session.lookupUser((UINT)speaker);
     if (!spk) return -1;   // unknown speaker id
 
+    // Live-fix (Plan 4b live-fix 3): drive every avatar-keyed step off the
+    // participant's CURRENT avatar id -- see cc_strip_add_line's identical
+    // `avId` note for the full rationale (the original's SayEntry::Execute
+    // passes `m_pui->GetAvatarID()` to AddLine, histent.cpp:108, not a fixed
+    // user id; post-`cc_strip_set_participant_avatar` the two diverge, and the
+    // pre-fix bridge kept rendering the OLD avatar -- Tim's "still renders
+    // Anna" report).
+    UINT avId = spk->GetAvatarID();
+
     // (1) rebuild the speaker's talk-to graph from the addressees (identical
     // to cc_strip_add_line).
     spk->m_udi.m_talkTos.RemoveAll();
@@ -449,7 +490,7 @@ extern "C" int32_t cc_strip_add_line_cooked(cc_strip* s, int32_t speaker,
     }
 
     // (2) pose: explicit annotations (cooked) win over text inference.
-    CAvatarX* av = GetAvatar((USHORT)speaker);
+    CAvatarX* av = GetAvatar((USHORT)avId);
     if (ann && ann->cooked && av) {
         if (!(av->m_flags & OTHERMAPPED)) {
             // Ordinary avatar: the decoded pose indices map directly onto
@@ -469,9 +510,9 @@ extern "C" int32_t cc_strip_add_line_cooked(cc_strip* s, int32_t speaker,
         }
     } else {
         // Not cooked (or no annotations at all): fall back to the original
-        // text-inference path, unchanged from cc_strip_add_line.
+        // text-inference path. ChatPreSendText takes an AVATAR id.
         CString text(text_bytes);
-        ChatPreSendText(text, speaker);
+        ChatPreSendText(text, (int)avId);
     }
 
     // Plan 4a Task 7 (R17): TallySpeech's m_nSends++ (see cc_strip_add_line's
@@ -479,8 +520,9 @@ extern "C" int32_t cc_strip_add_line_cooked(cc_strip* s, int32_t speaker,
     // branch, so reuse it rather than a second GetAvatar lookup.
     if (strcmp(text_bytes, "<Brk>") != 0 && av) av->m_nSends++;
 
-    // (3) orchestrator ingestion -- identical to cc_strip_add_line.
-    BOOL ok = s->page->AddLine((UINT)speaker, text_bytes, (USHORT)modes, NULL, NULL);
+    // (3) orchestrator ingestion. AddLine's uID is the AVATAR id -- pass the
+    // current avatar id (matches histent.cpp:108).
+    BOOL ok = s->page->AddLine((UINT)avId, text_bytes, (USHORT)modes, NULL, NULL);
     return ok ? 0 : -1;
 }
 
