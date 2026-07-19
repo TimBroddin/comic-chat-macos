@@ -76,18 +76,65 @@ public final class ProtocolStripBridge {
 
         mutating func resolve(avatarName: String?) -> String {
             let name = avatarName.flatMap { $0.isEmpty ? nil : $0 }
-            let bare: String
             if let name {
                 // `.appearsAs`'s avatarName has no required extension on the
                 // wire; the bundled comicart set uses "<name>.avb" — append it
                 // only if the caller-supplied name doesn't already end in
                 // ".avb" (an explicit path segment naming its own file wins).
-                bare = name.lowercased().hasSuffix(".avb") ? name : "\(name).avb"
-            } else {
-                bare = defaultOrder[nextDefaultIndex % defaultOrder.count]
-                nextDefaultIndex += 1
+                let bare = name.lowercased().hasSuffix(".avb") ? name : "\(name).avb"
+                if let resolved = existingPath(forBare: bare, allowCWDRelative: true) {
+                    return resolved
+                }
+                // Plan 4b live-fix: an announced name that resolves to NO real
+                // art on disk (e.g. the `_NoArt` sentinel a peer with no avatar
+                // of its own sends, or any character we don't have locally and
+                // couldn't download) must NOT be handed to `addParticipant` as
+                // a literal path — `cc_strip_add_participant`'s `LoadAvatar`
+                // would fail and the whole event would throw. The ORIGINAL
+                // never treats an unknown announced name as an error:
+                // `ChangeAvatarEntry::Execute` (histent.cpp:384) resolves via
+                // `GetAvatar3(name, pui, bRandomIfNotFound=TRUE)`, whose
+                // `LoadAvatar` miss cycles a default avatar via
+                // `GetNextAvatarName` (avatar.cpp:699-704). Mirror that: fall
+                // through to the same default-cycling path a nil name uses, so
+                // the participant still gets SOME avatar and the line renders.
+                return cycleDefault()
             }
+            return cycleDefault()
+        }
+
+        /// The default-cycling fallback (a nil announced name, or a non-nil one
+        /// that resolved to no real file). Advances `nextDefaultIndex` so
+        /// successive unannounced/unresolvable participants get distinct
+        /// defaults — mirrors `GetNextAvatarName`'s round-robin (avatar.cpp).
+        private mutating func cycleDefault() -> String {
+            let bare = defaultOrder[nextDefaultIndex % defaultOrder.count]
+            nextDefaultIndex += 1
             if bare.hasPrefix("/") { return bare }
+            // A default name is normally a real fixture/comicart path; resolve
+            // it through the same search order for consistency, but fall back
+            // to the bare form (the pre-fix behavior for defaults) if it isn't
+            // found anywhere — a caller with a genuinely-present default gets
+            // the located path; a misconfigured one gets what it always got.
+            return existingPath(forBare: bare)
+                ?? comicartDir.map { ($0 as NSString).appendingPathComponent(bare) }
+                ?? bare
+        }
+
+        /// The bare name resolved to an EXISTING file over `extraDirs` then
+        /// `comicartDir` (D1 §4.3 search order), or `nil` if it exists nowhere.
+        /// An absolute bare path is honored as-is when it exists.
+        ///
+        /// `allowCWDRelative` (named-avatar resolution only): when no directory
+        /// locates the name, also probe the bare form CWD-relative — this
+        /// preserves the documented `comicartDir == nil` convention ("bare
+        /// names are used as-is, caller's CWD-relative resolution") for a named
+        /// avatar the caller genuinely staged next to its CWD, while still
+        /// answering `nil` for a name (like `_NoArt`) present nowhere at all.
+        private func existingPath(forBare bare: String, allowCWDRelative: Bool = false) -> String? {
+            if bare.hasPrefix("/") {
+                return FileManager.default.fileExists(atPath: bare) ? bare : nil
+            }
             // extraDirs BEFORE comicartDir (D1 §4.3): a user-downloaded
             // character with the same bare name as a bundled one shadows it.
             for dir in extraDirs {
@@ -96,8 +143,14 @@ public final class ProtocolStripBridge {
                     return candidate
                 }
             }
-            guard let dir = comicartDir else { return bare }
-            return (dir as NSString).appendingPathComponent(bare)
+            if let dir = comicartDir {
+                let candidate = (dir as NSString).appendingPathComponent(bare)
+                if FileManager.default.fileExists(atPath: candidate) { return candidate }
+            }
+            if allowCWDRelative, FileManager.default.fileExists(atPath: bare) {
+                return bare
+            }
+            return nil
         }
 
         /// Pure path-existence check over `extraDirs + [comicartDir]`,

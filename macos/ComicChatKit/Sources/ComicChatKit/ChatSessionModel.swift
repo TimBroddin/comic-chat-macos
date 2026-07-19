@@ -923,7 +923,7 @@ public final class ChatSessionModel: @unchecked Sendable {
                     }
                 }
             }
-            if isActiveRoom || isPrivateAnnounce { try? bridge?.apply(ev); recomposeLocked() }
+            if isActiveRoom || isPrivateAnnounce { applyToBridgeLocked(ev); recomposeLocked() }
             // Plan 4b Task 6 (D4 §4): a PEER's announce naming art we don't
             // have locally AND carrying a fetchable URL enters the
             // auto-download path. Fires once regardless of room — the in-flight
@@ -992,7 +992,7 @@ public final class ChatSessionModel: @unchecked Sendable {
             // nil` fallback entirely. A whisper does NOT bump unread either
             // way.
             whisperBoxRoutingLocked(nick: nick, text: text)
-            if isActiveRoom { try? bridge?.apply(ev); recomposeLocked() }
+            if isActiveRoom { applyToBridgeLocked(ev); recomposeLocked() }
 
         case .userJoined:
             // A peer joining is strip-relevant (renders a JOIN panel) AND
@@ -1000,7 +1000,7 @@ public final class ChatSessionModel: @unchecked Sendable {
             // when that room is active; a background room defers rendering to
             // its next activation (transcript already appended). A join does
             // NOT bump unread (clarification 3).
-            if isActiveRoom { try? bridge?.apply(ev); recomposeLocked() }
+            if isActiveRoom { applyToBridgeLocked(ev); recomposeLocked() }
             if let room = scopedRoom { emitMembers(for: room) }
 
         case .nickChanged(_, let newNick, let isSelf):
@@ -1088,7 +1088,7 @@ public final class ChatSessionModel: @unchecked Sendable {
     /// whisper) does nothing here — it never touches the strip or unread.
     private func handleRoomMessageStripEffect(_ ev: ProtocolEvent, isActiveRoom: Bool, room: String?, isMessage: Bool) {
         if isActiveRoom {
-            try? bridge?.apply(ev)
+            applyToBridgeLocked(ev)
             recomposeLocked()
         } else if let room, rooms[room] != nil {
             if isMessage {
@@ -1376,6 +1376,27 @@ public final class ChatSessionModel: @unchecked Sendable {
         }
     }
 
+    /// ENGINE QUEUE ONLY. Applies `ev` to the live strip `bridge`, surfacing a
+    /// failure via `onStatus` instead of swallowing it silently. Every strip
+    /// `apply` in `handleLocked`/`rebuildStripLocked` was previously a bare
+    /// `try? bridge?.apply(ev)` — a throw (e.g. an avatar that fails to load)
+    /// vanished with no trace, so a whole room's strip could freeze invisibly
+    /// (the Plan 4b live break: an unresolvable announced avatar threw on every
+    /// event needing that peer as a participant, and nothing said so). The
+    /// engine's own single-line diagnostics stay swallowed by design; this only
+    /// adds ONE status line at the failure site so the NEXT such break is
+    /// visible rather than silent. Error handling is otherwise unchanged: the
+    /// throw is still absorbed (a failed line must not abort the surrounding
+    /// event loop), and `nil` bridge is still a no-op.
+    private func applyToBridgeLocked(_ ev: ProtocolEvent) {
+        guard let bridge else { return }
+        do {
+            try bridge.apply(ev)
+        } catch {
+            emitStatus("Strip render skipped an event: \(error)")
+        }
+    }
+
     // MARK: - emotion wheel / send-mode preview (Plan 4b Task 3)
 
     /// The wheel drag: sets the SELF participant's emotion (`angle` in
@@ -1508,7 +1529,7 @@ public final class ChatSessionModel: @unchecked Sendable {
                 self.rooms[room]?.transcript.append(synthetic)
             }
             // Apply to the live strip (the active room) once.
-            try? self.bridge?.apply(synthetic)
+            self.applyToBridgeLocked(synthetic)
             self.recomposeLocked()
             self.emitSelfPoseLocked()
             // The REAL wire announce to every joined room.
@@ -1904,9 +1925,9 @@ public final class ChatSessionModel: @unchecked Sendable {
         // and the `_transcript` computed property this replays).
         activeRoom = room
         guard (try? setUpStripLocked(isReflow: true)) != nil else { return }
-        guard let bridge else { return }
+        guard bridge != nil else { return }
         for ev in rooms[room]?.transcript ?? [] {
-            try? bridge.apply(ev)
+            applyToBridgeLocked(ev)
         }
         recomposeLocked()
     }

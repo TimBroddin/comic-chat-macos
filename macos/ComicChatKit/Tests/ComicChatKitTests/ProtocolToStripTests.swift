@@ -195,6 +195,99 @@ extension EngineGlobalStateSelfTests {
         }
     }
 
+    // (c3) Plan 4b live-fix (p4b-a-mac capture): an `.appearsAs` announcing an
+    // UNRESOLVABLE avatar name — the `_NoArt` sentinel a peer with no avatar
+    // art of its own sends (avatar.cpp:686 `GetNextAvatarName` -> "_NoArt"
+    // when the peer's own avatar-name list is empty) — must NOT poison that
+    // peer. In the original, `ChangeAvatarEntry::Execute` (histent.cpp:384)
+    // resolves it through `GetAvatar3(name, pui, bRandomIfNotFound=TRUE)`,
+    // whose `LoadAvatar` miss cycles a DEFAULT avatar (avatar.cpp:699-704) —
+    // an unknown/unresolvable announced name is NEVER an error there.
+    //
+    // The live symptom: after Anonymous announced `_NoArt` (privately),
+    // EVERY subsequent event that needed Anonymous as a strip participant —
+    // our own T-list say addressing them, and their own bare inbound says —
+    // threw inside `ensureParticipant` (resolver produced literal `_NoArt.avb`
+    // -> `cc_strip_add_participant`'s `LoadAvatar` fails -> -1 -> throw) and
+    // was swallowed by `handleLocked`'s `try? bridge?.apply`, freezing the
+    // strip. This asserts the addressee path heals: a not-yet-participant
+    // addressee whose only announced name is unresolvable still becomes a
+    // participant (cycling the resolver default) and the line renders.
+    @Test func unresolvableAnnouncedAddresseeStillRendersAndParticipates() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            let fixturesDir = (fixture("anna.avb") as NSString).deletingLastPathComponent
+            let resolver = ProtocolStripBridge.AvatarResolver(
+                comicartDir: fixturesDir, defaultOrder: [fixture("anna.avb")])
+            let bridge = try ProtocolStripBridge(resolver: resolver)
+
+            // Self speaks first (becomes a participant), like the Mac app's
+            // opening "hi".
+            try bridge.apply(.text(nick: "Tim", ident: "tim@host", target: "#comicrig",
+                                   text: "hi", kind: 1, annotations: nil))
+            #expect(bridge.participantOrder == ["Tim"])
+
+            // Anonymous is announced PRIVATELY with the `_NoArt` sentinel —
+            // stashed in announcedAvatarNames but not yet a participant (never
+            // spoke). This alone must not throw.
+            try bridge.apply(.appearsAs(nick: "Anonymous", avatarName: "_NoArt", url: ""))
+            #expect(bridge.announcedAvatarNames["Anonymous"] == "_NoArt")
+            #expect(bridge.participantIDs["Anonymous"] == nil)
+
+            // Our own say addressing Anonymous (Task 8 member-list selection
+            // as addressee) — this resolves Anonymous as an addressee, which
+            // must ensureParticipant despite the unresolvable announced name.
+            let addressed = Annotations(
+                gesturePose: 2, gestureEmotion: 9, gestureIntensity: 5,
+                facePose: 1, faceEmotion: 9, faceIntensity: 3,
+                requested: false, mode: 1, addressees: ["Anonymous"], cooked: true)
+            let before = bridge.panelCount
+            try bridge.apply(.text(nick: "Tim", ident: "tim@host", target: "#comicrig",
+                                   text: "test", kind: 1, annotations: addressed))
+            // Anonymous is now a participant (cycled the resolver default) and
+            // the addressed line laid out a panel.
+            #expect(bridge.participantIDs["Anonymous"] != nil)
+            #expect(bridge.panelCount > before)
+
+            // And Anonymous's own subsequent BARE inbound say renders too.
+            let before2 = bridge.panelCount
+            try bridge.apply(.text(nick: "Anonymous", ident: "anon@host", target: "#comicrig",
+                                   text: "lol", kind: 1, annotations: nil))
+            #expect(bridge.panelCount > before2)
+
+            let recorder = RecordingCanvas()
+            try bridge.compose(onto: recorder)
+            #expect(!recorder.log.isEmpty)
+        }
+    }
+
+    // (c4) Companion to (c3) for the OTHER order seen in the capture: the peer
+    // announces `_NoArt` privately, then speaks a bare line themselves BEFORE
+    // we ever address them. The bare say must ensureParticipant + render
+    // instead of throwing on the unresolvable stashed name.
+    @Test func unresolvableAnnouncedSpeakerStillRenders() throws {
+        let metricsCanvas = RecordingCanvas()
+        let metricsBox = CanvasBox(metricsCanvas)
+        cc_set_metrics_canvas(metricsBox.handle)
+
+        try withExtendedLifetime(metricsBox) {
+            let fixturesDir = (fixture("anna.avb") as NSString).deletingLastPathComponent
+            let resolver = ProtocolStripBridge.AvatarResolver(
+                comicartDir: fixturesDir, defaultOrder: [fixture("anna.avb")])
+            let bridge = try ProtocolStripBridge(resolver: resolver)
+
+            try bridge.apply(.appearsAs(nick: "Anonymous", avatarName: "_NoArt", url: ""))
+            let before = bridge.panelCount
+            try bridge.apply(.text(nick: "Anonymous", ident: "anon@host", target: "#comicrig",
+                                   text: "dddd", kind: 1, annotations: nil))
+            #expect(bridge.participantIDs["Anonymous"] != nil)
+            #expect(bridge.panelCount > before)
+        }
+    }
+
     // (d) THE EXIT-MILESTONE PNG: the same annotated event stream composited
     // through CGCanvas into real pixels -- the wire-fed equivalent of Plan 2's
     // stripPNG exit proof (StripTests.swift). Written to
