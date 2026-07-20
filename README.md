@@ -4,6 +4,8 @@ A native macOS port of Microsoft Comic Chat 2.5, running the genuine 1998 layout
 
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)](#install) [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
+📖 **Read the story:** [Bringing Microsoft Comic Chat to the Mac](https://broddin.be/bringing-microsoft-comic-chat-to-the-mac-using-fable/) — how this port was built.
+
 ![Comic Chat for macOS](docs/images/hero.png)
 
 ## Features
@@ -56,7 +58,7 @@ cd macos/ComicChatKit && swift test
 
 The port uses a "shim-and-lift" approach: the original C++ engine — comic layout, avatar/art rendering, and the IRC/MS Chat protocol handling, lifted from `v2.5-beta-1-modern/` largely unmodified — is compiled as a library against a small MFC-compatibility shim rather than reimplemented. A single C bridge header, `comicchat.h`, is the *only* interface visible to Swift; no C++ or Win32 types cross it. This lives in a SwiftPM package (`macos/ComicChatKit`) so the engine and protocol logic can be tested headlessly with `swift test`, independent of the GUI. A SwiftUI app (`macos/ComicChat`) sits on top and talks to the engine only through that bridge. Networking is bytes-in/events-out: raw bytes go to the engine's parser, typed events come back out, and the app's IRC transport preserves CP-1252 wire fidelity so annotations exchanged with real Windows Comic Chat clients decode correctly. The transcript itself is the event log — reflowing the comic view (e.g. on resize or panels-per-row changes) replays that log rather than mutating rendered state.
 
-See [`docs/superpowers/specs/2026-07-17-macos-port-design.md`](docs/superpowers/specs/2026-07-17-macos-port-design.md) for the full design writeup.
+See [`docs/superpowers/specs/2026-07-17-macos-port-design.md`](docs/superpowers/specs/2026-07-17-macos-port-design.md) for the full design writeup, and the blog post [Bringing Microsoft Comic Chat to the Mac](https://broddin.be/bringing-microsoft-comic-chat-to-the-mac-using-fable/) for the story of how it was built.
 
 ## Provenance & License
 
