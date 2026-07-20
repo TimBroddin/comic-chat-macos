@@ -3797,6 +3797,143 @@ static int cc_selftest_llquote_extra() {
     return 0;
 }
 
+// P4b white-avatar fix (.superpowers/sdd/p4b-white-avatar-diagnosis.md):
+// synthetic true-color DIB decode coverage for bridge_decode_dib_to_rgba's
+// new 24/32-bpp branch (bridge_art.cpp's decodeDibToRgba/readTrueColorPixel).
+// Deliberately does NOT use any real avatar file -- all bundled avatars are
+// <=8bpp indexed, so there is no in-repo 24/32bpp art to exercise this path;
+// hand-building the DIB in-memory pins the exact decode branch with zero
+// licensing exposure (mirrors the diagnosis's recommended fixture shape).
+static int cc_selftest_truecolor_dib() {
+    // --- 24bpp case: 3x2 image. Width 3 forces a non-trivial DWORD-aligned
+    // row stride: 3px * 3bytes/px = 9 bytes, padded up to 12 (DIBStorageWidth
+    // rounds to the next multiple of 4) -- this is the exact stride-padding
+    // scenario the diagnosis calls out, so a stride bug (reading the pad
+    // bytes as pixel data on row 2) would corrupt row 1's colors below.
+    // An asymmetric per-pixel color pattern (every pixel a different color,
+    // top row != bottom row) means a bottom-up/top-down row-order bug flips
+    // which row lands where in the RGBA output and the assertions below
+    // catch it.
+    {
+        BITMAPINFOHEADER hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.biSize = sizeof(BITMAPINFOHEADER);
+        hdr.biWidth = 3;
+        hdr.biHeight = 2;      // positive -> bottom-up storage (Win32/this port's convention)
+        hdr.biPlanes = 1;
+        hdr.biBitCount = 24;
+        hdr.biCompression = BI_RGB;
+
+        BITMAPINFO* bmi = (BITMAPINFO*)malloc(sizeof(BITMAPINFOHEADER));
+        bmi->bmiHeader = hdr;
+
+        // Storage rows, bottom-up: storage row 0 = image bottom row (y=1),
+        // storage row 1 = image top row (y=0). 12 bytes/row (9 pixel bytes +
+        // 3 pad bytes), BGR order per pixel (Windows DIB byte order).
+        uint8_t bits[24];
+        memset(bits, 0xAA, sizeof(bits)); // pad bytes: poison value, must never be read as color
+        // storage row 0 (bottom image row, y=1): red, green, blue pixels.
+        bits[0]=0x00; bits[1]=0x00; bits[2]=0xFF;   // B,G,R -> pixel (0,1) red
+        bits[3]=0x00; bits[4]=0xFF; bits[5]=0x00;   // pixel (1,1) green
+        bits[6]=0xFF; bits[7]=0x00; bits[8]=0x00;   // pixel (2,1) blue
+        // bits[9..11] = pad (poison, untouched)
+        // storage row 1 (top image row, y=0): white, black, yellow pixels.
+        bits[12]=0xFF; bits[13]=0xFF; bits[14]=0xFF; // pixel (0,0) white
+        bits[15]=0x00; bits[16]=0x00; bits[17]=0x00; // pixel (1,0) black
+        bits[18]=0x00; bits[19]=0xFF; bits[20]=0xFF; // pixel (2,0) yellow (B=0,G=FF,R=FF)
+        // bits[21..23] = pad (poison, untouched)
+
+        int32_t w = 0, h = 0;
+        uint8_t* rgba = nullptr;
+        BOOL ok = bridge_decode_dib_to_rgba(bmi, bits, &w, &h, &rgba);
+        CC_CHECK(ok);
+        if (ok) {
+            CC_CHECK(w == 3 && h == 2);
+            // decodeDibToRgba's output is top-down regardless of source
+            // bottom-up storage -- row 0 of rgba must be the image's TOP row
+            // (white/black/yellow), row 1 the BOTTOM row (red/green/blue).
+            auto px = [&](int x, int y) -> uint8_t* { return rgba + ((size_t)y*3 + x) * 4; };
+            // top row (y=0): white, black, yellow -- full opacity throughout
+            // (maskless true-color drawing plane decodes fully opaque, same
+            // convention as the indexed path with mask=NULL).
+            CC_CHECK(px(0,0)[0]==255 && px(0,0)[1]==255 && px(0,0)[2]==255 && px(0,0)[3]==255);
+            CC_CHECK(px(1,0)[0]==0   && px(1,0)[1]==0   && px(1,0)[2]==0   && px(1,0)[3]==255);
+            CC_CHECK(px(2,0)[0]==255 && px(2,0)[1]==255 && px(2,0)[2]==0   && px(2,0)[3]==255);
+            // bottom row (y=1): red, green, blue
+            CC_CHECK(px(0,1)[0]==255 && px(0,1)[1]==0   && px(0,1)[2]==0   && px(0,1)[3]==255);
+            CC_CHECK(px(1,1)[0]==0   && px(1,1)[1]==255 && px(1,1)[2]==0   && px(1,1)[3]==255);
+            CC_CHECK(px(2,1)[0]==0   && px(2,1)[1]==0   && px(2,1)[2]==255 && px(2,1)[3]==255);
+            free(rgba);
+        }
+        free(bmi);
+    }
+
+    // --- 32bpp case: 2x2 image, top-down (negative biHeight), BGRX (4th
+    // byte garbage -- must be ignored/forced opaque, not read as alpha).
+    {
+        BITMAPINFOHEADER hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.biSize = sizeof(BITMAPINFOHEADER);
+        hdr.biWidth = 2;
+        hdr.biHeight = -2;     // negative -> top-down storage
+        hdr.biPlanes = 1;
+        hdr.biBitCount = 32;
+        hdr.biCompression = BI_RGB;
+
+        BITMAPINFO* bmi = (BITMAPINFO*)malloc(sizeof(BITMAPINFOHEADER));
+        bmi->bmiHeader = hdr;
+
+        // Top-down: storage row 0 = image top row (y=0). No padding needed
+        // at 32bpp (2px * 4 bytes = 8, already DWORD-aligned).
+        uint8_t bits[16];
+        // row 0: magenta (B=FF,G=00,R=FF), cyan (B=FF,G=FF,R=00); 4th byte
+        // set to a non-255/non-0 garbage value to prove it's ignored.
+        bits[0]=0xFF; bits[1]=0x00; bits[2]=0xFF; bits[3]=0x42;
+        bits[4]=0xFF; bits[5]=0xFF; bits[6]=0x00; bits[7]=0x99;
+        // row 1: black, white
+        bits[8]=0x00;  bits[9]=0x00;  bits[10]=0x00;  bits[11]=0x00;
+        bits[12]=0xFF; bits[13]=0xFF; bits[14]=0xFF; bits[15]=0xFF;
+
+        int32_t w = 0, h = 0;
+        uint8_t* rgba = nullptr;
+        BOOL ok = bridge_decode_dib_to_rgba(bmi, bits, &w, &h, &rgba);
+        CC_CHECK(ok);
+        if (ok) {
+            CC_CHECK(w == 2 && h == 2);
+            auto px = [&](int x, int y) -> uint8_t* { return rgba + ((size_t)y*2 + x) * 4; };
+            CC_CHECK(px(0,0)[0]==255 && px(0,0)[1]==0   && px(0,0)[2]==255 && px(0,0)[3]==255); // magenta, opaque despite garbage 4th byte
+            CC_CHECK(px(1,0)[0]==0   && px(1,0)[1]==255 && px(1,0)[2]==255 && px(1,0)[3]==255); // cyan
+            CC_CHECK(px(0,1)[0]==0   && px(0,1)[1]==0   && px(0,1)[2]==0   && px(0,1)[3]==255); // black
+            CC_CHECK(px(1,1)[0]==255 && px(1,1)[1]==255 && px(1,1)[2]==255 && px(1,1)[3]==255); // white
+            free(rgba);
+        }
+        free(bmi);
+    }
+
+    // --- regression guard: an unsupported depth (e.g. the old rejected set
+    // now excludes 24/32, but a genuinely bogus depth like 2bpp) must still
+    // be rejected, not silently misdecoded.
+    {
+        BITMAPINFOHEADER hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.biSize = sizeof(BITMAPINFOHEADER);
+        hdr.biWidth = 2;
+        hdr.biHeight = 2;
+        hdr.biPlanes = 1;
+        hdr.biBitCount = 2; // never a valid DIB depth
+        hdr.biCompression = BI_RGB;
+        BITMAPINFO* bmi = (BITMAPINFO*)malloc(sizeof(BITMAPINFOHEADER));
+        bmi->bmiHeader = hdr;
+        uint8_t bits[8] = {0};
+        int32_t w = 0, h = 0;
+        uint8_t* rgba = nullptr;
+        CC_CHECK(!bridge_decode_dib_to_rgba(bmi, bits, &w, &h, &rgba));
+        free(bmi);
+    }
+
+    return 0;
+}
+
 // bConvertWideStringToUTF8 / bConvertUTF8StringToWide round-trip + boundary
 // coverage: ASCII passthrough, 2-byte UTF-8 (0x80-0x7FF range), 3-byte UTF-8
 // (>0x7FF), and SzNextUTF8Char's per-class advance (backslash-escape,
@@ -6028,6 +6165,7 @@ extern "C" int32_t cc_run_selftests(void) {
     cc_selftest_session_skeleton();  // Plan 3 Task 1: cc_session C boundary
     cc_selftest_llquote();           // Plan 3 Task 2: low-level quoting (brief vectors)
     cc_selftest_llquote_extra();     // Plan 3 Task 2: zero-copy fast path, CR, QQ
+    cc_selftest_truecolor_dib();     // P4b white-avatar fix: 24/32bpp DIB decode
     cc_selftest_utf8codec();         // Plan 3 Task 2: UTF-8 <-> wide codec
     cc_selftest_cptrlist_fifo();     // Plan 3 Task 2 Step 6: CPtrList::RemoveHead
     cc_selftest_charnext();          // Plan 3 Task 2 Step 7: CharNext (Plan 2 debt)

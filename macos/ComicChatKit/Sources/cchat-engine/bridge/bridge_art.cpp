@@ -110,6 +110,58 @@ inline int readIndexedPixel(const uint8_t* row, int x, int bitCount) {
     }
 }
 
+// True-color (non-indexed) pixel read, added for the downloaded-custom-avatar
+// fix (P4b white-silhouette diagnosis, .superpowers/sdd/p4b-white-avatar-
+// diagnosis.md): a 24-bpp BI_RGB DIB has no color table at all (readIndexedPixel
+// /clrTab do not apply -- NumDIBColorEntries returns 0 color entries for any
+// depth other than 1/4/8, dib.cpp), so this is a SEPARATE read path, not a
+// branch inside readIndexedPixel. Handles 24-bpp (3 bytes/pixel, BGR), 32-bpp
+// (4 bytes/pixel, BGRx -- the 4th byte is ignored/forced opaque below; this
+// codebase's DIBs are always BI_RGB, never BI_BITFIELDS, so there is no real
+// alpha channel to read), and 16-bpp BI_RGB (5-5-5, 2 bytes/pixel, top bit
+// unused). 16-bpp BI_BITFIELDS (5-6-5) is intentionally NOT handled -- this
+// shim never defines BI_BITFIELDS (mfc_compat.h has no such constant, and no
+// producer in this codebase emits it), so a 5-6-5 buffer can never reach here;
+// treating a hypothetical future 16bpp-BI_BITFIELDS DIB as 5-5-5 would silently
+// misdecode colors, so decodeDibToRgba's caller-visible guard below rejects
+// any 16bpp DIB whose biCompression isn't BI_RGB rather than guessing.
+inline void readTrueColorPixel(const uint8_t* row, int x, int bitCount,
+                                uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a) {
+    a = 255; // opaque -- see the file-level comment block on the drawing-plane
+             // alpha convention: a maskless (or NULL-mask) drawing plane always
+             // decodes fully opaque, indexed or true-color alike (this mirrors
+             // that same default exactly, not a new rule).
+    switch (bitCount) {
+        case 16: {
+            // BI_RGB 16bpp = 5-5-5 (bit 15 unused/padding). Scale 5-bit
+            // channels to 8-bit by replicating the top 3 bits into the low
+            // bits (the standard 5->8 expansion: v*255/31, done via shift+or
+            // to avoid float/division).
+            uint16_t px = (uint16_t)(row[x * 2] | (row[x * 2 + 1] << 8));
+            uint8_t r5 = (uint8_t)((px >> 10) & 0x1F);
+            uint8_t g5 = (uint8_t)((px >> 5) & 0x1F);
+            uint8_t b5 = (uint8_t)(px & 0x1F);
+            r = (uint8_t)((r5 << 3) | (r5 >> 2));
+            g = (uint8_t)((g5 << 3) | (g5 >> 2));
+            b = (uint8_t)((b5 << 3) | (b5 >> 2));
+            break;
+        }
+        case 24: {
+            const uint8_t* p = row + (size_t)x * 3;
+            b = p[0]; g = p[1]; r = p[2]; // Windows DIB byte order: B,G,R
+            break;
+        }
+        case 32:
+        default: {
+            const uint8_t* p = row + (size_t)x * 4;
+            b = p[0]; g = p[1]; r = p[2]; // 4th byte (p[3]) ignored: BI_RGB
+                                          // 32bpp is BGRx, not a real alpha
+                                          // channel (see comment above).
+            break;
+        }
+    }
+}
+
 // Decodes an indexed CDIB into freshly malloc'd top-down RGBA8. Runs
 // ConvertToNonRLE() first (a no-op if already BI_RGB). `maskDib`, if
 // non-NULL, must have the same width/height; its bit (1bpp, same row
@@ -136,7 +188,17 @@ bool decodeDibToRgba(CDIB* dib, CDIB* maskDib,
     int bitCount = (int)pHeader->biBitCount;
 
     if (width <= 0 || absHeight <= 0) return false;
-    if (bitCount != 1 && bitCount != 4 && bitCount != 8) return false;
+    bool indexed = (bitCount == 1 || bitCount == 4 || bitCount == 8);
+    // True-color depths added for the custom-avatar white-silhouette fix (see
+    // readTrueColorPixel's comment above): 24/32-bpp BI_RGB unconditionally;
+    // 16-bpp only when BI_RGB (5-5-5) -- a hypothetical 16bpp BI_BITFIELDS
+    // (5-6-5) DIB is deliberately rejected rather than misdecoded as 5-5-5
+    // (this shim never defines/produces BI_BITFIELDS, so this cannot fire on
+    // any real data in this codebase; it is a documented, explicit refusal,
+    // not a silent gap).
+    bool trueColor = (bitCount == 24 || bitCount == 32 ||
+                       (bitCount == 16 && pHeader->biCompression == BI_RGB));
+    if (!indexed && !trueColor) return false;
 
     const uint8_t* bits = (const uint8_t*)dib->GetBitsAddress();
     if (bits == nullptr) return false;
@@ -178,13 +240,21 @@ bool decodeDibToRgba(CDIB* dib, CDIB* maskDib,
 
         uint8_t* outRow = rgba + (size_t)y * width * 4;
         for (int x = 0; x < width; x++) {
-            int idx = readIndexedPixel(rowPtr, x, bitCount);
-            uint8_t r = 0, g = 0, b = 0;
-            if (idx >= 0 && idx < numClrEntries) {
-                RGBQUAD& q = clrTab[idx];
-                r = q.rgbRed; g = q.rgbGreen; b = q.rgbBlue;
+            uint8_t r = 0, g = 0, b = 0, a = 255;
+            if (indexed) {
+                int idx = readIndexedPixel(rowPtr, x, bitCount);
+                if (idx >= 0 && idx < numClrEntries) {
+                    RGBQUAD& q = clrTab[idx];
+                    r = q.rgbRed; g = q.rgbGreen; b = q.rgbBlue;
+                }
+            } else {
+                // True-color plane: no color table, read BGR(x) straight out
+                // of the pixel bytes. See readTrueColorPixel's comment block
+                // above -- this is purely additive, the indexed branch above
+                // is untouched.
+                readTrueColorPixel(rowPtr, x, bitCount, r, g, b, a);
             }
-            uint8_t alpha = 255;
+            uint8_t alpha = a;
             if (maskRowPtr != nullptr) {
                 int maskBit = readIndexedPixel(maskRowPtr, x, 1);
                 alpha = (maskBit == 1) ? 255 : 0; // see transparency rule above
